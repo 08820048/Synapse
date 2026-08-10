@@ -1,0 +1,76 @@
+# Synapse
+
+Synapse 是一款使用 Rust 与 GPUI 构建的高性能、本地优先 Markdown 编辑器。
+
+产品重点是快速启动、低内存、可靠的本地文件编辑，以及接近 Zed 的原生桌面体验。Markdown 文件和本地文件夹是唯一数据源，不依赖 Web 技术、数据库或强制网络服务。
+
+## 当前能力
+
+- 在应用内通过系统文件夹选择器打开本地 Markdown 目录。
+- 递归发现 `.md` / `.MD` 文件和空文件夹，并显示可展开/收起的分层文件树；展开目录使用 `folder-open`，空目录显示“空文件夹”。
+- 在 Vault 根目录或任意子目录直接创建 `未命名N` 文件夹或 Markdown 笔记，不需要先填写命名弹层。
+- 新建笔记会立即打开并写入 `# 未命名N`；编辑该一级标题会同步更新对应文件名。
+- 文件夹右键支持新建子文件夹、新建笔记、重命名、Finder 定位和移到废纸篓。
+- 笔记右键支持重命名、Finder 定位和移到废纸篓；危险操作使用红色提示。
+- 文件夹和笔记重命名在文件树原位置进行，支持中文 IME；Enter 提交，Escape 取消。
+- 文件夹和笔记支持拖到目标目录、同级笔记所在目录或 Vault 根目录。
+- 多文档页签、独立 Rope 缓冲区、Unicode 光标和脏状态。
+- 页签切换、关闭，以及 Close / Close Left / Close Right / Close All 右键菜单。
+- 基础字符输入、换行、删除和左右/Home/End 光标导航。
+- `Cmd/Ctrl + S` 原子保存，保存失败不会丢失内存缓冲区。
+- 可收起的左侧导航和一体化编辑区域。
+- 常驻 40px 底部工具栏使用 Lucide `panel-left` / `panel-right` 控制左侧导航，并与 Settings 行等高对齐。
+- 搜索启动器与中央命令面板 UI。
+- Todo、Bookmarks 和 Settings 入口 UI。
+- 导航、菜单和页签操作统一使用编译进应用的 Lucide 官方 SVG 图标。
+
+搜索、待办、书签和设置的业务逻辑将在后续版本实现。V3 文件操作已经接入真实文件系统，并对路径穿越、符号链接、覆盖冲突、递归移动和未保存页签提供保护。
+
+## 技术约束
+
+- 语言：Rust 最新稳定版。
+- UI：GPUI，禁止引入 HTML/CSS/JavaScript、Electron、egui 或 iced。
+- 文本缓冲区：ropey。
+- 删除：使用 `trash 5.2.6` 移入操作系统废纸篓，不执行永久删除。
+- 图标：固定使用 Lucide `1.27.0`，项目只内置实际使用的 SVG，并随附上游许可证与来源记录。
+- 动画：固定使用 `gpui-animation 0.2.63`，交互时长和缓动遵循 `docs/过渡和交互动画规约.md`。
+- Markdown 与高亮：后续使用 pulldown-cmark / markdown-rs 与 tree-sitter。
+- 文件监听：后续使用 notify。
+- 文件系统始终是 Markdown 文档的真实来源。
+
+架构保持清晰分层：
+
+- `synapse-core`：Vault、Markdown 文档、路径安全和持久化。
+- `synapse-ui`：GPUI 窗口、页签、导航、命令面板和编辑会话状态。
+- 后续独立模块：专业编辑输入、Markdown 渲染、搜索、配置。
+
+## 运行
+
+```bash
+cargo run -p synapse
+```
+
+也可以直接传入初始目录：
+
+```bash
+cargo run -p synapse -- /path/to/markdown-folder
+```
+
+## 编辑快捷键
+
+| 操作 | 快捷键 |
+|---|---|
+| 保存 | macOS `Cmd+S`，Windows/Linux `Ctrl+S` |
+| 换行 | `Enter` |
+| 删除 | `Backspace` / `Delete` |
+| 移动光标 | `Left` / `Right` / `Home` / `End` |
+
+## 验证
+
+```bash
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+```
+
+当前开发进度见 [PROGRESS.md](PROGRESS.md)，版本规划见 [docs/Task.md](docs/Task.md)。

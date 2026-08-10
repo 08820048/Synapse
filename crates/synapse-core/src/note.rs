@@ -1,0 +1,130 @@
+use std::{
+    error::Error,
+    fmt,
+    io::{self, Write},
+    ops::Range,
+    path::{Path, PathBuf},
+};
+
+use ropey::Rope;
+
+#[derive(Debug)]
+pub struct NoteDocument {
+    relative_path: PathBuf,
+    buffer: Rope,
+    revision: u64,
+    saved_revision: u64,
+}
+
+impl NoteDocument {
+    pub(crate) fn from_text(relative_path: PathBuf, text: &str) -> Self {
+        Self {
+            relative_path,
+            buffer: Rope::from_str(text),
+            revision: 0,
+            saved_revision: 0,
+        }
+    }
+
+    pub fn relative_path(&self) -> &Path {
+        &self.relative_path
+    }
+
+    pub fn relocate(&mut self, relative_path: PathBuf) {
+        self.relative_path = relative_path;
+    }
+
+    pub fn text(&self) -> String {
+        self.buffer.to_string()
+    }
+
+    pub fn len_chars(&self) -> usize {
+        self.buffer.len_chars()
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        self.revision != self.saved_revision
+    }
+
+    pub fn insert(&mut self, char_index: usize, text: &str) -> Result<(), BufferError> {
+        let len = self.len_chars();
+        if char_index > len {
+            return Err(BufferError::CharacterIndexOutOfBounds {
+                index: char_index,
+                len,
+            });
+        }
+        if text.is_empty() {
+            return Ok(());
+        }
+
+        self.buffer.insert(char_index, text);
+        self.revision = self.revision.saturating_add(1);
+        Ok(())
+    }
+
+    pub fn remove(&mut self, range: Range<usize>) -> Result<(), BufferError> {
+        let len = self.len_chars();
+        if range.start > range.end || range.end > len {
+            return Err(BufferError::InvalidCharacterRange {
+                start: range.start,
+                end: range.end,
+                len,
+            });
+        }
+        if range.is_empty() {
+            return Ok(());
+        }
+
+        self.buffer.remove(range);
+        self.revision = self.revision.saturating_add(1);
+        Ok(())
+    }
+
+    pub(crate) fn write_to(&self, writer: &mut impl Write) -> io::Result<()> {
+        for chunk in self.buffer.chunks() {
+            writer.write_all(chunk.as_bytes())?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn mark_saved(&mut self) {
+        self.saved_revision = self.revision;
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BufferError {
+    CharacterIndexOutOfBounds {
+        index: usize,
+        len: usize,
+    },
+    InvalidCharacterRange {
+        start: usize,
+        end: usize,
+        len: usize,
+    },
+}
+
+impl fmt::Display for BufferError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CharacterIndexOutOfBounds { index, len } => {
+                write!(
+                    formatter,
+                    "character index {index} exceeds document length {len}"
+                )
+            }
+            Self::InvalidCharacterRange { start, end, len } => write!(
+                formatter,
+                "character range {start}..{end} is invalid for document length {len}"
+            ),
+        }
+    }
+}
+
+impl Error for BufferError {}
