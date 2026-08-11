@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     cell::RefCell,
     collections::{BTreeMap, BTreeSet},
     ffi::OsString,
@@ -21,10 +22,7 @@ use gpui::{
     WindowControlArea, WindowOptions, actions, anchored, canvas, deferred, div, hsla, img, list,
     point, prelude::*, px, relative, rgb, rgba, size,
 };
-use gpui_animation::{
-    animation::TransitionExt,
-    transition::general::{EaseInOutCubic, EaseOutQuad},
-};
+use gpui_animation::{animation::TransitionExt, transition::general::EaseOutQuad};
 use gpui_component::{
     ActiveTheme, IconName, Root, Sizable as _, Theme, ThemeMode,
     button::{Button, ButtonRounded, ButtonVariants as _},
@@ -69,6 +67,9 @@ const WINDOW_MIN_HEIGHT: f32 = 560.0;
 const SIDEBAR_FOOTER_HEIGHT: f32 = 40.0;
 const SIDEBAR_SHORTCUT_HEIGHT: f32 = 40.0;
 const SIDEBAR_SHORTCUT_ACTION_WIDTH: f32 = 40.0;
+const SIDEBAR_TREE_FONT_FAMILY: &str = "Inter";
+const SIDEBAR_TREE_FONT_SIZE: f32 = 13.0;
+const SIDEBAR_TREE_ROW_HEIGHT: f32 = 30.0;
 const SIDEBAR_SEARCH_OUTER_MARGIN: f32 = 8.0;
 const SIDEBAR_SEARCH_INNER_PADDING: f32 = 12.0;
 const SIDEBAR_SEARCH_CONTENT_WIDTH: f32 =
@@ -284,6 +285,13 @@ fn apply_synapse_theme(preference: ThemePreference, window: Option<&mut Window>,
     theme.table_even = palette.background;
     theme.table_head = palette.panel;
     theme.table_head_foreground = palette.foreground;
+}
+
+fn register_bundled_fonts(cx: &mut App) {
+    const INTER_VARIABLE_FONT: &[u8] = include_bytes!("../../../assets/fonts/Inter-Variable.ttf");
+    cx.text_system()
+        .add_fonts(vec![Cow::Borrowed(INTER_VARIABLE_FONT)])
+        .expect("failed to register the bundled Inter variable font");
 }
 
 fn theme_preference_path() -> Option<PathBuf> {
@@ -3812,6 +3820,7 @@ impl Render for SynapseApp {
             };
 
         let sidebar_hover = theme.sidebar_accent;
+        let sidebar_ink = theme.sidebar_foreground;
         let left_sidebar = div()
             .id("left-sidebar")
             .w(if self.left_sidebar_open {
@@ -4080,10 +4089,6 @@ impl Render for SynapseApp {
                                 };
                                 let is_expanded =
                                     !self.collapsed_directories.contains(&relative_path);
-                                let transition_id = SharedString::from(format!(
-                                    "folder-state-{row_index}-{}",
-                                    relative_path.display()
-                                ));
                                 let toggle_path = relative_path.clone();
                                 let destination = relative_path;
                                 div()
@@ -4091,16 +4096,20 @@ impl Render for SynapseApp {
                                         "directory-{row_index}-{}",
                                         destination.display()
                                     )))
-                                    .h(px(30.0))
+                                    .h(px(SIDEBAR_TREE_ROW_HEIGHT))
                                     .flex()
                                     .items_center()
                                     .gap_2()
                                     .pl(px(12.0 + depth as f32 * 16.0))
                                     .pr_2()
-                                    .text_sm()
-                                    .text_color(theme.sidebar_foreground)
+                                    .font_family(SIDEBAR_TREE_FONT_FAMILY)
+                                    .text_size(px(SIDEBAR_TREE_FONT_SIZE))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(theme.muted_foreground)
                                     .cursor_pointer()
-                                    .hover(move |style| style.bg(sidebar_hover))
+                                    .hover(move |style| {
+                                        style.bg(sidebar_hover).text_color(sidebar_ink)
+                                    })
                                     .child(
                                         if is_expanded {
                                             Icon::FolderOpen
@@ -4118,6 +4127,7 @@ impl Render for SynapseApp {
                                             .flex()
                                             .items_center()
                                             .px_1()
+                                            .text_color(sidebar_ink)
                                             .rounded_sm()
                                             .border_1()
                                             .border_color(if rename_has_error {
@@ -4165,14 +4175,6 @@ impl Render for SynapseApp {
                                             }
                                         },
                                     ))
-                                    .with_transition(transition_id)
-                                    .transition_when_else(
-                                        is_expanded,
-                                        QUICK_TRANSITION,
-                                        EaseInOutCubic,
-                                        |style| style.opacity(1.0),
-                                        |style| style.opacity(0.82),
-                                    )
                                     .into_any_element()
                             }
                             FileTreeRow::Note {
@@ -4207,16 +4209,20 @@ impl Render for SynapseApp {
                                         "note-{row_index}-{}",
                                         path.display()
                                     )))
-                                    .h(px(30.0))
+                                    .h(px(SIDEBAR_TREE_ROW_HEIGHT))
                                     .flex()
                                     .items_center()
                                     .gap_2()
                                     .pl(px(12.0 + depth as f32 * 16.0))
                                     .pr_2()
-                                    .text_sm()
-                                    .text_color(theme.sidebar_foreground)
+                                    .font_family(SIDEBAR_TREE_FONT_FAMILY)
+                                    .text_size(px(SIDEBAR_TREE_FONT_SIZE))
+                                    .font_weight(FontWeight::NORMAL)
+                                    .text_color(theme.muted_foreground)
                                     .cursor_pointer()
-                                    .hover(move |style| style.bg(sidebar_hover))
+                                    .hover(move |style| {
+                                        style.bg(sidebar_hover).text_color(sidebar_ink)
+                                    })
                                     .when(selected, |style| {
                                         style
                                             .bg(theme.sidebar_primary)
@@ -4235,6 +4241,7 @@ impl Render for SynapseApp {
                                             .flex()
                                             .items_center()
                                             .px_1()
+                                            .text_color(sidebar_ink)
                                             .rounded_sm()
                                             .border_1()
                                             .border_color(if rename_has_error {
@@ -5210,6 +5217,7 @@ fn main() {
         .with_http_client(http_client)
         .with_assets(SynapseAssets)
         .run(move |cx: &mut App| {
+            register_bundled_fonts(cx);
             gpui_component::init(cx);
             apply_synapse_theme(theme_preference, None, cx);
             let [macos_palette_key, cross_platform_palette_key] = command_palette_key_bindings();
@@ -5386,7 +5394,8 @@ mod tests {
         EDITOR_RULE_THICKNESS, EDITOR_TOP_PADDING, EDITOR_WIDE_GUTTER, FileTreeRow,
         MENU_ITEM_ICON_SIZE, MENU_ITEM_ICON_SLOT_SIZE, MarkdownImagePreview, SIDEBAR_FOOTER_HEIGHT,
         SIDEBAR_SEARCH_CONTENT_WIDTH, SIDEBAR_SEARCH_INNER_PADDING, SIDEBAR_SEARCH_OUTER_MARGIN,
-        SIDEBAR_SHORTCUT_ACTION_WIDTH, SIDEBAR_SHORTCUT_HEIGHT, TABLE_CELL_HORIZONTAL_PADDING,
+        SIDEBAR_SHORTCUT_ACTION_WIDTH, SIDEBAR_SHORTCUT_HEIGHT, SIDEBAR_TREE_FONT_FAMILY,
+        SIDEBAR_TREE_FONT_SIZE, SIDEBAR_TREE_ROW_HEIGHT, TABLE_CELL_HORIZONTAL_PADDING,
         TABLE_CELL_VERTICAL_PADDING, TABLE_FONT_SIZE, TABLE_ROW_MIN_HEIGHT, TITLEBAR_HEIGHT,
         ThemePreference, active_document_outline_index, build_document_outline,
         build_file_tree_rows, build_image_previews, build_math_previews, build_mermaid_previews,
@@ -5575,6 +5584,20 @@ mod tests {
         assert_eq!(dark.tab_inactive, rgb(0x0f0f0f).into());
         assert_ne!(dark.background, dark.panel);
         assert_ne!(light.background, dark.background);
+    }
+
+    #[test]
+    fn sidebar_tree_typography_matches_the_markd_reference() {
+        assert_eq!(SIDEBAR_TREE_FONT_FAMILY, "Inter");
+        assert_eq!(SIDEBAR_TREE_FONT_SIZE, 13.0);
+        assert_eq!(SIDEBAR_TREE_ROW_HEIGHT, 30.0);
+
+        let light = synapse_theme_palette(false);
+        let dark = synapse_theme_palette(true);
+        assert_eq!(light.muted, rgb(0x6e6e6a).into());
+        assert_eq!(light.foreground, rgb(0x191919).into());
+        assert_eq!(dark.muted, rgb(0x8f8f8a).into());
+        assert_eq!(dark.foreground, rgb(0xebebe8).into());
     }
 
     #[test]
