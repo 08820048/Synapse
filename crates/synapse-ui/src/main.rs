@@ -27,7 +27,7 @@ use gpui_animation::{
 };
 use gpui_component::{
     ActiveTheme, IconName, Root, Sizable as _, Theme, ThemeMode,
-    button::{Button, ButtonVariants as _},
+    button::{Button, ButtonRounded, ButtonVariants as _},
     input::{Input, InputState},
     kbd::Kbd,
 };
@@ -3144,40 +3144,48 @@ impl Render for SynapseApp {
             .flex_none()
             .flex()
             .overflow_x_scroll()
-            .border_b_1()
-            .border_color(tab_border)
             .bg(tab_background)
             .child(
                 div()
                     .h_full()
                     .w(titlebar_left_inset)
                     .flex_none()
+                    .border_b_1()
+                    .border_color(tab_border)
                     .window_control_area(WindowControlArea::Drag),
             )
             .child(
-                Button::new("toggle-left-sidebar")
-                    .ghost()
-                    .size(px(40.0))
+                div()
+                    .h_full()
+                    .w(px(40.0))
                     .flex_none()
-                    .tooltip(if self.left_sidebar_open {
-                        "Hide sidebar"
-                    } else {
-                        "Show sidebar"
-                    })
+                    .border_b_1()
+                    .border_color(tab_border)
                     .child(
-                        if self.left_sidebar_open {
-                            Icon::PanelLeft
-                        } else {
-                            Icon::PanelRight
-                        }
-                        .render(17.0)
-                        .text_color(tab_muted),
-                    )
-                    .on_click(move |_, _, cx| {
-                        sidebar_toggle_app.update(cx, |this, cx| {
-                            this.toggle_left_sidebar(cx);
-                        });
-                    }),
+                        Button::new("toggle-left-sidebar")
+                            .text()
+                            .rounded(ButtonRounded::None)
+                            .size(px(40.0))
+                            .tooltip(if self.left_sidebar_open {
+                                "Hide sidebar"
+                            } else {
+                                "Show sidebar"
+                            })
+                            .child(
+                                if self.left_sidebar_open {
+                                    Icon::PanelLeft
+                                } else {
+                                    Icon::PanelRight
+                                }
+                                .render(17.0)
+                                .text_color(tab_muted),
+                            )
+                            .on_click(move |_, _, cx| {
+                                sidebar_toggle_app.update(cx, |this, cx| {
+                                    this.toggle_left_sidebar(cx);
+                                });
+                            }),
+                    ),
             )
             .children(tabs.into_iter().enumerate().map(|(index, tab)| {
                 let tab_id = SharedString::from(format!("tab-{index}"));
@@ -3195,6 +3203,9 @@ impl Render for SynapseApp {
                     .px_3()
                     .border_r_1()
                     .border_color(tab_border)
+                    .when(!is_active, |style| {
+                        style.border_b_1().border_color(tab_border)
+                    })
                     .text_sm()
                     .cursor_pointer()
                     .text_color(tab_muted)
@@ -3271,6 +3282,8 @@ impl Render for SynapseApp {
                     .h_full()
                     .min_w(px(24.0))
                     .flex_1()
+                    .border_b_1()
+                    .border_color(tab_border)
                     .window_control_area(WindowControlArea::Drag),
             );
 
