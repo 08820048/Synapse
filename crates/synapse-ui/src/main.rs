@@ -17,9 +17,9 @@ use gpui::{
     Corner, CursorStyle, ElementInputHandler, Entity, FocusHandle, Focusable, FontWeight, Hsla,
     Image, ImageFormat, ImageSource, KeyBinding, ListAlignment, ListOffset, ListState, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, PathPromptOptions, Pixels, Point,
-    SharedString, StyledImage as _, TitlebarOptions, Window, WindowBounds, WindowControlArea,
-    WindowOptions, actions, anchored, canvas, deferred, div, hsla, img, list, point, prelude::*,
-    px, relative, rgb, rgba, size,
+    SharedString, StyledImage as _, Subscription, TitlebarOptions, Window, WindowBounds,
+    WindowControlArea, WindowOptions, actions, anchored, canvas, deferred, div, hsla, img, list,
+    point, prelude::*, px, relative, rgb, rgba, size,
 };
 use gpui_animation::{
     animation::TransitionExt,
@@ -28,7 +28,7 @@ use gpui_animation::{
 use gpui_component::{
     ActiveTheme, IconName, Root, Sizable as _, Theme, ThemeMode,
     button::{Button, ButtonRounded, ButtonVariants as _},
-    input::{Input, InputState},
+    input::{Input, InputEvent, InputState},
     kbd::Kbd,
 };
 use synapse::ShellState;
@@ -41,6 +41,7 @@ mod http_client;
 mod icons;
 mod inline_rename;
 mod math_renderer;
+mod todo_workspace;
 
 use document_outline::{
     DocumentOutlineEntry, active_document_outline_index, build_document_outline,
@@ -57,6 +58,9 @@ use http_client::SynapseHttpClient;
 use icons::{Icon, SynapseAssets};
 use inline_rename::{InlineRenameEvent, InlineRenameInput};
 use math_renderer::{MathPreview, render_math_preview};
+use todo_workspace::{
+    TodoTagPicker, TodoWorkspace, TodoWorkspaceRenderState, render_todo_workspace,
+};
 
 const WINDOW_DEFAULT_WIDTH: f32 = 1809.0;
 const WINDOW_DEFAULT_HEIGHT: f32 = 1332.0;
@@ -482,10 +486,26 @@ actions!(
     ]
 );
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum WorkspaceView {
+    #[default]
+    Note,
+    Todo,
+}
+
 struct SynapseApp {
     state: ShellState,
     editor_focus: FocusHandle,
     command_search: Entity<InputState>,
+    todo_tag_input: Entity<InputState>,
+    todo_item_input: Entity<InputState>,
+    todo_workspace: TodoWorkspace,
+    workspace_view: WorkspaceView,
+    todo_tag_editor_open: bool,
+    todo_tag_error: Option<String>,
+    todo_item_error: Option<String>,
+    todo_tag_picker: Option<TodoTagPicker>,
+    _input_subscriptions: Vec<Subscription>,
     theme_preference: ThemePreference,
     theme_settings_open: bool,
     theme_settings_closing: bool,
@@ -869,6 +889,181 @@ fn hex_value(byte: u8) -> Option<u8> {
 }
 
 impl SynapseApp {
+    fn open_todo_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.workspace_view = WorkspaceView::Todo;
+        self.dismiss_command_palette(cx);
+        self.dismiss_context_menus(cx);
+        window.focus(&self.todo_item_input.focus_handle(cx));
+        cx.notify();
+    }
+
+    fn select_todo_tag(&mut self, tag_id: Option<u64>, cx: &mut Context<Self>) {
+        self.todo_workspace.select_tag(tag_id);
+        self.todo_tag_error = None;
+        self.todo_item_error = None;
+        self.todo_tag_picker = None;
+        cx.notify();
+    }
+
+    fn confirm_new_todo(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let text = self.todo_item_input.read(cx).value().to_string();
+        match self.todo_workspace.add_todo(&text) {
+            Ok(_) => {
+                self.todo_item_error = self
+                    .todo_workspace
+                    .save_default()
+                    .err()
+                    .map(|error| format!("待办已添加，但无法保存：{error}"));
+                self.todo_item_input.update(cx, |input, cx| {
+                    input.set_value("", window, cx);
+                });
+            }
+            Err(error) => {
+                self.todo_item_error = Some(error.message().to_owned());
+            }
+        }
+        window.focus(&self.todo_item_input.focus_handle(cx));
+        cx.notify();
+    }
+
+    fn toggle_todo_item(&mut self, todo_id: u64, cx: &mut Context<Self>) {
+        if self.todo_workspace.toggle_todo(todo_id) {
+            self.todo_item_error = self
+                .todo_workspace
+                .save_default()
+                .err()
+                .map(|error| format!("待办状态已更新，但无法保存：{error}"));
+            cx.notify();
+        }
+    }
+
+    fn toggle_todo_tag_picker(
+        &mut self,
+        todo_id: u64,
+        position: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        self.todo_tag_picker = if self
+            .todo_tag_picker
+            .is_some_and(|picker| picker.todo_id == todo_id)
+        {
+            None
+        } else {
+            Some(TodoTagPicker { todo_id, position })
+        };
+        cx.notify();
+    }
+
+    fn dismiss_todo_tag_picker(&mut self, cx: &mut Context<Self>) {
+        if self.todo_tag_picker.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    fn toggle_todo_tag_assignment(&mut self, todo_id: u64, tag_id: u64, cx: &mut Context<Self>) {
+        if self.todo_workspace.toggle_todo_tag(todo_id, tag_id) {
+            self.todo_item_error = self
+                .todo_workspace
+                .save_default()
+                .err()
+                .map(|error| format!("标签分配已更新，但无法保存：{error}"));
+            cx.notify();
+        }
+    }
+
+    fn remove_todo_tag_assignment(&mut self, todo_id: u64, tag_id: u64, cx: &mut Context<Self>) {
+        if self.todo_workspace.remove_todo_tag(todo_id, tag_id) {
+            self.todo_item_error = self
+                .todo_workspace
+                .save_default()
+                .err()
+                .map(|error| format!("标签已取消分配，但无法保存：{error}"));
+            cx.notify();
+        }
+    }
+
+    fn copy_todo_text(&mut self, text: String, cx: &mut Context<Self>) {
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        self.todo_item_error = None;
+        cx.notify();
+    }
+
+    fn delete_todo_item(&mut self, todo_id: u64, cx: &mut Context<Self>) {
+        if self.todo_workspace.delete_todo(todo_id) {
+            if self
+                .todo_tag_picker
+                .is_some_and(|picker| picker.todo_id == todo_id)
+            {
+                self.todo_tag_picker = None;
+            }
+            self.todo_item_error = self
+                .todo_workspace
+                .save_default()
+                .err()
+                .map(|error| format!("待办已删除，但无法保存：{error}"));
+            cx.notify();
+        }
+    }
+
+    fn clear_completed_todos(&mut self, cx: &mut Context<Self>) {
+        if self.todo_workspace.clear_completed() == 0 {
+            return;
+        }
+        if self
+            .todo_tag_picker
+            .is_some_and(|picker| !self.todo_workspace.contains_todo(picker.todo_id))
+        {
+            self.todo_tag_picker = None;
+        }
+        self.todo_item_error = self
+            .todo_workspace
+            .save_default()
+            .err()
+            .map(|error| format!("已清除完成项，但无法保存：{error}"));
+        cx.notify();
+    }
+
+    fn begin_new_todo_tag(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.todo_tag_input.update(cx, |input, cx| {
+            input.set_value("", window, cx);
+        });
+        self.todo_tag_editor_open = true;
+        self.todo_tag_error = None;
+        window.focus(&self.todo_tag_input.focus_handle(cx));
+        cx.notify();
+    }
+
+    fn cancel_new_todo_tag(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.todo_tag_input.update(cx, |input, cx| {
+            input.set_value("", window, cx);
+        });
+        self.todo_tag_editor_open = false;
+        self.todo_tag_error = None;
+        cx.notify();
+    }
+
+    fn confirm_new_todo_tag(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let name = self.todo_tag_input.read(cx).value().to_string();
+        match self.todo_workspace.add_tag(&name) {
+            Ok(_) => {
+                self.todo_tag_editor_open = false;
+                self.todo_tag_error = self
+                    .todo_workspace
+                    .save_default()
+                    .err()
+                    .map(|error| format!("标签已添加，但无法保存：{error}"));
+                self.todo_tag_input.update(cx, |input, cx| {
+                    input.set_value("", window, cx);
+                });
+            }
+            Err(error) => {
+                self.todo_tag_error = Some(error.message().to_owned());
+                window.focus(&self.todo_tag_input.focus_handle(cx));
+            }
+        }
+        cx.notify();
+    }
+
     fn toggle_task_item(
         &mut self,
         checkbox_range: Range<usize>,
@@ -977,6 +1172,7 @@ impl SynapseApp {
 
     fn select_note(&mut self, relative_path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         let _ = self.state.select_note(&relative_path);
+        self.workspace_view = WorkspaceView::Note;
         self.editor_selection.collapse(self.state.cursor());
         self.editor_marked_range = None;
         self.tab_context_menu = None;
@@ -988,6 +1184,7 @@ impl SynapseApp {
 
     fn activate_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         let _ = self.state.activate_tab(index);
+        self.workspace_view = WorkspaceView::Note;
         self.editor_selection.collapse(self.state.cursor());
         self.editor_marked_range = None;
         self.tab_context_menu = None;
@@ -1185,6 +1382,7 @@ impl SynapseApp {
 
     fn create_untitled_note(&mut self, parent: &Path, window: &mut Window, cx: &mut Context<Self>) {
         if self.state.create_untitled_note(parent).is_ok() {
+            self.workspace_view = WorkspaceView::Note;
             self.collapsed_directories.remove(parent);
             self.editor_selection.collapse(self.state.cursor());
             self.editor_marked_range = None;
@@ -2903,10 +3101,14 @@ impl Render for SynapseApp {
         let theme = cx.theme().clone();
         let app_entity = cx.entity();
         let command_kbd = Kbd::binding_for_action(&OpenCommandPalette, None, window);
-        let selected_path = self
-            .state
-            .active_document()
-            .map(|document| document.relative_path().to_path_buf());
+        let todo_workspace_active = self.workspace_view == WorkspaceView::Todo;
+        let selected_path = (!todo_workspace_active)
+            .then(|| {
+                self.state
+                    .active_document()
+                    .map(|document| document.relative_path().to_path_buf())
+            })
+            .flatten();
         let active_note_path = selected_path.clone();
         let file_rows = build_file_tree_rows(&self.state.entries, &self.collapsed_directories);
         let tabs = self.state.tabs();
@@ -2931,7 +3133,19 @@ impl Render for SynapseApp {
             editor_horizontal_gutter,
         );
 
-        let editor_body = if let Some(document) = self.state.active_document() {
+        let editor_body = if todo_workspace_active {
+            render_todo_workspace(
+                &self.todo_workspace,
+                TodoWorkspaceRenderState {
+                    todo_input: &self.todo_item_input,
+                    todo_error: self.todo_item_error.as_deref(),
+                    tag_error: self.todo_tag_error.as_deref(),
+                    tag_picker: self.todo_tag_picker,
+                    theme: synapse_theme_palette(theme.is_dark()),
+                },
+                cx,
+            )
+        } else if let Some(document) = self.state.active_document() {
             let cursor = self.state.cursor();
             let vault_root = self
                 .state
@@ -3281,7 +3495,7 @@ impl Render for SynapseApp {
             .children(tabs.into_iter().enumerate().map(|(index, tab)| {
                 let tab_id = SharedString::from(format!("tab-{index}"));
                 let close_id = SharedString::from(format!("close-tab-{index}"));
-                let is_active = active_tab == Some(index);
+                let is_active = !todo_workspace_active && active_tab == Some(index);
                 let close_app = tab_app.clone();
                 div()
                     .id(tab_id)
@@ -3378,131 +3592,224 @@ impl Render for SynapseApp {
                     .window_control_area(WindowControlArea::Drag),
             );
 
-        let editor_toolbar = active_note_path.map(|path| {
-            let parts = note_breadcrumb_parts(&path);
-            let last_index = parts.len().saturating_sub(1);
-            let source_mode = self.markdown_source_mode;
-            let source_app = app_entity.clone();
-            let menu_app = app_entity.clone();
-            div()
-                .id("editor-note-toolbar")
-                .h(px(EDITOR_TOOLBAR_HEIGHT))
-                .flex_none()
-                .flex()
-                .items_center()
-                .px_3()
-                .child(
+        let editor_toolbar =
+            if todo_workspace_active {
+                let start_app = app_entity.clone();
+                let confirm_app = app_entity.clone();
+                let cancel_app = app_entity.clone();
+                let tag_action = if self.todo_tag_editor_open {
                     div()
-                        .flex_1()
-                        .min_w(px(0.0))
+                        .w(px(300.0))
+                        .h(px(40.0))
+                        .flex_none()
+                        .child(
+                            Input::new(&self.todo_tag_input).h(px(40.0)).suffix(
+                                div()
+                                    .h_full()
+                                    .flex()
+                                    .items_center()
+                                    .child(
+                                        Button::new("confirm-todo-tag")
+                                            .ghost()
+                                            .w(px(40.0))
+                                            .h_full()
+                                            .p_0()
+                                            .rounded(ButtonRounded::None)
+                                            .tooltip("完成新建标签")
+                                            .child(
+                                                Icon::Check
+                                                    .render(15.0)
+                                                    .text_color(theme.muted_foreground),
+                                            )
+                                            .on_click(move |_, window, cx| {
+                                                confirm_app.update(cx, |this, cx| {
+                                                    this.confirm_new_todo_tag(window, cx);
+                                                });
+                                            }),
+                                    )
+                                    .child(
+                                        Button::new("cancel-todo-tag")
+                                            .ghost()
+                                            .w(px(40.0))
+                                            .h_full()
+                                            .p_0()
+                                            .rounded(ButtonRounded::None)
+                                            .tooltip("取消新建标签")
+                                            .child(
+                                                Icon::Close
+                                                    .render(15.0)
+                                                    .text_color(theme.muted_foreground),
+                                            )
+                                            .on_click(move |_, window, cx| {
+                                                cancel_app.update(cx, |this, cx| {
+                                                    this.cancel_new_todo_tag(window, cx);
+                                                });
+                                            }),
+                                    ),
+                            ),
+                        )
+                        .into_any_element()
+                } else {
+                    Button::new("new-todo-tag")
+                        .ghost()
+                        .h(px(40.0))
+                        .px_3()
+                        .child(Icon::Tag.render(15.0).text_color(theme.muted_foreground))
+                        .child("新建标签")
+                        .on_click(move |_, window, cx| {
+                            start_app.update(cx, |this, cx| {
+                                this.begin_new_todo_tag(window, cx);
+                            });
+                        })
+                        .into_any_element()
+                };
+                Some(
+                    div()
+                        .id("todo-toolbar")
+                        .h(px(EDITOR_TOOLBAR_HEIGHT))
+                        .flex_none()
                         .flex()
                         .items_center()
-                        .overflow_hidden()
-                        .children(parts.into_iter().enumerate().map(|(index, part)| {
+                        .px_3()
+                        .child(
                             div()
+                                .flex_1()
+                                .text_size(px(13.5))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child("待办"),
+                        )
+                        .child(tag_action)
+                        .into_any_element(),
+                )
+            } else {
+                active_note_path.map(|path| {
+                    let parts = note_breadcrumb_parts(&path);
+                    let last_index = parts.len().saturating_sub(1);
+                    let source_mode = self.markdown_source_mode;
+                    let source_app = app_entity.clone();
+                    let menu_app = app_entity.clone();
+                    div()
+                        .id("editor-note-toolbar")
+                        .h(px(EDITOR_TOOLBAR_HEIGHT))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .px_3()
+                        .child(
+                            div()
+                                .flex_1()
                                 .min_w(px(0.0))
                                 .flex()
                                 .items_center()
-                                .gap_1()
-                                .when(index > 0, |view| {
-                                    view.child(
-                                        Icon::ChevronRight
-                                            .render(13.0)
-                                            .flex_none()
-                                            .text_color(theme.muted_foreground),
-                                    )
+                                .overflow_hidden()
+                                .children(parts.into_iter().enumerate().map(|(index, part)| {
+                                    div()
+                                        .min_w(px(0.0))
+                                        .flex()
+                                        .items_center()
+                                        .gap_1()
+                                        .when(index > 0, |view| {
+                                            view.child(
+                                                Icon::ChevronRight
+                                                    .render(13.0)
+                                                    .flex_none()
+                                                    .text_color(theme.muted_foreground),
+                                            )
+                                        })
+                                        .child(
+                                            div()
+                                                .max_w(px(if index == last_index {
+                                                    260.0
+                                                } else {
+                                                    140.0
+                                                }))
+                                                .truncate()
+                                                .text_size(px(13.5))
+                                                .text_color(if index == last_index {
+                                                    theme.foreground
+                                                } else {
+                                                    theme.muted_foreground
+                                                })
+                                                .when(index == last_index, |text| {
+                                                    text.font_weight(FontWeight::SEMIBOLD)
+                                                })
+                                                .child(part),
+                                        )
+                                })),
+                        )
+                        .child(
+                            Button::new("toggle-markdown-source")
+                                .ghost()
+                                .size(px(40.0))
+                                .tooltip(if source_mode {
+                                    "Show rich editor"
+                                } else {
+                                    "Show Markdown source"
                                 })
                                 .child(
                                     div()
-                                        .max_w(px(if index == last_index { 260.0 } else { 140.0 }))
-                                        .truncate()
-                                        .text_size(px(13.5))
-                                        .text_color(if index == last_index {
+                                        .size(px(28.0))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded_md()
+                                        .border_1()
+                                        .border_color(theme.tab_bar_segmented)
+                                        .bg(if source_mode {
                                             theme.foreground
                                         } else {
-                                            theme.muted_foreground
+                                            theme.secondary_hover
                                         })
-                                        .when(index == last_index, |text| {
-                                            text.font_weight(FontWeight::SEMIBOLD)
-                                        })
-                                        .child(part),
+                                        .child(
+                                            if source_mode {
+                                                Icon::RichText
+                                            } else {
+                                                Icon::Code
+                                            }
+                                            .render(15.0)
+                                            .text_color(if source_mode {
+                                                theme.background
+                                            } else {
+                                                theme.muted_foreground
+                                            }),
+                                        ),
                                 )
-                        })),
-                )
-                .child(
-                    Button::new("toggle-markdown-source")
-                        .ghost()
-                        .size(px(40.0))
-                        .tooltip(if source_mode {
-                            "Show rich editor"
-                        } else {
-                            "Show Markdown source"
-                        })
-                        .child(
-                            div()
-                                .size(px(28.0))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .rounded_md()
-                                .border_1()
-                                .border_color(theme.tab_bar_segmented)
-                                .bg(if source_mode {
-                                    theme.foreground
-                                } else {
-                                    theme.secondary_hover
-                                })
-                                .child(
-                                    if source_mode {
-                                        Icon::RichText
-                                    } else {
-                                        Icon::Code
-                                    }
-                                    .render(15.0)
-                                    .text_color(
-                                        if source_mode {
-                                            theme.background
-                                        } else {
-                                            theme.muted_foreground
-                                        },
-                                    ),
-                                ),
+                                .on_click(move |_, _, cx| {
+                                    source_app.update(cx, |this, cx| {
+                                        this.toggle_markdown_source_mode(cx);
+                                    });
+                                }),
                         )
-                        .on_click(move |_, _, cx| {
-                            source_app.update(cx, |this, cx| {
-                                this.toggle_markdown_source_mode(cx);
-                            });
-                        }),
-                )
-                .child(
-                    Button::new("open-note-actions")
-                        .ghost()
-                        .size(px(40.0))
-                        .tooltip("Note actions")
                         .child(
-                            div()
-                                .size(px(28.0))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .rounded_md()
-                                .border_1()
-                                .border_color(theme.tab_bar_segmented)
-                                .bg(theme.secondary_hover)
+                            Button::new("open-note-actions")
+                                .ghost()
+                                .size(px(40.0))
+                                .tooltip("Note actions")
                                 .child(
-                                    Icon::MoreVertical
-                                        .render(15.0)
-                                        .text_color(theme.muted_foreground),
-                                ),
+                                    div()
+                                        .size(px(28.0))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded_md()
+                                        .border_1()
+                                        .border_color(theme.tab_bar_segmented)
+                                        .bg(theme.secondary_hover)
+                                        .child(
+                                            Icon::MoreVertical
+                                                .render(15.0)
+                                                .text_color(theme.muted_foreground),
+                                        ),
+                                )
+                                .on_click(move |_, _, cx| {
+                                    menu_app.update(cx, |this, cx| {
+                                        this.toggle_note_actions_menu(cx);
+                                    });
+                                }),
                         )
-                        .on_click(move |_, _, cx| {
-                            menu_app.update(cx, |this, cx| {
-                                this.toggle_note_actions_menu(cx);
-                            });
-                        }),
-                )
-                .into_any_element()
-        });
+                        .into_any_element()
+                })
+            };
 
         let sidebar_hover = theme.sidebar_accent;
         let left_sidebar = div()
@@ -3582,6 +3889,9 @@ impl Render for SynapseApp {
                             .h_full()
                             .px_3()
                             .justify_start()
+                            .when(todo_workspace_active, |button| {
+                                button.bg(theme.sidebar_accent)
+                            })
                             .child(
                                 div()
                                     .flex()
@@ -3593,11 +3903,11 @@ impl Render for SynapseApp {
                                             .flex_none()
                                             .text_color(theme.muted_foreground),
                                     )
-                                    .child("Todo"),
+                                    .child("待办"),
                             )
                             .on_click(move |_, window, cx| {
                                 shortcut_app.update(cx, |this, cx| {
-                                    this.open_command_palette(window, cx);
+                                    this.open_todo_workspace(window, cx);
                                 });
                             }),
                     )
@@ -3648,7 +3958,7 @@ impl Render for SynapseApp {
                                             .flex_none()
                                             .text_color(theme.muted_foreground),
                                     )
-                                    .child("Bookmarks"),
+                                    .child("书签"),
                             )
                             .on_click(move |_, window, cx| {
                                 shortcut_app.update(cx, |this, cx| {
@@ -4502,10 +4812,10 @@ impl Render for SynapseApp {
                                 .justify_start()
                                 .child(Icon::Todo.render(17.0))
                                 .child(div().flex_1().child("Open Todo"))
-                                .on_click(move |_, _, cx| {
+                                .on_click(move |_, window, cx| {
                                     cx.stop_propagation();
                                     todo_app.update(cx, |this, cx| {
-                                        this.dismiss_command_palette(cx);
+                                        this.open_todo_workspace(window, cx);
                                     });
                                 }),
                         )
@@ -4893,6 +5203,7 @@ fn synapse_titlebar_options() -> TitlebarOptions {
 fn main() {
     let state = ShellState::from_vault_argument(std::env::args_os().nth(1));
     let theme_preference = load_theme_preference();
+    let todo_workspace = TodoWorkspace::load_default();
     let http_client = SynapseHttpClient::new().expect("failed to initialize the HTTP client");
 
     Application::new()
@@ -4948,37 +5259,73 @@ fn main() {
                             .placeholder("Search any...")
                             .clean_on_escape()
                     });
+                    let todo_tag_input = cx.new(|cx| {
+                        InputState::new(window, cx)
+                            .placeholder("标签名称")
+                            .clean_on_escape()
+                    });
+                    let todo_item_input = cx.new(|cx| {
+                        InputState::new(window, cx)
+                            .placeholder("添加待办…")
+                            .clean_on_escape()
+                    });
                     let editor_line_layouts = Rc::new(RefCell::new(Vec::new()));
                     let editor_list_state = ListState::new(0, ListAlignment::Top, px(320.0));
-                    let app = cx.new(|cx| SynapseApp {
-                        state,
-                        editor_focus: cx.focus_handle(),
-                        command_search,
-                        theme_preference,
-                        theme_settings_open: false,
-                        theme_settings_closing: false,
-                        theme_settings_generation: 0,
-                        theme_persistence_error: None,
-                        left_sidebar_open: true,
-                        command_palette_open: false,
-                        command_palette_closing: false,
-                        command_palette_generation: 0,
-                        tab_context_menu: None,
-                        tree_context_menu: None,
-                        note_actions_menu_open: false,
-                        context_menu_closing: false,
-                        context_menu_generation: 0,
-                        inline_rename: None,
-                        collapsed_directories: BTreeSet::new(),
-                        editor_marked_range: None,
-                        editor_selection: EditorSelection::collapsed(0),
-                        editor_line_layouts: editor_line_layouts.clone(),
-                        editor_list_state: editor_list_state.clone(),
-                        editor_visible_range: 0..0,
-                        editor_outline_hovered_index: None,
-                        editor_render_cache: None,
-                        editor_blink: CursorBlinkState::default(),
-                        markdown_source_mode: false,
+                    let app = cx.new(|cx| {
+                        let input_subscriptions = vec![cx.subscribe_in(
+                            &todo_item_input,
+                            window,
+                            |this: &mut SynapseApp, _, event: &InputEvent, window, cx| match event {
+                                InputEvent::Change => {
+                                    if this.todo_item_error.take().is_some() {
+                                        cx.notify();
+                                    }
+                                }
+                                InputEvent::PressEnter { secondary: false } => {
+                                    this.confirm_new_todo(window, cx);
+                                }
+                                _ => {}
+                            },
+                        )];
+                        SynapseApp {
+                            state,
+                            editor_focus: cx.focus_handle(),
+                            command_search,
+                            todo_tag_input,
+                            todo_item_input,
+                            todo_workspace,
+                            workspace_view: WorkspaceView::Note,
+                            todo_tag_editor_open: false,
+                            todo_tag_error: None,
+                            todo_item_error: None,
+                            todo_tag_picker: None,
+                            _input_subscriptions: input_subscriptions,
+                            theme_preference,
+                            theme_settings_open: false,
+                            theme_settings_closing: false,
+                            theme_settings_generation: 0,
+                            theme_persistence_error: None,
+                            left_sidebar_open: true,
+                            command_palette_open: false,
+                            command_palette_closing: false,
+                            command_palette_generation: 0,
+                            tab_context_menu: None,
+                            tree_context_menu: None,
+                            note_actions_menu_open: false,
+                            context_menu_closing: false,
+                            context_menu_generation: 0,
+                            inline_rename: None,
+                            collapsed_directories: BTreeSet::new(),
+                            editor_marked_range: None,
+                            editor_selection: EditorSelection::collapsed(0),
+                            editor_line_layouts: editor_line_layouts.clone(),
+                            editor_list_state: editor_list_state.clone(),
+                            editor_visible_range: 0..0,
+                            editor_outline_hovered_index: None,
+                            editor_render_cache: None,
+                            editor_blink: CursorBlinkState::default(),
+                            markdown_source_mode: false,
+                        }
                     });
                     editor_list_state.set_scroll_handler({
                         let editor_line_layouts = editor_line_layouts.clone();
