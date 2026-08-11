@@ -16,11 +16,15 @@ Synapse 是一款使用 Rust 与 GPUI 构建的高性能、本地优先 Markdown
 - 文件夹和笔记支持拖到目标目录、同级笔记所在目录或 Vault 根目录。
 - 多文档页签、独立 Rope 缓冲区、Unicode 光标和脏状态。
 - 页签切换、关闭，以及 Close / Close Left / Close Right / Close All 右键菜单。
-- 基础字符输入、换行、删除和左右/Home/End 光标导航。
+- GPUI 原生文本输入，支持中文 IME、鼠标点击定位、换行、删除和上下左右/Home/End 光标导航。
+- 普通 Enter 使用 `writ 0.18.1` 的 tree-sitter Markdown 列表上下文：自动续写无序列表、有序列表、任务列表和引用；空列表项回车退出列表，Shift+Enter 插入原始换行。
+- 编辑光标按约 530ms 周期闪烁；输入、鼠标定位或方向移动后立即恢复显示并重置闪烁周期。
+- Markdown 源码在内存和磁盘中保持原样，编辑区实时呈现标题、列表、引用、代码及常用行内标记。
+- 光标所在行会恢复显示原始 Markdown 标记，离开该行后重新显示阅读样式，避免隐藏语法时无法准确编辑结构。
 - `Cmd/Ctrl + S` 原子保存，保存失败不会丢失内存缓冲区。
 - 可收起的左侧导航和一体化编辑区域。
 - 常驻 40px 底部工具栏使用 Lucide `panel-left` / `panel-right` 控制左侧导航，并与 Settings 行等高对齐。
-- 搜索启动器与中央命令面板 UI。
+- 左侧 Lucide 搜索入口使用 `Search any...` 文案和右侧 `⌘K` 徽标，可打开中央命令面板。
 - Todo、Bookmarks 和 Settings 入口 UI。
 - 导航、菜单和页签操作统一使用编译进应用的 Lucide 官方 SVG 图标。
 
@@ -34,7 +38,8 @@ Synapse 是一款使用 Rust 与 GPUI 构建的高性能、本地优先 Markdown
 - 删除：使用 `trash 5.2.6` 移入操作系统废纸篓，不执行永久删除。
 - 图标：固定使用 Lucide `1.27.0`，项目只内置实际使用的 SVG，并随附上游许可证与来源记录。
 - 动画：固定使用 `gpui-animation 0.2.63`，交互时长和缓动遵循 `docs/过渡和交互动画规约.md`。
-- Markdown 与高亮：后续使用 pulldown-cmark / markdown-rs 与 tree-sitter。
+- Markdown 编辑内核：固定接入 `writ 0.18.1` 并关闭默认 app feature；当前先复用其无头 `EditorState` 和 tree-sitter-md 列表上下文，GPUI 继续承担应用壳、输入法和绘制。
+- Markdown 呈现：当前仍是可编辑的轻量块级实时呈现；后续分阶段把 writ 的解析、位置映射和更多语法节点接入 GPUI 渲染层。
 - 文件监听：后续使用 notify。
 - 文件系统始终是 Markdown 文档的真实来源。
 
@@ -62,8 +67,9 @@ cargo run -p synapse -- /path/to/markdown-folder
 |---|---|
 | 保存 | macOS `Cmd+S`，Windows/Linux `Ctrl+S` |
 | 换行 | `Enter` |
+| 原始换行（不续写 Markdown 容器） | `Shift+Enter` |
 | 删除 | `Backspace` / `Delete` |
-| 移动光标 | `Left` / `Right` / `Home` / `End` |
+| 移动光标 | `Up` / `Down` / `Left` / `Right` / `Home` / `End`，或鼠标点击文本位置 |
 
 ## 验证
 

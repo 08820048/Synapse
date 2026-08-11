@@ -2,16 +2,17 @@ use std::{
     collections::BTreeSet,
     ffi::OsString,
     io,
+    ops::Range,
     path::{Path, PathBuf},
     process::Command,
     time::Duration,
 };
 
 use gpui::{
-    App, Application, Bounds, ClickEvent, Context, Entity, FocusHandle, Focusable, KeyBinding,
-    KeyDownEvent, MouseButton, MouseDownEvent, PathPromptOptions, Pixels, Point, SharedString,
-    Size, TitlebarOptions, Window, WindowBounds, WindowOptions, actions, div, hsla, point,
-    prelude::*, px, rgb, size,
+    App, Application, Bounds, ClickEvent, ClipboardItem, Context, CursorStyle, Entity, FocusHandle,
+    Focusable, FontWeight, KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    PathPromptOptions, Pixels, Point, SharedString, Size, TitlebarOptions, Window, WindowBounds,
+    WindowOptions, actions, div, hsla, point, prelude::*, px, rgb, size,
 };
 use gpui_animation::{
     animation::TransitionExt,
@@ -20,9 +21,15 @@ use gpui_animation::{
 use synapse::ShellState;
 use synapse_core::{VaultEntry, VaultEntryKind};
 
+mod editor_blink;
+mod editor_surface;
 mod icons;
 mod inline_rename;
 
+use editor_blink::CursorBlinkState;
+use editor_surface::{
+    EditorLineLayout, EditorSelection, MarkdownBlockKind, MarkdownLineElement, source_lines,
+};
 use icons::{Icon, SynapseAssets};
 use inline_rename::{InlineRenameEvent, InlineRenameInput};
 
@@ -31,6 +38,7 @@ const WINDOW_MIN_HEIGHT: f32 = 560.0;
 const BOTTOM_BAR_HEIGHT: f32 = 40.0;
 const QUICK_TRANSITION: Duration = Duration::from_millis(140);
 const PANEL_TRANSITION: Duration = Duration::from_millis(180);
+const EDITOR_CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(530);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum FileTreeRow {
@@ -170,9 +178,22 @@ actions!(
         DeleteForward,
         MoveLeft,
         MoveRight,
+        MoveUp,
+        MoveDown,
         MoveHome,
         MoveEnd,
+        SelectLeft,
+        SelectRight,
+        SelectUp,
+        SelectDown,
+        SelectHome,
+        SelectEnd,
+        SelectAll,
+        Copy,
+        Cut,
+        Paste,
         InsertNewline,
+        InsertRawNewline,
     ]
 );
 
@@ -189,6 +210,10 @@ struct SynapseApp {
     context_menu_generation: u64,
     inline_rename: Option<Entity<InlineRenameInput>>,
     collapsed_directories: BTreeSet<PathBuf>,
+    editor_marked_range: Option<Range<usize>>,
+    editor_selection: EditorSelection,
+    editor_line_layouts: Vec<Option<EditorLineLayout>>,
+    editor_blink: CursorBlinkState,
 }
 
 impl SynapseApp {
@@ -209,6 +234,8 @@ impl SynapseApp {
                             && this.state.open_vault(path).is_ok()
                         {
                             this.collapsed_directories.clear();
+                            this.editor_selection.collapse(0);
+                            this.editor_marked_range = None;
                         }
                     }
                     Ok(Ok(None)) => {}
@@ -227,37 +254,51 @@ impl SynapseApp {
 
     fn select_note(&mut self, relative_path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         let _ = self.state.select_note(&relative_path);
+        self.editor_selection.collapse(self.state.cursor());
+        self.editor_marked_range = None;
         self.tab_context_menu = None;
         self.tree_context_menu = None;
         window.focus(&self.editor_focus);
+        self.restart_editor_cursor_blink(cx);
         cx.notify();
     }
 
     fn activate_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         let _ = self.state.activate_tab(index);
+        self.editor_selection.collapse(self.state.cursor());
+        self.editor_marked_range = None;
         self.tab_context_menu = None;
         self.tree_context_menu = None;
         window.focus(&self.editor_focus);
+        self.restart_editor_cursor_blink(cx);
         cx.notify();
     }
 
     fn close_tab(&mut self, index: usize, cx: &mut Context<Self>) {
         let _ = self.state.close_tab(index);
+        self.editor_selection.collapse(self.state.cursor());
+        self.editor_marked_range = None;
         self.dismiss_context_menus(cx);
     }
 
     fn close_tabs_left(&mut self, index: usize, cx: &mut Context<Self>) {
         let _ = self.state.close_tabs_left(index);
+        self.editor_selection.collapse(self.state.cursor());
+        self.editor_marked_range = None;
         self.dismiss_context_menus(cx);
     }
 
     fn close_tabs_right(&mut self, index: usize, cx: &mut Context<Self>) {
         let _ = self.state.close_tabs_right(index);
+        self.editor_selection.collapse(self.state.cursor());
+        self.editor_marked_range = None;
         self.dismiss_context_menus(cx);
     }
 
     fn close_all_tabs(&mut self, cx: &mut Context<Self>) {
         let _ = self.state.close_all_tabs();
+        self.editor_selection.collapse(self.state.cursor());
+        self.editor_marked_range = None;
         self.dismiss_context_menus(cx);
     }
 
@@ -320,7 +361,10 @@ impl SynapseApp {
     fn create_untitled_note(&mut self, parent: &Path, window: &mut Window, cx: &mut Context<Self>) {
         if self.state.create_untitled_note(parent).is_ok() {
             self.collapsed_directories.remove(parent);
+            self.editor_selection.collapse(self.state.cursor());
+            self.editor_marked_range = None;
             window.focus(&self.editor_focus);
+            self.restart_editor_cursor_blink(cx);
         }
         self.dismiss_command_palette(cx);
         self.dismiss_context_menus(cx);
@@ -441,26 +485,6 @@ impl SynapseApp {
         self.dismiss_context_menus(cx);
     }
 
-    fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
-        if event.keystroke.modifiers.control || event.keystroke.modifiers.platform {
-            return;
-        }
-        let Some(text) = event.keystroke.key_char.as_deref() else {
-            return;
-        };
-        if text
-            .chars()
-            .any(|character| character == '\r' || character == '\n' || character.is_control())
-        {
-            return;
-        }
-
-        if self.state.insert_text(text).is_ok() {
-            cx.stop_propagation();
-            cx.notify();
-        }
-    }
-
     fn save(&mut self, _: &Save, _: &mut Window, cx: &mut Context<Self>) {
         let _ = self.state.save_active();
         cx.stop_propagation();
@@ -468,45 +492,300 @@ impl SynapseApp {
     }
 
     fn backspace(&mut self, _: &Backspace, _: &mut Window, cx: &mut Context<Self>) {
-        let _ = self.state.backspace();
+        self.editor_marked_range = None;
+        if self.editor_selection.is_empty() {
+            let _ = self.state.backspace();
+        } else {
+            let _ = self
+                .state
+                .replace_active_range(self.editor_selection.range(), "");
+        }
+        self.editor_selection.collapse(self.state.cursor());
+        self.restart_editor_cursor_blink(cx);
         cx.stop_propagation();
         cx.notify();
     }
 
     fn delete_forward(&mut self, _: &DeleteForward, _: &mut Window, cx: &mut Context<Self>) {
-        let _ = self.state.delete_forward();
+        self.editor_marked_range = None;
+        if self.editor_selection.is_empty() {
+            let _ = self.state.delete_forward();
+        } else {
+            let _ = self
+                .state
+                .replace_active_range(self.editor_selection.range(), "");
+        }
+        self.editor_selection.collapse(self.state.cursor());
+        self.restart_editor_cursor_blink(cx);
         cx.stop_propagation();
         cx.notify();
     }
 
     fn move_left(&mut self, _: &MoveLeft, _: &mut Window, cx: &mut Context<Self>) {
-        self.state.move_left();
+        self.editor_marked_range = None;
+        if self.editor_selection.is_empty() {
+            self.state.move_left();
+        } else {
+            self.state.set_cursor(self.editor_selection.range().start);
+        }
+        self.editor_selection.collapse(self.state.cursor());
+        self.restart_editor_cursor_blink(cx);
         cx.stop_propagation();
         cx.notify();
     }
 
     fn move_right(&mut self, _: &MoveRight, _: &mut Window, cx: &mut Context<Self>) {
-        self.state.move_right();
+        self.editor_marked_range = None;
+        if self.editor_selection.is_empty() {
+            self.state.move_right();
+        } else {
+            self.state.set_cursor(self.editor_selection.range().end);
+        }
+        self.editor_selection.collapse(self.state.cursor());
+        self.restart_editor_cursor_blink(cx);
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn move_up(&mut self, _: &MoveUp, _: &mut Window, cx: &mut Context<Self>) {
+        self.editor_marked_range = None;
+        self.state.move_up();
+        self.editor_selection.collapse(self.state.cursor());
+        self.restart_editor_cursor_blink(cx);
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn move_down(&mut self, _: &MoveDown, _: &mut Window, cx: &mut Context<Self>) {
+        self.editor_marked_range = None;
+        self.state.move_down();
+        self.editor_selection.collapse(self.state.cursor());
+        self.restart_editor_cursor_blink(cx);
         cx.stop_propagation();
         cx.notify();
     }
 
     fn move_home(&mut self, _: &MoveHome, _: &mut Window, cx: &mut Context<Self>) {
+        self.editor_marked_range = None;
         self.state.move_home();
+        self.editor_selection.collapse(self.state.cursor());
+        self.restart_editor_cursor_blink(cx);
         cx.stop_propagation();
         cx.notify();
     }
 
     fn move_end(&mut self, _: &MoveEnd, _: &mut Window, cx: &mut Context<Self>) {
+        self.editor_marked_range = None;
         self.state.move_end();
+        self.editor_selection.collapse(self.state.cursor());
+        self.restart_editor_cursor_blink(cx);
         cx.stop_propagation();
         cx.notify();
     }
 
-    fn insert_newline(&mut self, _: &InsertNewline, _: &mut Window, cx: &mut Context<Self>) {
-        let _ = self.state.insert_text("\n");
+    fn select_left(&mut self, _: &SelectLeft, _: &mut Window, cx: &mut Context<Self>) {
+        self.state.move_left();
+        self.extend_editor_selection(cx);
+    }
+
+    fn select_right(&mut self, _: &SelectRight, _: &mut Window, cx: &mut Context<Self>) {
+        self.state.move_right();
+        self.extend_editor_selection(cx);
+    }
+
+    fn select_up(&mut self, _: &SelectUp, _: &mut Window, cx: &mut Context<Self>) {
+        self.state.move_up();
+        self.extend_editor_selection(cx);
+    }
+
+    fn select_down(&mut self, _: &SelectDown, _: &mut Window, cx: &mut Context<Self>) {
+        self.state.move_down();
+        self.extend_editor_selection(cx);
+    }
+
+    fn select_home(&mut self, _: &SelectHome, _: &mut Window, cx: &mut Context<Self>) {
+        self.state.move_home();
+        self.extend_editor_selection(cx);
+    }
+
+    fn select_end(&mut self, _: &SelectEnd, _: &mut Window, cx: &mut Context<Self>) {
+        self.state.move_end();
+        self.extend_editor_selection(cx);
+    }
+
+    fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(len_chars) = self
+            .state
+            .active_document()
+            .map(|document| document.len_chars())
+        else {
+            return;
+        };
+        self.editor_marked_range = None;
+        self.editor_selection.select_all(len_chars);
+        self.state.set_cursor(len_chars);
+        self.restart_editor_cursor_blink(cx);
         cx.stop_propagation();
         cx.notify();
+    }
+
+    fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(text) = self.selected_editor_text() {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
+        cx.stop_propagation();
+    }
+
+    fn cut(&mut self, _: &Cut, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(text) = self.selected_editor_text() {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+            let _ = self
+                .state
+                .replace_active_range(self.editor_selection.range(), "");
+            self.editor_selection.collapse(self.state.cursor());
+            self.restart_editor_cursor_blink(cx);
+            cx.notify();
+        }
+        cx.stop_propagation();
+    }
+
+    fn paste(&mut self, _: &Paste, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+            let text = normalize_clipboard_text(&text);
+            let _ = self
+                .state
+                .replace_active_range(self.editor_selection.range(), &text);
+            self.editor_selection.collapse(self.state.cursor());
+            self.editor_marked_range = None;
+            self.restart_editor_cursor_blink(cx);
+            cx.notify();
+        }
+        cx.stop_propagation();
+    }
+
+    fn insert_newline(&mut self, _: &InsertNewline, _: &mut Window, cx: &mut Context<Self>) {
+        self.editor_marked_range = None;
+        if self.editor_selection.is_empty() {
+            let _ = self.state.smart_enter();
+        } else {
+            let _ = self
+                .state
+                .replace_active_range(self.editor_selection.range(), "\n");
+        }
+        self.editor_selection.collapse(self.state.cursor());
+        self.restart_editor_cursor_blink(cx);
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn insert_raw_newline(&mut self, _: &InsertRawNewline, _: &mut Window, cx: &mut Context<Self>) {
+        self.editor_marked_range = None;
+        let _ = self
+            .state
+            .replace_active_range(self.editor_selection.range(), "\n");
+        self.editor_selection.collapse(self.state.cursor());
+        self.restart_editor_cursor_blink(cx);
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn extend_editor_selection(&mut self, cx: &mut Context<Self>) {
+        self.editor_marked_range = None;
+        self.editor_selection.select_to(self.state.cursor());
+        self.restart_editor_cursor_blink(cx);
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn selected_editor_text(&self) -> Option<String> {
+        let range = self.editor_selection.range();
+        if range.is_empty() {
+            return None;
+        }
+        let text = self.state.active_document()?.text();
+        Some(text.chars().skip(range.start).take(range.len()).collect())
+    }
+
+    fn editor_char_for_position(&self, position: Point<Pixels>) -> Option<usize> {
+        let mut layouts = self.editor_line_layouts.iter().flatten();
+        let first = layouts.next()?;
+        if position.y < first.bounds.top() {
+            return Some(first.start_char);
+        }
+        if position.y <= first.bounds.bottom() {
+            return Some(first.source_char_for_position(position));
+        }
+        let mut last = first;
+        for layout in layouts {
+            if position.y <= layout.bounds.bottom() {
+                return Some(layout.source_char_for_position(position));
+            }
+            last = layout;
+        }
+        Some(last.start_char + last.source_len_chars)
+    }
+
+    fn editor_mouse_down(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(cursor) = self.editor_char_for_position(event.position) else {
+            return;
+        };
+        self.editor_marked_range = None;
+        self.editor_selection
+            .start_drag(cursor, event.modifiers.shift);
+        self.state.set_cursor(cursor);
+        window.focus(&self.editor_focus);
+        self.restart_editor_cursor_blink(cx);
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn editor_mouse_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.editor_selection.is_dragging() {
+            return;
+        }
+        if let Some(cursor) = self.editor_char_for_position(event.position) {
+            self.editor_selection.select_to(cursor);
+            self.state.set_cursor(cursor);
+            self.restart_editor_cursor_blink(cx);
+            cx.notify();
+        }
+    }
+
+    fn editor_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, _: &mut Context<Self>) {
+        self.editor_selection.finish_drag();
+    }
+
+    fn restart_editor_cursor_blink(&mut self, cx: &mut Context<Self>) {
+        let generation = self.editor_blink.restart();
+        let executor = cx.background_executor().clone();
+        cx.spawn(async move |this, cx| {
+            loop {
+                executor.timer(EDITOR_CURSOR_BLINK_INTERVAL).await;
+                let should_continue = this
+                    .update(cx, |this, cx| {
+                        if !this.editor_blink.toggle(generation) {
+                            return false;
+                        }
+                        cx.notify();
+                        true
+                    })
+                    .unwrap_or(false);
+                if !should_continue {
+                    break;
+                }
+            }
+        })
+        .detach();
     }
 }
 
@@ -518,7 +797,6 @@ impl Focusable for SynapseApp {
 
 impl Render for SynapseApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let vault_label = self.state.vault_name.as_deref().unwrap_or("No vault open");
         let selected_path = self
             .state
             .active_document()
@@ -536,106 +814,160 @@ impl Render for SynapseApp {
         let active_tab = self.state.active_tab_index();
         let no_vault_open = self.state.vault_name.is_none();
 
-        let editor_body =
-            if let Some(document) = self.state.active_document() {
-                let lines = lines_with_cursor(&document.text(), self.state.cursor());
-                div()
-                    .id("editor-content")
-                    .flex_1()
-                    .min_w(px(0.0))
-                    .overflow_y_scroll()
-                    .p_5()
-                    .track_focus(&self.editor_focus)
-                    .key_context("SynapseEditor")
-                    .on_key_down(cx.listener(Self::on_key_down))
-                    .on_action(cx.listener(Self::save))
-                    .on_action(cx.listener(Self::backspace))
-                    .on_action(cx.listener(Self::delete_forward))
-                    .on_action(cx.listener(Self::move_left))
-                    .on_action(cx.listener(Self::move_right))
-                    .on_action(cx.listener(Self::move_home))
-                    .on_action(cx.listener(Self::move_end))
-                    .on_action(cx.listener(Self::insert_newline))
-                    .on_click(cx.listener(|this, _, window, _| {
-                        window.focus(&this.editor_focus);
-                    }))
-                    .children(lines.into_iter().enumerate().map(|(index, line)| {
-                        div()
-                            .flex()
-                            .w_full()
-                            .min_w(px(0.0))
-                            .items_start()
-                            .min_h(px(24.0))
-                            .text_sm()
-                            .child(
-                                div()
-                                    .w(px(46.0))
-                                    .flex_none()
-                                    .text_color(rgb(0x454c5b))
-                                    .child(format!("{}", index + 1)),
-                            )
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w(px(0.0))
-                                    .whitespace_normal()
-                                    .text_color(rgb(0xcbd0dc))
-                                    .child(if line.is_empty() {
-                                        " ".to_owned()
-                                    } else {
-                                        line
-                                    }),
-                            )
-                    }))
-                    .into_any_element()
-            } else {
-                let center_message = self.state.vault_error.as_deref().unwrap_or(
-                    if self.state.vault_name.is_some() {
+        let editor_body = if let Some(document) = self.state.active_document() {
+            let cursor = self.state.cursor();
+            self.editor_selection.clamp(document.len_chars());
+            let lines = source_lines(&document.text(), cursor);
+            let selection = self.editor_selection.range();
+            self.editor_line_layouts = vec![None; lines.len()];
+            let app = cx.entity();
+            div()
+                .id("editor-content")
+                .flex_1()
+                .min_w(px(0.0))
+                .overflow_y_scroll()
+                .p_5()
+                .track_focus(&self.editor_focus)
+                .key_context("SynapseEditor")
+                .on_action(cx.listener(Self::save))
+                .on_action(cx.listener(Self::backspace))
+                .on_action(cx.listener(Self::delete_forward))
+                .on_action(cx.listener(Self::move_left))
+                .on_action(cx.listener(Self::move_right))
+                .on_action(cx.listener(Self::move_up))
+                .on_action(cx.listener(Self::move_down))
+                .on_action(cx.listener(Self::move_home))
+                .on_action(cx.listener(Self::move_end))
+                .on_action(cx.listener(Self::select_left))
+                .on_action(cx.listener(Self::select_right))
+                .on_action(cx.listener(Self::select_up))
+                .on_action(cx.listener(Self::select_down))
+                .on_action(cx.listener(Self::select_home))
+                .on_action(cx.listener(Self::select_end))
+                .on_action(cx.listener(Self::select_all))
+                .on_action(cx.listener(Self::copy))
+                .on_action(cx.listener(Self::cut))
+                .on_action(cx.listener(Self::paste))
+                .on_action(cx.listener(Self::insert_newline))
+                .on_action(cx.listener(Self::insert_raw_newline))
+                .on_mouse_down(MouseButton::Left, cx.listener(Self::editor_mouse_down))
+                .on_mouse_move(cx.listener(Self::editor_mouse_move))
+                .on_mouse_up(MouseButton::Left, cx.listener(Self::editor_mouse_up))
+                .on_mouse_up_out(MouseButton::Left, cx.listener(Self::editor_mouse_up))
+                .children(lines.into_iter().enumerate().map(|(index, line)| {
+                    let active = (line.start_char..=line.start_char + line.source_len_chars)
+                        .contains(&cursor);
+                    let kind = line.presentation.kind;
+                    let app = app.clone();
+                    div()
+                        .flex()
+                        .w_full()
+                        .min_w(px(0.0))
+                        .items_start()
+                        .min_h(match kind {
+                            MarkdownBlockKind::Heading(1) => px(38.0),
+                            MarkdownBlockKind::Heading(2) => px(34.0),
+                            MarkdownBlockKind::Heading(_) => px(30.0),
+                            MarkdownBlockKind::ThematicBreak => px(20.0),
+                            _ => px(26.0),
+                        })
+                        .child(
+                            div()
+                                .w(px(46.0))
+                                .flex_none()
+                                .pt_1()
+                                .text_color(rgb(0x454c5b))
+                                .text_xs()
+                                .child(format!("{}", index + 1)),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .cursor(CursorStyle::IBeam)
+                                .text_color(match kind {
+                                    MarkdownBlockKind::Quote => rgb(0x9da7b8),
+                                    MarkdownBlockKind::Code => rgb(0xb6c9a8),
+                                    MarkdownBlockKind::Task(true) => rgb(0x747d8d),
+                                    MarkdownBlockKind::Table => rgb(0xb8c4d8),
+                                    MarkdownBlockKind::Math => rgb(0xcab7e8),
+                                    MarkdownBlockKind::Html => rgb(0xd0a878),
+                                    _ => rgb(0xcbd0dc),
+                                })
+                                .when(matches!(kind, MarkdownBlockKind::Heading(1)), |style| {
+                                    style.text_2xl().font_weight(FontWeight::SEMIBOLD)
+                                })
+                                .when(matches!(kind, MarkdownBlockKind::Heading(2)), |style| {
+                                    style.text_xl().font_weight(FontWeight::SEMIBOLD)
+                                })
+                                .when(matches!(kind, MarkdownBlockKind::Heading(3..=6)), |style| {
+                                    style.text_lg().font_weight(FontWeight::SEMIBOLD)
+                                })
+                                .when(!matches!(kind, MarkdownBlockKind::Heading(_)), |style| {
+                                    style.text_sm()
+                                })
+                                .child(MarkdownLineElement {
+                                    app,
+                                    line_index: index,
+                                    source_line: line,
+                                    active,
+                                    cursor,
+                                    selection: selection.clone(),
+                                    cursor_visible: self.editor_blink.visible(),
+                                }),
+                        )
+                }))
+                .into_any_element()
+        } else {
+            let center_message =
+                self.state
+                    .vault_error
+                    .as_deref()
+                    .unwrap_or(if self.state.vault_name.is_some() {
                         "Select a note from the file tree"
                     } else {
                         "Choose a local folder to start writing"
-                    },
-                );
-                div()
-                    .flex_1()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .items_center()
-                            .gap_3()
-                            .px_6()
-                            .py_4()
-                            .text_sm()
-                            .text_color(if self.state.vault_error.is_some() {
-                                rgb(0xe69a9a)
-                            } else {
-                                rgb(0x747d90)
-                            })
-                            .child(center_message.to_owned())
-                            .when(no_vault_open, |view| {
-                                view.child(
-                                    div()
-                                        .id("open-vault-empty-state")
-                                        .px_4()
-                                        .py_2()
-                                        .rounded_md()
-                                        .bg(rgb(0x355a86))
-                                        .text_color(rgb(0xf3f6fb))
-                                        .cursor_pointer()
-                                        .hover(|style| style.bg(rgb(0x416d9f)))
-                                        .child("Open Vault")
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.prompt_for_vault(cx);
-                                        })),
-                                )
-                            }),
-                    )
-                    .into_any_element()
-            };
+                    });
+            div()
+                .flex_1()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .gap_3()
+                        .px_6()
+                        .py_4()
+                        .text_sm()
+                        .text_color(if self.state.vault_error.is_some() {
+                            rgb(0xe69a9a)
+                        } else {
+                            rgb(0x747d90)
+                        })
+                        .child(center_message.to_owned())
+                        .when(no_vault_open, |view| {
+                            view.child(
+                                div()
+                                    .id("open-vault-empty-state")
+                                    .px_4()
+                                    .py_2()
+                                    .rounded_md()
+                                    .bg(rgb(0x355a86))
+                                    .text_color(rgb(0xf3f6fb))
+                                    .cursor_pointer()
+                                    .hover(|style| style.bg(rgb(0x416d9f)))
+                                    .child("Open Vault")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.prompt_for_vault(cx);
+                                    })),
+                            )
+                        }),
+                )
+                .into_any_element()
+        };
 
         let tab_bar = div()
             .id("document-tabs")
@@ -762,7 +1094,7 @@ impl Render for SynapseApp {
                     .cursor_pointer()
                     .hover(|style| style.border_color(rgb(0x3a414d)))
                     .child(Icon::Search.render(16.0).text_color(rgb(0x707887)))
-                    .child(div().flex_1().child("Search notes and commands…"))
+                    .child(div().flex_1().child("Search any..."))
                     .child(
                         div()
                             .px_1()
@@ -1511,7 +1843,7 @@ impl Render for SynapseApp {
                                     div()
                                         .flex_1()
                                         .text_color(rgb(0x858e9d))
-                                        .child("Search notes and commands…"),
+                                        .child("Search any..."),
                                 ),
                         )
                         .child(
@@ -1641,23 +1973,6 @@ impl Render for SynapseApp {
                     .border_b_1()
                     .border_color(rgb(0x2a2e36))
                     .bg(rgb(0x171a20))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .min_w(px(0.0))
-                            .child(div().text_sm().text_color(rgb(0xcbd1dc)).child("Synapse"))
-                            .child(div().text_color(rgb(0x454c5b)).child("/"))
-                            .child(
-                                div()
-                                    .max_w(px(240.0))
-                                    .truncate()
-                                    .text_xs()
-                                    .text_color(rgb(0x747d90))
-                                    .child(vault_label.to_owned()),
-                            ),
-                    )
                     .child(div().flex_1())
                     .child(
                         div()
@@ -1795,6 +2110,10 @@ fn clamp_pixels(value: Pixels, minimum: Pixels, maximum: Pixels) -> Pixels {
     }
 }
 
+fn normalize_clipboard_text(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
+}
+
 fn file_manager_reveal_command(path: &Path) -> (&'static str, Vec<OsString>) {
     #[cfg(target_os = "macos")]
     {
@@ -1834,22 +2153,6 @@ fn synapse_titlebar_options() -> TitlebarOptions {
     }
 }
 
-fn lines_with_cursor(text: &str, cursor: usize) -> Vec<String> {
-    let mut display = String::with_capacity(text.len() + 3);
-    let mut char_index = 0;
-    for character in text.chars() {
-        if char_index == cursor {
-            display.push('▏');
-        }
-        display.push(character);
-        char_index += 1;
-    }
-    if char_index == cursor {
-        display.push('▏');
-    }
-    display.split('\n').map(str::to_owned).collect()
-}
-
 fn main() {
     let state = ShellState::from_vault_argument(std::env::args_os().nth(1));
 
@@ -1863,9 +2166,26 @@ fn main() {
                 KeyBinding::new("delete", DeleteForward, Some("SynapseEditor")),
                 KeyBinding::new("left", MoveLeft, Some("SynapseEditor")),
                 KeyBinding::new("right", MoveRight, Some("SynapseEditor")),
+                KeyBinding::new("up", MoveUp, Some("SynapseEditor")),
+                KeyBinding::new("down", MoveDown, Some("SynapseEditor")),
                 KeyBinding::new("home", MoveHome, Some("SynapseEditor")),
                 KeyBinding::new("end", MoveEnd, Some("SynapseEditor")),
+                KeyBinding::new("shift-left", SelectLeft, Some("SynapseEditor")),
+                KeyBinding::new("shift-right", SelectRight, Some("SynapseEditor")),
+                KeyBinding::new("shift-up", SelectUp, Some("SynapseEditor")),
+                KeyBinding::new("shift-down", SelectDown, Some("SynapseEditor")),
+                KeyBinding::new("shift-home", SelectHome, Some("SynapseEditor")),
+                KeyBinding::new("shift-end", SelectEnd, Some("SynapseEditor")),
+                KeyBinding::new("cmd-a", SelectAll, Some("SynapseEditor")),
+                KeyBinding::new("ctrl-a", SelectAll, Some("SynapseEditor")),
+                KeyBinding::new("cmd-c", Copy, Some("SynapseEditor")),
+                KeyBinding::new("ctrl-c", Copy, Some("SynapseEditor")),
+                KeyBinding::new("cmd-x", Cut, Some("SynapseEditor")),
+                KeyBinding::new("ctrl-x", Cut, Some("SynapseEditor")),
+                KeyBinding::new("cmd-v", Paste, Some("SynapseEditor")),
+                KeyBinding::new("ctrl-v", Paste, Some("SynapseEditor")),
                 KeyBinding::new("enter", InsertNewline, Some("SynapseEditor")),
+                KeyBinding::new("shift-enter", InsertRawNewline, Some("SynapseEditor")),
             ]);
 
             let bounds = Bounds::centered(None, size(px(1180.0), px(760.0)), cx);
@@ -1877,7 +2197,7 @@ fn main() {
                     ..Default::default()
                 },
                 move |_, cx| {
-                    cx.new(|cx| SynapseApp {
+                    let app = cx.new(|cx| SynapseApp {
                         state,
                         editor_focus: cx.focus_handle(),
                         left_sidebar_open: true,
@@ -1890,7 +2210,13 @@ fn main() {
                         context_menu_generation: 0,
                         inline_rename: None,
                         collapsed_directories: BTreeSet::new(),
-                    })
+                        editor_marked_range: None,
+                        editor_selection: EditorSelection::collapsed(0),
+                        editor_line_layouts: Vec::new(),
+                        editor_blink: CursorBlinkState::default(),
+                    });
+                    app.update(cx, |app, cx| app.restart_editor_cursor_blink(cx));
+                    app
                 },
             )
             .expect("failed to open the Synapse window");
@@ -1910,18 +2236,16 @@ mod tests {
 
     use super::{
         BOTTOM_BAR_HEIGHT, FileTreeRow, build_file_tree_rows, context_menu_position,
-        file_manager_reveal_command, is_tab_context_trigger, lines_with_cursor,
+        file_manager_reveal_command, is_tab_context_trigger, normalize_clipboard_text,
         synapse_titlebar_options, toolbar_left_padding,
     };
 
     #[test]
-    fn cursor_rendering_uses_unicode_character_indices() {
-        assert_eq!(lines_with_cursor("你a\nb", 1), vec!["你▏a", "b"]);
-    }
-
-    #[test]
-    fn cursor_rendering_preserves_trailing_empty_line() {
-        assert_eq!(lines_with_cursor("a\n", 2), vec!["a", "▏"]);
+    fn p2_clipboard_normalizes_platform_newlines_without_dropping_markdown() {
+        assert_eq!(
+            normalize_clipboard_text("# 标题\r\n\r\n- 第一项\r- 第二项"),
+            "# 标题\n\n- 第一项\n- 第二项"
+        );
     }
 
     #[test]

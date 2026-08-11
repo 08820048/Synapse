@@ -2,6 +2,7 @@ use std::{
     error::Error,
     ffi::OsString,
     fmt,
+    ops::Range,
     path::{Path, PathBuf},
 };
 
@@ -9,10 +10,15 @@ use synapse_core::{
     BufferError, NoteDocument, NoteEntry, Vault, VaultEntry, VaultEntryKind, VaultError,
 };
 
+mod markdown_command;
+
+pub use markdown_command::{MarkdownEdit, smart_enter_edit};
+
 #[derive(Debug)]
 struct OpenTab {
     document: NoteDocument,
     cursor: usize,
+    preferred_column: Option<usize>,
     title_linked: bool,
 }
 
@@ -288,6 +294,7 @@ impl ShellState {
                 self.tabs.push(OpenTab {
                     document,
                     cursor: 0,
+                    preferred_column: None,
                     title_linked: false,
                 });
                 self.active_tab = Some(self.tabs.len() - 1);
@@ -309,12 +316,75 @@ impl ShellState {
             .insert(tab.cursor, text)
             .map_err(SessionError::Buffer)?;
         tab.cursor += text.chars().count();
+        tab.preferred_column = None;
         if tab.document.is_dirty() {
             self.status_message = "Modified".to_owned();
             self.vault_error = None;
         }
         self.sync_active_linked_title();
         Ok(())
+    }
+
+    pub fn smart_enter(&mut self) -> Result<(), SessionError> {
+        let source = self
+            .active_document()
+            .ok_or(SessionError::NoActiveNote)?
+            .text();
+        let edit = smart_enter_edit(&source, self.cursor());
+        self.replace_active_range(edit.range, &edit.replacement)?;
+        self.set_cursor(edit.cursor);
+        Ok(())
+    }
+
+    pub fn replace_active_range(
+        &mut self,
+        range: Range<usize>,
+        text: &str,
+    ) -> Result<(), SessionError> {
+        self.replace_active_range_inner(range, text, true)
+    }
+
+    pub fn replace_active_range_composing(
+        &mut self,
+        range: Range<usize>,
+        text: &str,
+    ) -> Result<(), SessionError> {
+        self.replace_active_range_inner(range, text, false)
+    }
+
+    fn replace_active_range_inner(
+        &mut self,
+        range: Range<usize>,
+        text: &str,
+        sync_linked_title: bool,
+    ) -> Result<(), SessionError> {
+        let index = self.active_tab.ok_or(SessionError::NoActiveNote)?;
+        let tab = &mut self.tabs[index];
+        tab.document
+            .remove(range.clone())
+            .map_err(SessionError::Buffer)?;
+        tab.document
+            .insert(range.start, text)
+            .map_err(SessionError::Buffer)?;
+        tab.cursor = range.start + text.chars().count();
+        tab.preferred_column = None;
+        self.status_message = "Modified".to_owned();
+        self.vault_error = None;
+        if sync_linked_title {
+            self.sync_active_linked_title();
+        }
+        Ok(())
+    }
+
+    pub fn finalize_active_composition(&mut self) {
+        self.sync_active_linked_title();
+    }
+
+    pub fn set_cursor(&mut self, char_index: usize) {
+        if let Some(tab) = self.active_tab.and_then(|index| self.tabs.get_mut(index)) {
+            tab.cursor = char_index.min(tab.document.len_chars());
+            tab.preferred_column = None;
+        }
     }
 
     pub fn backspace(&mut self) -> Result<(), SessionError> {
@@ -327,6 +397,7 @@ impl ShellState {
             .remove(tab.cursor - 1..tab.cursor)
             .map_err(SessionError::Buffer)?;
         tab.cursor -= 1;
+        tab.preferred_column = None;
         self.status_message = "Modified".to_owned();
         self.vault_error = None;
         self.sync_active_linked_title();
@@ -342,6 +413,7 @@ impl ShellState {
         tab.document
             .remove(tab.cursor..tab.cursor + 1)
             .map_err(SessionError::Buffer)?;
+        tab.preferred_column = None;
         self.status_message = "Modified".to_owned();
         self.vault_error = None;
         self.sync_active_linked_title();
@@ -351,12 +423,14 @@ impl ShellState {
     pub fn move_left(&mut self) {
         if let Some(tab) = self.active_tab.and_then(|index| self.tabs.get_mut(index)) {
             tab.cursor = tab.cursor.saturating_sub(1);
+            tab.preferred_column = None;
         }
     }
 
     pub fn move_right(&mut self) {
         if let Some(tab) = self.active_tab.and_then(|index| self.tabs.get_mut(index)) {
             tab.cursor = (tab.cursor + 1).min(tab.document.len_chars());
+            tab.preferred_column = None;
         }
     }
 
@@ -370,6 +444,7 @@ impl ShellState {
             .iter()
             .rposition(|character| *character == '\n')
             .map_or(0, |index| index + 1);
+        tab.preferred_column = None;
     }
 
     pub fn move_end(&mut self) {
@@ -383,6 +458,55 @@ impl ShellState {
             .skip(tab.cursor)
             .find_map(|(index, character)| (character == '\n').then_some(index))
             .unwrap_or_else(|| tab.document.len_chars());
+        tab.preferred_column = None;
+    }
+
+    pub fn move_up(&mut self) {
+        self.move_vertical(-1);
+    }
+
+    pub fn move_down(&mut self) {
+        self.move_vertical(1);
+    }
+
+    fn move_vertical(&mut self, direction: i8) {
+        let Some(tab) = self.active_tab.and_then(|index| self.tabs.get_mut(index)) else {
+            return;
+        };
+        let chars: Vec<char> = tab.document.text().chars().collect();
+        let line_start = chars[..tab.cursor]
+            .iter()
+            .rposition(|character| *character == '\n')
+            .map_or(0, |index| index + 1);
+        let column = *tab.preferred_column.get_or_insert(tab.cursor - line_start);
+
+        if direction < 0 {
+            if line_start == 0 {
+                return;
+            }
+            let previous_end = line_start - 1;
+            let previous_start = chars[..previous_end]
+                .iter()
+                .rposition(|character| *character == '\n')
+                .map_or(0, |index| index + 1);
+            tab.cursor = previous_start + column.min(previous_end - previous_start);
+        } else {
+            let current_end = chars[tab.cursor..]
+                .iter()
+                .position(|character| *character == '\n')
+                .map(|offset| tab.cursor + offset)
+                .unwrap_or(chars.len());
+            if current_end == chars.len() {
+                return;
+            }
+            let next_start = current_end + 1;
+            let next_end = chars[next_start..]
+                .iter()
+                .position(|character| *character == '\n')
+                .map(|offset| next_start + offset)
+                .unwrap_or(chars.len());
+            tab.cursor = next_start + column.min(next_end - next_start);
+        }
     }
 
     pub fn save_active(&mut self) -> Result<bool, SessionError> {
@@ -912,6 +1036,81 @@ mod tests {
         assert_eq!(state.active_document().unwrap().text(), "你\n\nline");
         assert_eq!(state.cursor(), 2);
         assert_eq!(state.status_message(), "Modified");
+    }
+
+    #[test]
+    fn p2_native_input_replaces_unicode_character_ranges() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("note.md"), "hello world").unwrap();
+        let mut state =
+            ShellState::from_vault_argument(Some(OsString::from(directory.path().as_os_str())));
+        state.select_note(Path::new("note.md")).unwrap();
+
+        state.replace_active_range(6..11, "中文").unwrap();
+
+        assert_eq!(state.active_document().unwrap().text(), "hello 中文");
+        assert_eq!(state.cursor(), 8);
+        assert_eq!(state.status_message(), "Modified");
+    }
+
+    #[test]
+    fn p2_ime_composition_defers_linked_file_rename_until_commit() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state =
+            ShellState::from_vault_argument(Some(OsString::from(directory.path().as_os_str())));
+        state.create_untitled_note(Path::new("")).unwrap();
+
+        state
+            .replace_active_range_composing(2..6, "新笔记")
+            .unwrap();
+        assert_eq!(
+            state.active_document().unwrap().relative_path(),
+            Path::new("未命名1.md")
+        );
+
+        state.finalize_active_composition();
+        assert_eq!(
+            state.active_document().unwrap().relative_path(),
+            Path::new("新笔记.md")
+        );
+    }
+
+    #[test]
+    fn p2_vertical_cursor_movement_preserves_unicode_character_column() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("note.md"), "第一行\n短\n第三行内容").unwrap();
+        let mut state =
+            ShellState::from_vault_argument(Some(OsString::from(directory.path().as_os_str())));
+        state.select_note(Path::new("note.md")).unwrap();
+        state.set_cursor(3);
+
+        state.move_down();
+        assert_eq!(state.cursor(), 5);
+        state.move_down();
+        assert_eq!(state.cursor(), 9);
+        state.move_up();
+        assert_eq!(state.cursor(), 5);
+    }
+
+    #[test]
+    fn p2_writ_smart_enter_updates_session_buffer_and_persists() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("note.md"), "- 第一项").unwrap();
+        let mut state =
+            ShellState::from_vault_argument(Some(OsString::from(directory.path().as_os_str())));
+        state.select_note(Path::new("note.md")).unwrap();
+        state.move_end();
+
+        state.smart_enter().unwrap();
+
+        assert_eq!(state.active_document().unwrap().text(), "- 第一项\n- ");
+        assert_eq!(state.cursor(), 8);
+        assert_eq!(state.status_message(), "Modified");
+        state.save_active().unwrap();
+        assert_eq!(
+            fs::read_to_string(directory.path().join("note.md")).unwrap(),
+            "- 第一项\n- "
+        );
     }
 
     #[test]

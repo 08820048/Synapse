@@ -9,6 +9,7 @@ rust-version.workspace = true
 gpui.workspace = true
 gpui-animation.workspace = true
 synapse-core.workspace = true
+writ.workspace = true
 
 [dev-dependencies]
 tempfile = "3.20"
