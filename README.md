@@ -21,19 +21,23 @@ Synapse 是一款使用 Rust 与 GPUI 构建的高性能、本地优先 Markdown
 - 编辑光标按约 530ms 周期闪烁；输入、鼠标定位或方向移动后立即恢复显示并重置闪烁周期。
 - Markdown 源码在内存和磁盘中保持原样，编辑区实时呈现标题、列表、引用、代码及常用行内标记。
 - 光标所在行会恢复显示原始 Markdown 标记，离开该行后重新显示阅读样式，避免隐藏语法时无法准确编辑结构。
+- 编辑器使用占可用区域 92%、最大 1100px 的响应式居中写作列，左右内边距 24px，正文为 16px 系统字体与 1.65 行高，不显示行号；活动行 Markdown 标记使用弱化灰色。
 - `Cmd/Ctrl + S` 原子保存，保存失败不会丢失内存缓冲区。
 - 可收起的左侧导航和一体化编辑区域。
 - 常驻 40px 底部工具栏使用 Lucide `panel-left` / `panel-right` 控制左侧导航，并与 Settings 行等高对齐。
 - 左侧 Lucide 搜索入口使用 `Search any...` 文案和右侧 `⌘K` 徽标，可打开中央命令面板。
+- 界面已接入 `gpui-component 0.5.1`：统一使用 Root、Theme、Button、Input 与 Kbd，`Cmd/Ctrl+K` 可在任意区域打开并聚焦命令搜索。
+- Settings 的 Appearance 面板支持 System、Light、Dark 三态并持久化；浅色和深色模式均使用不同的侧栏与写作画布表面色。
 - Todo、Bookmarks 和 Settings 入口 UI。
 - 导航、菜单和页签操作统一使用编译进应用的 Lucide 官方 SVG 图标。
 
-搜索、待办、书签和设置的业务逻辑将在后续版本实现。V3 文件操作已经接入真实文件系统，并对路径穿越、符号链接、覆盖冲突、递归移动和未保存页签提供保护。
+搜索、待办、书签和其余设置业务逻辑将在后续版本实现；主题设置已经可用。V3 文件操作已经接入真实文件系统，并对路径穿越、符号链接、覆盖冲突、递归移动和未保存页签提供保护。
 
 ## 技术约束
 
 - 语言：Rust 最新稳定版。
 - UI：GPUI，禁止引入 HTML/CSS/JavaScript、Electron、egui 或 iced。
+- 组件体系：最新正式版 `gpui-component 0.5.1` 与 `gpui-component-assets 0.5.1`；标准按钮、输入、快捷键标签和浮层宿主优先使用组件库实现。
 - 文本缓冲区：ropey。
 - 删除：使用 `trash 5.2.6` 移入操作系统废纸篓，不执行永久删除。
 - 图标：固定使用 Lucide `1.27.0`，项目只内置实际使用的 SVG，并随附上游许可证与来源记录。
@@ -74,7 +78,8 @@ cargo run -p synapse -- /path/to/markdown-folder
 ## 验证
 
 ```bash
-cargo fmt --all --check
+cargo fmt --package synapse-core -- --check
+cargo fmt --package synapse -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```

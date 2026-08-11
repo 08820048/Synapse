@@ -42,6 +42,10 @@ pub struct ShellState {
 }
 
 impl ShellState {
+    pub fn vault_root(&self) -> Option<&Path> {
+        self.vault.as_ref().map(Vault::root)
+    }
+
     pub fn from_vault_argument(argument: Option<OsString>) -> Self {
         let mut state = Self {
             status_message: "No vault open".to_owned(),

@@ -1,22 +1,31 @@
 use std::{
+    cell::RefCell,
     collections::BTreeSet,
     ffi::OsString,
-    io,
+    fs, io,
     ops::Range,
     path::{Path, PathBuf},
     process::Command,
+    rc::Rc,
     time::Duration,
 };
 
 use gpui::{
-    App, Application, Bounds, ClickEvent, ClipboardItem, Context, CursorStyle, Entity, FocusHandle,
-    Focusable, FontWeight, KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    PathPromptOptions, Pixels, Point, SharedString, Size, TitlebarOptions, Window, WindowBounds,
-    WindowOptions, actions, div, hsla, point, prelude::*, px, rgb, size,
+    AnyElement, App, Application, Bounds, ClickEvent, ClipboardItem, Context, CursorStyle, Entity,
+    FocusHandle, Focusable, FontWeight, Hsla, KeyBinding, ListAlignment, ListState, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathPromptOptions, Pixels, Point, SharedString,
+    Size, TitlebarOptions, Window, WindowBounds, WindowOptions, actions, div, hsla, list, point,
+    prelude::*, px, relative, rgb, rgba, size,
 };
 use gpui_animation::{
     animation::TransitionExt,
     transition::general::{EaseInOutCubic, EaseOutQuad},
+};
+use gpui_component::{
+    ActiveTheme, IconName, Root, Sizable as _, Theme, ThemeMode,
+    button::{Button, ButtonVariants as _},
+    input::{Input, InputState},
+    kbd::Kbd,
 };
 use synapse::ShellState;
 use synapse_core::{VaultEntry, VaultEntryKind};
@@ -28,7 +37,8 @@ mod inline_rename;
 
 use editor_blink::CursorBlinkState;
 use editor_surface::{
-    EditorLineLayout, EditorSelection, MarkdownBlockKind, MarkdownLineElement, source_lines,
+    EditorLineLayout, EditorSelection, MarkdownBlockKind, MarkdownLineElement, SourceLine,
+    source_lines,
 };
 use icons::{Icon, SynapseAssets};
 use inline_rename::{InlineRenameEvent, InlineRenameInput};
@@ -39,6 +49,223 @@ const BOTTOM_BAR_HEIGHT: f32 = 40.0;
 const QUICK_TRANSITION: Duration = Duration::from_millis(140);
 const PANEL_TRANSITION: Duration = Duration::from_millis(180);
 const EDITOR_CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(530);
+const EDITOR_CONTENT_WIDTH_RATIO: f32 = 0.92;
+const EDITOR_CONTENT_MAX_WIDTH: f32 = 1100.0;
+const EDITOR_HORIZONTAL_GUTTER: f32 = 24.0;
+const EDITOR_TOP_PADDING: f32 = 24.0;
+const EDITOR_BODY_FONT_SIZE: f32 = 16.0;
+const EDITOR_BODY_LINE_HEIGHT: f32 = 26.4;
+
+fn command_palette_key_bindings() -> [&'static str; 2] {
+    ["cmd-k", "ctrl-k"]
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum ThemePreference {
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
+impl ThemePreference {
+    const ALL: [Self; 3] = [Self::System, Self::Light, Self::Dark];
+
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "system" => Some(Self::System),
+            "light" => Some(Self::Light),
+            "dark" => Some(Self::Dark),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::Light => "light",
+            Self::Dark => "dark",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::System => "System",
+            Self::Light => "Light",
+            Self::Dark => "Dark",
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            Self::System => "Follow system appearance",
+            Self::Light => "Bright writing canvas",
+            Self::Dark => "Low-light writing canvas",
+        }
+    }
+
+    fn icon(self) -> IconName {
+        match self {
+            Self::System => IconName::Palette,
+            Self::Light => IconName::Sun,
+            Self::Dark => IconName::Moon,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct SynapseThemePalette {
+    background: Hsla,
+    panel: Hsla,
+    sunken: Hsla,
+    foreground: Hsla,
+    muted: Hsla,
+    faint: Hsla,
+    border: Hsla,
+    line_soft: Hsla,
+    hover: Hsla,
+    active: Hsla,
+    selection: Hsla,
+}
+
+fn synapse_theme_palette(dark: bool) -> SynapseThemePalette {
+    if dark {
+        SynapseThemePalette {
+            background: rgb(0x1a1a1a).into(),
+            panel: rgb(0x151515).into(),
+            sunken: rgb(0x0f0f0f).into(),
+            foreground: rgb(0xebebe8).into(),
+            muted: rgb(0x8f8f8a).into(),
+            faint: rgb(0x64645f).into(),
+            border: rgb(0x292927).into(),
+            line_soft: rgb(0x202020).into(),
+            hover: rgba(0xebebe80f).into(),
+            active: rgba(0xebebe81a).into(),
+            selection: rgba(0xebebe824).into(),
+        }
+    } else {
+        SynapseThemePalette {
+            background: rgb(0xfbfbfa).into(),
+            panel: rgb(0xf4f4f2).into(),
+            sunken: rgb(0xe9e9e6).into(),
+            foreground: rgb(0x191919).into(),
+            muted: rgb(0x6e6e6a).into(),
+            faint: rgb(0xa3a39e).into(),
+            border: rgb(0xe3e3e0).into(),
+            line_soft: rgb(0xececea).into(),
+            hover: rgba(0x1919190d).into(),
+            active: rgba(0x19191917).into(),
+            selection: rgba(0x19191924).into(),
+        }
+    }
+}
+
+fn apply_synapse_theme(preference: ThemePreference, window: Option<&mut Window>, cx: &mut App) {
+    match preference {
+        ThemePreference::System => Theme::sync_system_appearance(window, cx),
+        ThemePreference::Light => Theme::change(ThemeMode::Light, window, cx),
+        ThemePreference::Dark => Theme::change(ThemeMode::Dark, window, cx),
+    }
+
+    let palette = synapse_theme_palette(Theme::global(cx).is_dark());
+    let theme = Theme::global_mut(cx);
+    theme.font_family = ".SystemUIFont".into();
+    theme.font_size = px(14.0);
+    theme.accent = palette.hover;
+    theme.accent_foreground = palette.foreground;
+    theme.accordion = palette.sunken;
+    theme.accordion_hover = palette.active;
+    theme.background = palette.background;
+    theme.border = palette.border;
+    theme.caret = palette.foreground;
+    theme.foreground = palette.foreground;
+    theme.group_box = palette.panel;
+    theme.group_box_foreground = palette.foreground;
+    theme.input = palette.border;
+    theme.link = palette.foreground;
+    theme.link_active = palette.foreground;
+    theme.link_hover = palette.muted;
+    theme.list = palette.background;
+    theme.list_active = palette.active;
+    theme.list_active_border = palette.border;
+    theme.list_even = palette.background;
+    theme.list_head = palette.panel;
+    theme.list_hover = palette.hover;
+    theme.muted = palette.panel;
+    theme.muted_foreground = palette.muted;
+    theme.popover = palette.background;
+    theme.popover_foreground = palette.foreground;
+    theme.primary = palette.foreground;
+    theme.primary_foreground = palette.background;
+    theme.primary_active = palette.muted;
+    theme.primary_hover = palette.faint;
+    theme.secondary = palette.panel;
+    theme.secondary_foreground = palette.foreground;
+    theme.secondary_active = palette.active;
+    theme.secondary_hover = palette.hover;
+    theme.selection = palette.selection;
+    theme.sidebar = palette.panel;
+    theme.sidebar_accent = palette.hover;
+    theme.sidebar_accent_foreground = palette.foreground;
+    theme.sidebar_border = palette.border;
+    theme.sidebar_foreground = palette.foreground;
+    theme.sidebar_primary = palette.active;
+    theme.sidebar_primary_foreground = palette.foreground;
+    theme.tab = palette.panel;
+    theme.tab_active = palette.background;
+    theme.tab_active_foreground = palette.foreground;
+    theme.tab_bar = palette.panel;
+    theme.tab_bar_segmented = palette.line_soft;
+    theme.tab_foreground = palette.muted;
+    theme.table = palette.background;
+    theme.table_active = palette.active;
+    theme.table_active_border = palette.border;
+    theme.table_even = palette.background;
+    theme.table_head = palette.panel;
+    theme.table_head_foreground = palette.foreground;
+}
+
+fn theme_preference_path() -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .map(|home| home.join("Library/Application Support/Synapse/theme"))
+    }
+    #[cfg(target_os = "windows")]
+    {
+        std::env::var_os("APPDATA")
+            .map(PathBuf::from)
+            .map(|directory| directory.join("Synapse/theme"))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .map(PathBuf::from)
+                    .map(|home| home.join(".config"))
+            })
+            .map(|directory| directory.join("synapse/theme"))
+    }
+}
+
+fn load_theme_preference() -> ThemePreference {
+    theme_preference_path()
+        .and_then(|path| fs::read_to_string(path).ok())
+        .and_then(|value| ThemePreference::parse(&value))
+        .unwrap_or_default()
+}
+
+fn save_theme_preference(preference: ThemePreference) -> io::Result<()> {
+    let path = theme_preference_path()
+        .ok_or_else(|| io::Error::other("unable to locate the user configuration directory"))?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, format!("{}\n", preference.as_str()))
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum FileTreeRow {
@@ -194,13 +421,22 @@ actions!(
         Paste,
         InsertNewline,
         InsertRawNewline,
+        OpenCommandPalette,
     ]
 );
 
 struct SynapseApp {
     state: ShellState,
     editor_focus: FocusHandle,
+    command_search: Entity<InputState>,
+    theme_preference: ThemePreference,
+    theme_settings_open: bool,
+    theme_settings_closing: bool,
+    theme_settings_generation: u64,
+    theme_persistence_error: Option<String>,
     left_sidebar_open: bool,
+    left_sidebar_mounted: bool,
+    left_sidebar_generation: u64,
     command_palette_open: bool,
     command_palette_closing: bool,
     command_palette_generation: u64,
@@ -212,11 +448,137 @@ struct SynapseApp {
     collapsed_directories: BTreeSet<PathBuf>,
     editor_marked_range: Option<Range<usize>>,
     editor_selection: EditorSelection,
-    editor_line_layouts: Vec<Option<EditorLineLayout>>,
+    editor_line_layouts: Rc<RefCell<Vec<Option<EditorLineLayout>>>>,
+    editor_list_state: ListState,
+    editor_render_cache: Option<EditorRenderCache>,
     editor_blink: CursorBlinkState,
 }
 
+struct EditorRenderCache {
+    vault_root: PathBuf,
+    relative_path: PathBuf,
+    revision: u64,
+    cursor: usize,
+    dark_mode: bool,
+    lines: Rc<Vec<Rc<SourceLine>>>,
+}
+
+impl EditorRenderCache {
+    fn matches(
+        &self,
+        vault_root: &Path,
+        relative_path: &Path,
+        revision: u64,
+        cursor: usize,
+        dark_mode: bool,
+    ) -> bool {
+        self.vault_root == vault_root
+            && self.relative_path == relative_path
+            && self.revision == revision
+            && self.cursor == cursor
+            && self.dark_mode == dark_mode
+    }
+}
+
+fn changed_line_span(
+    old_lines: &[Rc<SourceLine>],
+    new_lines: &[Rc<SourceLine>],
+) -> Option<(Range<usize>, usize)> {
+    let prefix = old_lines
+        .iter()
+        .zip(new_lines)
+        .take_while(|(old, new)| editor_line_layout_matches(old, new))
+        .count();
+    if prefix == old_lines.len() && prefix == new_lines.len() {
+        return None;
+    }
+
+    let suffix = old_lines[prefix..]
+        .iter()
+        .rev()
+        .zip(new_lines[prefix..].iter().rev())
+        .take_while(|(old, new)| editor_line_layout_matches(old, new))
+        .count();
+    Some((
+        prefix..old_lines.len().saturating_sub(suffix),
+        new_lines.len().saturating_sub(prefix + suffix),
+    ))
+}
+
+fn editor_line_layout_matches(old: &SourceLine, new: &SourceLine) -> bool {
+    old.source_len_chars == new.source_len_chars && old.presentation == new.presentation
+}
+
 impl SynapseApp {
+    fn toggle_left_sidebar(&mut self, cx: &mut Context<Self>) {
+        self.left_sidebar_generation = self.left_sidebar_generation.wrapping_add(1);
+        let generation = self.left_sidebar_generation;
+        if self.left_sidebar_open {
+            self.left_sidebar_open = false;
+            let timer = cx.background_executor().timer(PANEL_TRANSITION);
+            cx.spawn(async move |this, cx| {
+                timer.await;
+                let _ = this.update(cx, |this, cx| {
+                    if this.left_sidebar_generation == generation && !this.left_sidebar_open {
+                        this.left_sidebar_mounted = false;
+                        cx.notify();
+                    }
+                });
+            })
+            .detach();
+        } else {
+            self.left_sidebar_mounted = true;
+            self.left_sidebar_open = true;
+        }
+        self.dismiss_context_menus(cx);
+        cx.notify();
+    }
+
+    fn open_theme_settings(&mut self, cx: &mut Context<Self>) {
+        self.dismiss_command_palette(cx);
+        self.dismiss_context_menus(cx);
+        self.theme_settings_open = true;
+        self.theme_settings_closing = false;
+        self.theme_settings_generation = self.theme_settings_generation.wrapping_add(1);
+        cx.notify();
+    }
+
+    fn close_theme_settings(&mut self, cx: &mut Context<Self>) {
+        if !self.theme_settings_open || self.theme_settings_closing {
+            return;
+        }
+        self.theme_settings_closing = true;
+        self.theme_settings_generation = self.theme_settings_generation.wrapping_add(1);
+        let generation = self.theme_settings_generation;
+        let timer = cx.background_executor().timer(QUICK_TRANSITION);
+        cx.spawn(async move |this, cx| {
+            timer.await;
+            let _ = this.update(cx, |this, cx| {
+                if this.theme_settings_generation == generation {
+                    this.theme_settings_open = false;
+                    this.theme_settings_closing = false;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn set_theme_preference(
+        &mut self,
+        preference: ThemePreference,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.theme_preference = preference;
+        apply_synapse_theme(preference, Some(window), cx);
+        self.theme_persistence_error = save_theme_preference(preference)
+            .err()
+            .map(|error| format!("Theme preference could not be saved: {error}"));
+        cx.notify();
+    }
+
     fn prompt_for_vault(&mut self, cx: &mut Context<Self>) {
         let receiver = cx.prompt_for_paths(PathPromptOptions {
             files: false,
@@ -302,13 +664,24 @@ impl SynapseApp {
         self.dismiss_context_menus(cx);
     }
 
-    fn open_command_palette(&mut self, cx: &mut Context<Self>) {
+    fn open_command_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_theme_settings(cx);
         self.command_palette_open = true;
         self.command_palette_closing = false;
         self.command_palette_generation = self.command_palette_generation.wrapping_add(1);
         self.tab_context_menu = None;
         self.tree_context_menu = None;
+        window.focus(&self.command_search.focus_handle(cx));
         cx.notify();
+    }
+
+    fn open_command_palette_action(
+        &mut self,
+        _: &OpenCommandPalette,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_command_palette(window, cx);
     }
 
     fn dismiss_command_palette(&mut self, cx: &mut Context<Self>) {
@@ -707,10 +1080,11 @@ impl SynapseApp {
     }
 
     fn editor_char_for_position(&self, position: Point<Pixels>) -> Option<usize> {
-        let mut layouts = self.editor_line_layouts.iter().flatten();
+        let line_layouts = self.editor_line_layouts.borrow();
+        let mut layouts = line_layouts.iter().flatten();
         let first = layouts.next()?;
         if position.y < first.bounds.top() {
-            return Some(first.start_char);
+            return Some(first.source_line.start_char);
         }
         if position.y <= first.bounds.bottom() {
             return Some(first.source_char_for_position(position));
@@ -722,7 +1096,7 @@ impl SynapseApp {
             }
             last = layout;
         }
-        Some(last.start_char + last.source_len_chars)
+        Some(last.source_line.start_char + last.source_line.source_len_chars)
     }
 
     fn editor_mouse_down(
@@ -795,180 +1169,298 @@ impl Focusable for SynapseApp {
     }
 }
 
-impl Render for SynapseApp {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let selected_path = self
-            .state
-            .active_document()
-            .map(|document| document.relative_path().to_path_buf());
-        let status_message = self.state.status_message().to_owned();
-        let status_color = if status_message == "Modified" {
-            rgb(0xe6b673)
-        } else if status_message == "Saved" || status_message == "Ready" {
-            rgb(0x70bf8a)
-        } else {
-            rgb(0xe28d8d)
-        };
-        let file_rows = build_file_tree_rows(&self.state.entries, &self.collapsed_directories);
-        let tabs = self.state.tabs();
-        let active_tab = self.state.active_tab_index();
-        let no_vault_open = self.state.vault_name.is_none();
+#[derive(Clone)]
+struct EditorRowContext {
+    line_count: usize,
+    app: Entity<SynapseApp>,
+    line_layouts: Rc<RefCell<Vec<Option<EditorLineLayout>>>>,
+    cursor: usize,
+    selection: Range<usize>,
+    cursor_visible: bool,
+}
 
-        let editor_body = if let Some(document) = self.state.active_document() {
-            let cursor = self.state.cursor();
-            self.editor_selection.clamp(document.len_chars());
-            let lines = source_lines(&document.text(), cursor);
-            let selection = self.editor_selection.range();
-            self.editor_line_layouts = vec![None; lines.len()];
-            let app = cx.entity();
+fn render_editor_row(
+    index: usize,
+    line: Rc<SourceLine>,
+    row_context: &EditorRowContext,
+    cx: &mut App,
+) -> AnyElement {
+    let theme = cx.theme();
+    let active =
+        (line.start_char..=line.start_char + line.source_len_chars).contains(&row_context.cursor);
+    let kind = line.presentation.kind;
+    div()
+        .w_full()
+        .min_w(px(0.0))
+        .when(index == 0, |style| style.pt(px(EDITOR_TOP_PADDING)))
+        .when(index + 1 == row_context.line_count, |style| {
+            style.pb(px(180.0))
+        })
+        .child(
             div()
-                .id("editor-content")
-                .flex_1()
+                .w(relative(EDITOR_CONTENT_WIDTH_RATIO))
+                .max_w(px(EDITOR_CONTENT_MAX_WIDTH))
                 .min_w(px(0.0))
-                .overflow_y_scroll()
-                .p_5()
-                .track_focus(&self.editor_focus)
-                .key_context("SynapseEditor")
-                .on_action(cx.listener(Self::save))
-                .on_action(cx.listener(Self::backspace))
-                .on_action(cx.listener(Self::delete_forward))
-                .on_action(cx.listener(Self::move_left))
-                .on_action(cx.listener(Self::move_right))
-                .on_action(cx.listener(Self::move_up))
-                .on_action(cx.listener(Self::move_down))
-                .on_action(cx.listener(Self::move_home))
-                .on_action(cx.listener(Self::move_end))
-                .on_action(cx.listener(Self::select_left))
-                .on_action(cx.listener(Self::select_right))
-                .on_action(cx.listener(Self::select_up))
-                .on_action(cx.listener(Self::select_down))
-                .on_action(cx.listener(Self::select_home))
-                .on_action(cx.listener(Self::select_end))
-                .on_action(cx.listener(Self::select_all))
-                .on_action(cx.listener(Self::copy))
-                .on_action(cx.listener(Self::cut))
-                .on_action(cx.listener(Self::paste))
-                .on_action(cx.listener(Self::insert_newline))
-                .on_action(cx.listener(Self::insert_raw_newline))
-                .on_mouse_down(MouseButton::Left, cx.listener(Self::editor_mouse_down))
-                .on_mouse_move(cx.listener(Self::editor_mouse_move))
-                .on_mouse_up(MouseButton::Left, cx.listener(Self::editor_mouse_up))
-                .on_mouse_up_out(MouseButton::Left, cx.listener(Self::editor_mouse_up))
-                .children(lines.into_iter().enumerate().map(|(index, line)| {
-                    let active = (line.start_char..=line.start_char + line.source_len_chars)
-                        .contains(&cursor);
-                    let kind = line.presentation.kind;
-                    let app = app.clone();
+                .mx_auto()
+                .px(px(EDITOR_HORIZONTAL_GUTTER))
+                .child(
                     div()
                         .flex()
                         .w_full()
                         .min_w(px(0.0))
                         .items_start()
                         .min_h(match kind {
-                            MarkdownBlockKind::Heading(1) => px(38.0),
-                            MarkdownBlockKind::Heading(2) => px(34.0),
-                            MarkdownBlockKind::Heading(_) => px(30.0),
-                            MarkdownBlockKind::ThematicBreak => px(20.0),
-                            _ => px(26.0),
+                            MarkdownBlockKind::Heading(1) => px(42.0),
+                            MarkdownBlockKind::Heading(2) => px(36.0),
+                            MarkdownBlockKind::Heading(_) => px(31.0),
+                            MarkdownBlockKind::ThematicBreak => px(24.0),
+                            _ => px(EDITOR_BODY_LINE_HEIGHT),
                         })
-                        .child(
-                            div()
-                                .w(px(46.0))
-                                .flex_none()
-                                .pt_1()
-                                .text_color(rgb(0x454c5b))
-                                .text_xs()
-                                .child(format!("{}", index + 1)),
-                        )
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w(px(0.0))
-                                .cursor(CursorStyle::IBeam)
-                                .text_color(match kind {
-                                    MarkdownBlockKind::Quote => rgb(0x9da7b8),
-                                    MarkdownBlockKind::Code => rgb(0xb6c9a8),
-                                    MarkdownBlockKind::Task(true) => rgb(0x747d8d),
-                                    MarkdownBlockKind::Table => rgb(0xb8c4d8),
-                                    MarkdownBlockKind::Math => rgb(0xcab7e8),
-                                    MarkdownBlockKind::Html => rgb(0xd0a878),
-                                    _ => rgb(0xcbd0dc),
-                                })
-                                .when(matches!(kind, MarkdownBlockKind::Heading(1)), |style| {
-                                    style.text_2xl().font_weight(FontWeight::SEMIBOLD)
-                                })
-                                .when(matches!(kind, MarkdownBlockKind::Heading(2)), |style| {
-                                    style.text_xl().font_weight(FontWeight::SEMIBOLD)
-                                })
-                                .when(matches!(kind, MarkdownBlockKind::Heading(3..=6)), |style| {
-                                    style.text_lg().font_weight(FontWeight::SEMIBOLD)
-                                })
-                                .when(!matches!(kind, MarkdownBlockKind::Heading(_)), |style| {
-                                    style.text_sm()
-                                })
-                                .child(MarkdownLineElement {
-                                    app,
-                                    line_index: index,
-                                    source_line: line,
-                                    active,
-                                    cursor,
-                                    selection: selection.clone(),
-                                    cursor_visible: self.editor_blink.visible(),
-                                }),
-                        )
-                }))
-                .into_any_element()
+                        .cursor(CursorStyle::IBeam)
+                        .text_color(match kind {
+                            MarkdownBlockKind::Quote | MarkdownBlockKind::Task(true) => {
+                                theme.muted_foreground
+                            }
+                            _ => theme.foreground,
+                        })
+                        .when(matches!(kind, MarkdownBlockKind::Heading(1)), |style| {
+                            style
+                                .text_size(px(25.6))
+                                .line_height(px(32.0))
+                                .font_weight(FontWeight::SEMIBOLD)
+                        })
+                        .when(matches!(kind, MarkdownBlockKind::Heading(2)), |style| {
+                            style
+                                .text_size(px(20.8))
+                                .line_height(px(26.0))
+                                .font_weight(FontWeight::SEMIBOLD)
+                        })
+                        .when(matches!(kind, MarkdownBlockKind::Heading(3..=6)), |style| {
+                            style
+                                .text_size(px(17.6))
+                                .line_height(px(24.0))
+                                .font_weight(FontWeight::SEMIBOLD)
+                        })
+                        .when(!matches!(kind, MarkdownBlockKind::Heading(_)), |style| {
+                            style
+                                .text_size(px(EDITOR_BODY_FONT_SIZE))
+                                .line_height(px(EDITOR_BODY_LINE_HEIGHT))
+                        })
+                        .when(matches!(kind, MarkdownBlockKind::Code), |style| {
+                            style.font_family(theme.mono_font_family.clone())
+                        })
+                        .child(MarkdownLineElement {
+                            app: row_context.app.clone(),
+                            line_layouts: row_context.line_layouts.clone(),
+                            line_index: index,
+                            source_line: line,
+                            active,
+                            cursor: row_context.cursor,
+                            selection: row_context.selection.clone(),
+                            cursor_visible: row_context.cursor_visible,
+                            marker_color: theme.muted_foreground,
+                            cursor_color: theme.caret,
+                            selection_color: theme.selection,
+                        }),
+                ),
+        )
+        .into_any_element()
+}
+
+impl Render for SynapseApp {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().clone();
+        let app_entity = cx.entity();
+        let command_kbd = Kbd::binding_for_action(&OpenCommandPalette, None, window);
+        let selected_path = self
+            .state
+            .active_document()
+            .map(|document| document.relative_path().to_path_buf());
+        let status_message = self.state.status_message().to_owned();
+        let status_color = if status_message == "Modified" {
+            theme.warning
+        } else if status_message == "Saved" || status_message == "Ready" {
+            theme.success
         } else {
-            let center_message =
-                self.state
-                    .vault_error
-                    .as_deref()
-                    .unwrap_or(if self.state.vault_name.is_some() {
+            theme.danger
+        };
+        let file_rows = build_file_tree_rows(&self.state.entries, &self.collapsed_directories);
+        let tabs = self.state.tabs();
+        let active_tab = self.state.active_tab_index();
+        let no_vault_open = self.state.vault_name.is_none();
+
+        let editor_body =
+            if let Some(document) = self.state.active_document() {
+                let cursor = self.state.cursor();
+                let vault_root = self
+                    .state
+                    .vault_root()
+                    .map_or_else(PathBuf::new, Path::to_path_buf);
+                let relative_path = document.relative_path().to_path_buf();
+                let revision = document.revision();
+                let document_len = document.len_chars();
+                let dark_mode = theme.is_dark();
+                let cache_hit = self.editor_render_cache.as_ref().is_some_and(|cache| {
+                    cache.matches(&vault_root, &relative_path, revision, cursor, dark_mode)
+                });
+                let lines = if cache_hit {
+                    self.editor_render_cache
+                        .as_ref()
+                        .expect("cache hit requires an editor render cache")
+                        .lines
+                        .clone()
+                } else {
+                    let previous_lines = self
+                        .editor_render_cache
+                        .as_ref()
+                        .filter(|cache| {
+                            cache.vault_root == vault_root && cache.relative_path == relative_path
+                        })
+                        .map(|cache| cache.lines.clone());
+                    let parsed = Rc::new(
+                        source_lines(&document.text(), cursor, dark_mode)
+                            .into_iter()
+                            .map(Rc::new)
+                            .collect::<Vec<_>>(),
+                    );
+                    if let Some(previous_lines) = previous_lines {
+                        if let Some((old_range, new_count)) =
+                            changed_line_span(&previous_lines, &parsed)
+                        {
+                            self.editor_list_state.splice(old_range.clone(), new_count);
+                            self.editor_line_layouts
+                                .borrow_mut()
+                                .splice(old_range, (0..new_count).map(|_| None));
+                        }
+                    } else {
+                        self.editor_list_state.reset(parsed.len());
+                        *self.editor_line_layouts.borrow_mut() =
+                            (0..parsed.len()).map(|_| None).collect();
+                    }
+                    self.editor_render_cache = Some(EditorRenderCache {
+                        vault_root,
+                        relative_path,
+                        revision,
+                        cursor,
+                        dark_mode,
+                        lines: parsed.clone(),
+                    });
+                    parsed
+                };
+                self.editor_selection.clamp(document_len);
+                let selection = self.editor_selection.range();
+                if self.editor_line_layouts.borrow().len() != lines.len() {
+                    self.editor_line_layouts
+                        .borrow_mut()
+                        .resize_with(lines.len(), || None);
+                }
+                let app = cx.entity();
+                let line_layouts = self.editor_line_layouts.clone();
+                div()
+                    .id("editor-content")
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .track_focus(&self.editor_focus)
+                    .key_context("SynapseEditor")
+                    .on_action(cx.listener(Self::save))
+                    .on_action(cx.listener(Self::backspace))
+                    .on_action(cx.listener(Self::delete_forward))
+                    .on_action(cx.listener(Self::move_left))
+                    .on_action(cx.listener(Self::move_right))
+                    .on_action(cx.listener(Self::move_up))
+                    .on_action(cx.listener(Self::move_down))
+                    .on_action(cx.listener(Self::move_home))
+                    .on_action(cx.listener(Self::move_end))
+                    .on_action(cx.listener(Self::select_left))
+                    .on_action(cx.listener(Self::select_right))
+                    .on_action(cx.listener(Self::select_up))
+                    .on_action(cx.listener(Self::select_down))
+                    .on_action(cx.listener(Self::select_home))
+                    .on_action(cx.listener(Self::select_end))
+                    .on_action(cx.listener(Self::select_all))
+                    .on_action(cx.listener(Self::copy))
+                    .on_action(cx.listener(Self::cut))
+                    .on_action(cx.listener(Self::paste))
+                    .on_action(cx.listener(Self::insert_newline))
+                    .on_action(cx.listener(Self::insert_raw_newline))
+                    .on_mouse_down(MouseButton::Left, cx.listener(Self::editor_mouse_down))
+                    .on_mouse_move(cx.listener(Self::editor_mouse_move))
+                    .on_mouse_up(MouseButton::Left, cx.listener(Self::editor_mouse_up))
+                    .on_mouse_up_out(MouseButton::Left, cx.listener(Self::editor_mouse_up))
+                    .child(
+                        list(self.editor_list_state.clone(), {
+                            let lines = lines.clone();
+                            let row_context = EditorRowContext {
+                                line_count: lines.len(),
+                                app,
+                                line_layouts,
+                                cursor,
+                                selection,
+                                cursor_visible: self.editor_blink.visible(),
+                            };
+                            move |index, _, cx| {
+                                render_editor_row(index, lines[index].clone(), &row_context, cx)
+                            }
+                        })
+                        .size_full(),
+                    )
+                    .into_any_element()
+            } else {
+                let center_message = self.state.vault_error.as_deref().unwrap_or(
+                    if self.state.vault_name.is_some() {
                         "Select a note from the file tree"
                     } else {
                         "Choose a local folder to start writing"
-                    });
-            div()
-                .flex_1()
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .items_center()
-                        .gap_3()
-                        .px_6()
-                        .py_4()
-                        .text_sm()
-                        .text_color(if self.state.vault_error.is_some() {
-                            rgb(0xe69a9a)
-                        } else {
-                            rgb(0x747d90)
-                        })
-                        .child(center_message.to_owned())
-                        .when(no_vault_open, |view| {
-                            view.child(
-                                div()
-                                    .id("open-vault-empty-state")
-                                    .px_4()
-                                    .py_2()
-                                    .rounded_md()
-                                    .bg(rgb(0x355a86))
-                                    .text_color(rgb(0xf3f6fb))
-                                    .cursor_pointer()
-                                    .hover(|style| style.bg(rgb(0x416d9f)))
-                                    .child("Open Vault")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.prompt_for_vault(cx);
-                                    })),
-                            )
-                        }),
-                )
-                .into_any_element()
-        };
+                    },
+                );
+                div()
+                    .flex_1()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .gap_3()
+                            .px_6()
+                            .py_4()
+                            .text_sm()
+                            .text_color(if self.state.vault_error.is_some() {
+                                theme.danger
+                            } else {
+                                theme.muted_foreground
+                            })
+                            .child(center_message.to_owned())
+                            .when(no_vault_open, |view| {
+                                let app = app_entity.clone();
+                                view.child(
+                                    Button::new("open-vault-empty-state")
+                                        .primary()
+                                        .large()
+                                        .label("Open Vault")
+                                        .on_click(move |_, _, cx| {
+                                            app.update(cx, |this, cx| {
+                                                this.prompt_for_vault(cx);
+                                            });
+                                        }),
+                                )
+                            }),
+                    )
+                    .into_any_element()
+            };
 
+        let tab_app = app_entity.clone();
+        let tab_border = theme.border;
+        let tab_background = theme.tab_bar;
+        let tab_inactive = theme.tab;
+        let tab_inactive_foreground = theme.tab_foreground;
+        let tab_active = theme.tab_active;
+        let tab_active_foreground = theme.tab_active_foreground;
+        let tab_muted = theme.muted_foreground;
+        let tab_hover = theme.secondary_hover;
+        let tab_warning = theme.warning;
         let tab_bar = div()
             .id("document-tabs")
             .h(px(38.0))
@@ -976,12 +1468,13 @@ impl Render for SynapseApp {
             .flex()
             .overflow_x_scroll()
             .border_b_1()
-            .border_color(rgb(0x2a2e36))
-            .bg(rgb(0x171a20))
+            .border_color(tab_border)
+            .bg(tab_background)
             .children(tabs.into_iter().enumerate().map(|(index, tab)| {
                 let tab_id = SharedString::from(format!("tab-{index}"));
                 let close_id = SharedString::from(format!("close-tab-{index}"));
                 let is_active = active_tab == Some(index);
+                let close_app = tab_app.clone();
                 div()
                     .id(tab_id)
                     .h_full()
@@ -992,11 +1485,11 @@ impl Render for SynapseApp {
                     .gap_2()
                     .px_3()
                     .border_r_1()
-                    .border_color(rgb(0x2a2e36))
+                    .border_color(tab_border)
                     .text_sm()
                     .cursor_pointer()
-                    .text_color(rgb(0x858d9d))
-                    .hover(|style| style.bg(rgb(0x222731)))
+                    .text_color(tab_muted)
+                    .hover(move |style| style.bg(tab_hover))
                     .child(div().flex_1().min_w(px(0.0)).truncate().child(tab.title))
                     .when(tab.is_dirty, |view| {
                         view.child(
@@ -1004,27 +1497,24 @@ impl Render for SynapseApp {
                                 .size(px(6.0))
                                 .flex_none()
                                 .rounded_full()
-                                .bg(rgb(0xe6b673)),
+                                .bg(tab_warning),
                         )
                     })
                     .child(
-                        div()
-                            .id(close_id)
-                            .size(px(20.0))
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded_sm()
-                            .text_color(rgb(0x7d8594))
-                            .hover(|style| style.bg(rgb(0x343a45)).text_color(rgb(0xe4e8f0)))
-                            .child(Icon::Close.render(14.0).text_color(rgb(0x7d8594)))
-                            .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+                        Button::new(close_id)
+                            .ghost()
+                            .xsmall()
+                            .size(px(28.0))
+                            .tooltip("Close tab")
+                            .child(Icon::Close.render(14.0).text_color(tab_muted))
+                            .on_click(move |event: &ClickEvent, _, cx| {
                                 cx.stop_propagation();
                                 if !event.is_right_click() {
-                                    this.close_tab(index, cx);
+                                    close_app.update(cx, |this, cx| {
+                                        this.close_tab(index, cx);
+                                    });
                                 }
-                            })),
+                            }),
                     )
                     .on_mouse_down(
                         MouseButton::Right,
@@ -1054,14 +1544,15 @@ impl Render for SynapseApp {
                         is_active,
                         QUICK_TRANSITION,
                         EaseOutQuad,
-                        |style| style.bg(rgb(0x20242c)).text_color(rgb(0xe4e8f0)),
-                        |style| style.bg(rgb(0x171a20)).text_color(rgb(0x858d9d)),
+                        move |style| style.bg(tab_active).text_color(tab_active_foreground),
+                        move |style| style.bg(tab_inactive).text_color(tab_inactive_foreground),
                     )
             }));
 
+        let sidebar_hover = theme.sidebar_accent;
         let left_sidebar = div()
             .id("left-sidebar")
-            .w(if self.left_sidebar_open {
+            .w(if self.left_sidebar_mounted {
                 px(248.0)
             } else {
                 px(0.0)
@@ -1072,91 +1563,99 @@ impl Render for SynapseApp {
             .flex_col()
             .overflow_hidden()
             .border_r_1()
-            .border_color(rgb(0x2a2e36))
-            .bg(rgb(0x181b21))
-            .child(
-                div()
-                    .id("sidebar-search-launcher")
-                    .h(px(34.0))
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .mx_2()
-                    .mt_2()
-                    .px_3()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(rgb(0x292d34))
-                    .bg(rgb(0x1c1f25))
-                    .text_sm()
-                    .text_color(rgb(0x707887))
-                    .cursor_pointer()
-                    .hover(|style| style.border_color(rgb(0x3a414d)))
-                    .child(Icon::Search.render(16.0).text_color(rgb(0x707887)))
-                    .child(div().flex_1().child("Search any..."))
+            .border_color(theme.sidebar_border)
+            .bg(theme.sidebar)
+            .child(div().flex_none().p_2().child({
+                let app = app_entity.clone();
+                Button::new("sidebar-search-launcher")
+                    .outline()
+                    .w_full()
+                    .h(px(36.0))
+                    .justify_start()
                     .child(
                         div()
-                            .px_1()
-                            .rounded_sm()
-                            .border_1()
-                            .border_color(rgb(0x343a45))
-                            .text_xs()
-                            .child("⌘K"),
+                            .w_full()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(Icon::Search.render(16.0).text_color(theme.muted_foreground))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .text_left()
+                                    .text_color(theme.muted_foreground)
+                                    .child("Search any..."),
+                            )
+                            .children(command_kbd.clone()),
                     )
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.open_command_palette(cx);
-                    })),
-            )
+                    .on_click(move |_, window, cx| {
+                        app.update(cx, |this, cx| {
+                            this.open_command_palette(window, cx);
+                        });
+                    })
+            }))
             .child(
                 div()
                     .mt_3()
                     .px_3()
                     .text_xs()
-                    .text_color(rgb(0x606878))
+                    .text_color(theme.muted_foreground)
                     .child("MY NOTES"),
             )
+            .child({
+                let app = app_entity.clone();
+                Button::new("todo-shortcut")
+                    .ghost()
+                    .w_full()
+                    .h(px(34.0))
+                    .justify_start()
+                    .child(
+                        div()
+                            .w_full()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(Icon::Todo.render(16.0))
+                            .child(div().flex_1().text_left().child("Todo"))
+                            .child(Icon::Plus.render(14.0)),
+                    )
+                    .on_click(move |_, window, cx| {
+                        app.update(cx, |this, cx| {
+                            this.open_command_palette(window, cx);
+                        });
+                    })
+            })
+            .child({
+                let app = app_entity.clone();
+                Button::new("bookmark-shortcut")
+                    .ghost()
+                    .w_full()
+                    .h(px(34.0))
+                    .justify_start()
+                    .child(
+                        div()
+                            .w_full()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(Icon::Bookmark.render(16.0))
+                            .child(div().flex_1().text_left().child("Bookmarks"))
+                            .child(Icon::Plus.render(14.0)),
+                    )
+                    .on_click(move |_, window, cx| {
+                        app.update(cx, |this, cx| {
+                            this.open_command_palette(window, cx);
+                        });
+                    })
+            })
             .child(
                 div()
-                    .id("todo-shortcut")
-                    .h(px(34.0))
+                    .h(px(1.0))
                     .flex_none()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .px_3()
-                    .text_sm()
-                    .text_color(rgb(0xaab1bf))
-                    .cursor_pointer()
-                    .hover(|style| style.bg(rgb(0x20242b)))
-                    .child(Icon::Todo.render(16.0).text_color(rgb(0x8991a0)))
-                    .child(div().flex_1().child("Todo"))
-                    .child(Icon::Plus.render(14.0).text_color(rgb(0x5b6371)))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.open_command_palette(cx);
-                    })),
+                    .mx_3()
+                    .my_2()
+                    .bg(theme.sidebar_border),
             )
-            .child(
-                div()
-                    .id("bookmark-shortcut")
-                    .h(px(34.0))
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .px_3()
-                    .text_sm()
-                    .text_color(rgb(0xaab1bf))
-                    .cursor_pointer()
-                    .hover(|style| style.bg(rgb(0x20242b)))
-                    .child(Icon::Bookmark.render(16.0).text_color(rgb(0x8991a0)))
-                    .child(div().flex_1().child("Bookmarks"))
-                    .child(Icon::Plus.render(14.0).text_color(rgb(0x5b6371)))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.open_command_palette(cx);
-                    })),
-            )
-            .child(div().h(px(1.0)).flex_none().mx_3().my_2().bg(rgb(0x292d34)))
             .child(
                 div()
                     .h(px(30.0))
@@ -1165,38 +1664,44 @@ impl Render for SynapseApp {
                     .items_center()
                     .px_3()
                     .text_xs()
-                    .text_color(rgb(0x606878))
+                    .text_color(theme.muted_foreground)
                     .child(div().flex_1().child("NOTES"))
-                    .child(
-                        div()
-                            .id("new-note-control")
-                            .size(px(24.0))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded_sm()
-                            .cursor_pointer()
-                            .hover(|style| style.bg(rgb(0x282d36)))
-                            .child(Icon::FilePlus.render(16.0).text_color(rgb(0x7f8796)))
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.create_untitled_note(Path::new(""), window, cx);
-                            })),
-                    )
-                    .child(
-                        div()
-                            .id("new-folder-control")
-                            .size(px(24.0))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded_sm()
-                            .cursor_pointer()
-                            .hover(|style| style.bg(rgb(0x282d36)))
-                            .child(Icon::FolderPlus.render(16.0).text_color(rgb(0x7f8796)))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.create_untitled_directory(Path::new(""), cx);
-                            })),
-                    ),
+                    .child({
+                        let app = app_entity.clone();
+                        Button::new("new-note-control")
+                            .ghost()
+                            .xsmall()
+                            .size(px(28.0))
+                            .tooltip("New note")
+                            .child(
+                                Icon::FilePlus
+                                    .render(16.0)
+                                    .text_color(theme.muted_foreground),
+                            )
+                            .on_click(move |_, window, cx| {
+                                app.update(cx, |this, cx| {
+                                    this.create_untitled_note(Path::new(""), window, cx);
+                                });
+                            })
+                    })
+                    .child({
+                        let app = app_entity.clone();
+                        Button::new("new-folder-control")
+                            .ghost()
+                            .xsmall()
+                            .size(px(28.0))
+                            .tooltip("New folder")
+                            .child(
+                                Icon::FolderPlus
+                                    .render(16.0)
+                                    .text_color(theme.muted_foreground),
+                            )
+                            .on_click(move |_, _, cx| {
+                                app.update(cx, |this, cx| {
+                                    this.create_untitled_directory(Path::new(""), cx);
+                                });
+                            })
+                    }),
             )
             .child(
                 div()
@@ -1255,9 +1760,9 @@ impl Render for SynapseApp {
                                     .pl(px(12.0 + depth as f32 * 16.0))
                                     .pr_2()
                                     .text_sm()
-                                    .text_color(rgb(0x929aa9))
+                                    .text_color(theme.sidebar_foreground)
                                     .cursor_move()
-                                    .hover(|style| style.bg(rgb(0x222733)))
+                                    .hover(move |style| style.bg(sidebar_hover))
                                     .child(
                                         if is_expanded {
                                             Icon::FolderOpen
@@ -1265,7 +1770,7 @@ impl Render for SynapseApp {
                                             Icon::Folder
                                         }
                                         .render(15.0)
-                                        .text_color(rgb(0x747d8d)),
+                                        .text_color(theme.muted_foreground),
                                     )
                                     .child(if let Some(input) = rename_input {
                                         div()
@@ -1278,11 +1783,11 @@ impl Render for SynapseApp {
                                             .rounded_sm()
                                             .border_1()
                                             .border_color(if rename_has_error {
-                                                rgb(0xa84e58)
+                                                theme.danger
                                             } else {
-                                                rgb(0x526579)
+                                                theme.input
                                             })
-                                            .bg(rgb(0x12151a))
+                                            .bg(theme.background)
                                             .child(input)
                                             .into_any_element()
                                     } else {
@@ -1371,16 +1876,18 @@ impl Render for SynapseApp {
                                     .pl(px(12.0 + depth as f32 * 16.0))
                                     .pr_2()
                                     .text_sm()
-                                    .text_color(rgb(0x9fa7b5))
+                                    .text_color(theme.sidebar_foreground)
                                     .cursor_move()
-                                    .hover(|style| style.bg(rgb(0x222733)))
+                                    .hover(move |style| style.bg(sidebar_hover))
                                     .when(selected, |style| {
-                                        style.bg(rgb(0x293346)).text_color(rgb(0xe5eaf5))
+                                        style
+                                            .bg(theme.sidebar_primary)
+                                            .text_color(theme.sidebar_primary_foreground)
                                     })
                                     .child(Icon::FileText.render(15.0).text_color(if selected {
-                                        rgb(0xbfc9dc)
+                                        theme.sidebar_primary_foreground
                                     } else {
-                                        rgb(0x747d8d)
+                                        theme.muted_foreground
                                     }))
                                     .child(if let Some(input) = rename_input {
                                         div()
@@ -1393,11 +1900,11 @@ impl Render for SynapseApp {
                                             .rounded_sm()
                                             .border_1()
                                             .border_color(if rename_has_error {
-                                                rgb(0xa84e58)
+                                                theme.danger
                                             } else {
-                                                rgb(0x526579)
+                                                theme.input
                                             })
-                                            .bg(rgb(0x12151a))
+                                            .bg(theme.background)
                                             .child(input)
                                             .into_any_element()
                                     } else {
@@ -1457,7 +1964,7 @@ impl Render for SynapseApp {
                                 .pl(px(12.0 + depth as f32 * 16.0))
                                 .pr_2()
                                 .text_xs()
-                                .text_color(rgb(0x555e6d))
+                                .text_color(theme.muted_foreground)
                                 .child("空文件夹")
                                 .into_any_element(),
                         }
@@ -1465,32 +1972,33 @@ impl Render for SynapseApp {
             )
             .child(
                 div()
-                    .id("settings-shortcut")
                     .h(px(BOTTOM_BAR_HEIGHT))
                     .flex_none()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .px_3()
                     .border_t_1()
-                    .border_color(rgb(0x292d34))
-                    .text_sm()
-                    .text_color(rgb(0x858d9b))
-                    .cursor_pointer()
-                    .hover(|style| style.bg(rgb(0x20242b)))
-                    .child(Icon::Settings.render(16.0).text_color(rgb(0x858d9b)))
-                    .child("Settings")
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.open_command_palette(cx);
-                    })),
+                    .border_color(theme.sidebar_border)
+                    .child({
+                        let app = app_entity.clone();
+                        Button::new("settings-shortcut")
+                            .ghost()
+                            .w_full()
+                            .h_full()
+                            .justify_start()
+                            .child(Icon::Settings.render(16.0))
+                            .label("Settings")
+                            .on_click(move |_, _, cx| {
+                                app.update(cx, |this, cx| {
+                                    this.open_theme_settings(cx);
+                                });
+                            })
+                    }),
             )
             .with_transition("left-sidebar-transition")
             .transition_when_else(
                 self.left_sidebar_open,
                 PANEL_TRANSITION,
                 EaseInOutCubic,
-                |style| style.w(px(248.0)).opacity(1.0),
-                |style| style.w(px(0.0)).opacity(0.0),
+                |style| style.opacity(1.0),
+                |style| style.opacity(0.0),
             );
 
         let context_backdrop =
@@ -1518,6 +2026,10 @@ impl Render for SynapseApp {
 
         let context_menu = self.tab_context_menu.clone().map(|menu| {
             let index = menu.index;
+            let close_app = app_entity.clone();
+            let close_left_app = app_entity.clone();
+            let close_right_app = app_entity.clone();
+            let close_all_app = app_entity.clone();
             let position = context_menu_position(
                 menu.position,
                 window.viewport_size(),
@@ -1532,66 +2044,62 @@ impl Render for SynapseApp {
                 .p_1()
                 .rounded_md()
                 .border_1()
-                .border_color(rgb(0x3a404c))
-                .bg(rgb(0x22262e))
+                .border_color(theme.border)
+                .bg(theme.popover)
                 .text_sm()
-                .text_color(rgb(0xd6dae4))
+                .text_color(theme.popover_foreground)
                 .child(
-                    div()
-                        .id("context-close")
-                        .px_3()
-                        .py_2()
-                        .rounded_sm()
-                        .cursor_pointer()
-                        .hover(|style| style.bg(rgb(0x303642)))
-                        .child("Close")
-                        .on_click(cx.listener(move |this, _, _, cx| {
+                    Button::new("context-close")
+                        .ghost()
+                        .w_full()
+                        .justify_start()
+                        .label("Close")
+                        .on_click(move |_, _, cx| {
                             cx.stop_propagation();
-                            this.close_tab(index, cx);
-                        })),
+                            close_app.update(cx, |this, cx| {
+                                this.close_tab(index, cx);
+                            });
+                        }),
                 )
                 .child(
-                    div()
-                        .id("context-close-left")
-                        .px_3()
-                        .py_2()
-                        .rounded_sm()
-                        .cursor_pointer()
-                        .hover(|style| style.bg(rgb(0x303642)))
-                        .child("Close Left")
-                        .on_click(cx.listener(move |this, _, _, cx| {
+                    Button::new("context-close-left")
+                        .ghost()
+                        .w_full()
+                        .justify_start()
+                        .label("Close Left")
+                        .on_click(move |_, _, cx| {
                             cx.stop_propagation();
-                            this.close_tabs_left(index, cx);
-                        })),
+                            close_left_app.update(cx, |this, cx| {
+                                this.close_tabs_left(index, cx);
+                            });
+                        }),
                 )
                 .child(
-                    div()
-                        .id("context-close-right")
-                        .px_3()
-                        .py_2()
-                        .rounded_sm()
-                        .cursor_pointer()
-                        .hover(|style| style.bg(rgb(0x303642)))
-                        .child("Close Right")
-                        .on_click(cx.listener(move |this, _, _, cx| {
+                    Button::new("context-close-right")
+                        .ghost()
+                        .w_full()
+                        .justify_start()
+                        .label("Close Right")
+                        .on_click(move |_, _, cx| {
                             cx.stop_propagation();
-                            this.close_tabs_right(index, cx);
-                        })),
+                            close_right_app.update(cx, |this, cx| {
+                                this.close_tabs_right(index, cx);
+                            });
+                        }),
                 )
-                .child(div().h(px(1.0)).mx_2().my_1().bg(rgb(0x3a404c)))
+                .child(div().h(px(1.0)).mx_2().my_1().bg(theme.border))
                 .child(
-                    div()
-                        .id("context-close-all")
-                        .px_3()
-                        .py_2()
-                        .rounded_sm()
-                        .cursor_pointer()
-                        .hover(|style| style.bg(rgb(0x303642)))
-                        .child("Close All")
-                        .on_click(cx.listener(|this, _, _, cx| {
+                    Button::new("context-close-all")
+                        .ghost()
+                        .w_full()
+                        .justify_start()
+                        .label("Close All")
+                        .on_click(move |_, _, cx| {
                             cx.stop_propagation();
-                            this.close_all_tabs(cx);
-                        })),
+                            close_all_app.update(cx, |this, cx| {
+                                this.close_all_tabs(cx);
+                            });
+                        }),
                 )
                 .opacity(0.0)
                 .with_transition(SharedString::from(format!(
@@ -1622,10 +2130,10 @@ impl Render for SynapseApp {
                 .p_1()
                 .rounded_lg()
                 .border_1()
-                .border_color(rgb(0x3a404c))
-                .bg(rgb(0x22262e))
+                .border_color(theme.border)
+                .bg(theme.popover)
                 .text_sm()
-                .text_color(rgb(0xd6dae4))
+                .text_color(theme.popover_foreground)
                 .opacity(0.0)
                 .with_transition("tree-context-menu-transition")
                 .transition_when_else(
@@ -1640,162 +2148,152 @@ impl Render for SynapseApp {
                 VaultEntryKind::Directory => {
                     let new_folder_parent = target.relative_path.clone();
                     let new_note_parent = target.relative_path.clone();
+                    let new_folder_app = app_entity.clone();
+                    let reveal_app = app_entity.clone();
+                    let new_note_app = app_entity.clone();
+                    let rename_app = app_entity.clone();
+                    let trash_app = app_entity.clone();
                     base.child(
-                        div()
-                            .id("folder-menu-new-folder")
+                        Button::new("folder-menu-new-folder")
+                            .ghost()
+                            .w_full()
                             .h(px(38.0))
-                            .flex()
-                            .items_center()
-                            .gap_3()
-                            .px_3()
-                            .rounded_md()
-                            .cursor_pointer()
-                            .hover(|style| style.bg(rgb(0x303642)))
-                            .child(Icon::FolderPlus.render(16.0).text_color(rgb(0x9da6b6)))
-                            .child("New Folder")
-                            .on_click(cx.listener(move |this, _, _, cx| {
+                            .justify_start()
+                            .child(Icon::FolderPlus.render(16.0))
+                            .label("New Folder")
+                            .on_click(move |_, _, cx| {
                                 cx.stop_propagation();
-                                this.create_untitled_directory(&new_folder_parent, cx);
-                            })),
+                                new_folder_app.update(cx, |this, cx| {
+                                    this.create_untitled_directory(&new_folder_parent, cx);
+                                });
+                            }),
                     )
                     .child(
-                        div()
-                            .id("folder-menu-reveal")
+                        Button::new("folder-menu-reveal")
+                            .ghost()
+                            .w_full()
                             .h(px(38.0))
-                            .flex()
-                            .items_center()
-                            .gap_3()
-                            .px_3()
-                            .rounded_md()
-                            .cursor_pointer()
-                            .hover(|style| style.bg(rgb(0x303642)))
-                            .child(Icon::Reveal.render(16.0).text_color(rgb(0x9da6b6)))
-                            .child("Reveal in Finder")
-                            .on_click(cx.listener(move |this, _, _, cx| {
+                            .justify_start()
+                            .child(Icon::Reveal.render(16.0))
+                            .label("Reveal in Finder")
+                            .on_click(move |_, _, cx| {
                                 cx.stop_propagation();
-                                this.reveal_tree_target(&reveal_target, cx);
-                            })),
+                                reveal_app.update(cx, |this, cx| {
+                                    this.reveal_tree_target(&reveal_target, cx);
+                                });
+                            }),
                     )
                     .child(
-                        div()
-                            .id("folder-menu-new-note")
+                        Button::new("folder-menu-new-note")
+                            .ghost()
+                            .w_full()
                             .h(px(38.0))
-                            .flex()
-                            .items_center()
-                            .gap_3()
-                            .px_3()
-                            .rounded_md()
-                            .cursor_pointer()
-                            .hover(|style| style.bg(rgb(0x303642)))
-                            .child(Icon::FilePlus.render(16.0).text_color(rgb(0x9da6b6)))
-                            .child("New Note")
-                            .on_click(cx.listener(move |this, _, window, cx| {
+                            .justify_start()
+                            .child(Icon::FilePlus.render(16.0))
+                            .label("New Note")
+                            .on_click(move |_, window, cx| {
                                 cx.stop_propagation();
-                                this.create_untitled_note(&new_note_parent, window, cx);
-                            })),
+                                new_note_app.update(cx, |this, cx| {
+                                    this.create_untitled_note(&new_note_parent, window, cx);
+                                });
+                            }),
                     )
-                    .child(div().h(px(1.0)).mx_2().my_1().bg(rgb(0x3a404c)))
+                    .child(div().h(px(1.0)).mx_2().my_1().bg(theme.border))
                     .child(
-                        div()
-                            .id("folder-menu-rename")
+                        Button::new("folder-menu-rename")
+                            .ghost()
+                            .w_full()
                             .h(px(38.0))
-                            .flex()
-                            .items_center()
-                            .gap_3()
-                            .px_3()
-                            .rounded_md()
-                            .cursor_pointer()
-                            .hover(|style| style.bg(rgb(0x303642)))
-                            .child(Icon::Rename.render(16.0).text_color(rgb(0x9da6b6)))
-                            .child("Rename")
-                            .on_click(cx.listener(move |this, _, window, cx| {
+                            .justify_start()
+                            .child(Icon::Rename.render(16.0))
+                            .label("Rename")
+                            .on_click(move |_, window, cx| {
                                 cx.stop_propagation();
-                                this.begin_inline_rename(rename_target.clone(), window, cx);
-                            })),
+                                rename_app.update(cx, |this, cx| {
+                                    this.begin_inline_rename(rename_target.clone(), window, cx);
+                                });
+                            }),
                     )
                     .child(
-                        div()
-                            .id("folder-menu-delete")
+                        Button::new("folder-menu-delete")
+                            .danger()
+                            .outline()
+                            .w_full()
                             .h(px(38.0))
-                            .flex()
-                            .items_center()
-                            .gap_3()
-                            .px_3()
-                            .rounded_md()
-                            .text_color(rgb(0xee7f84))
-                            .cursor_pointer()
-                            .hover(|style| style.bg(rgb(0x3b292e)))
-                            .child(Icon::Trash.render(16.0).text_color(rgb(0xee7f84)))
-                            .child("Delete Folder")
-                            .on_click(cx.listener(move |this, _, _, cx| {
+                            .justify_start()
+                            .child(Icon::Trash.render(16.0))
+                            .label("Delete Folder")
+                            .on_click(move |_, _, cx| {
                                 cx.stop_propagation();
-                                this.trash_tree_target(&trash_target, cx);
-                            })),
+                                trash_app.update(cx, |this, cx| {
+                                    this.trash_tree_target(&trash_target, cx);
+                                });
+                            }),
                     )
                     .into_any_element()
                 }
-                VaultEntryKind::Note => base
-                    .child(
-                        div()
-                            .id("note-menu-rename")
+                VaultEntryKind::Note => {
+                    let rename_app = app_entity.clone();
+                    let reveal_app = app_entity.clone();
+                    let trash_app = app_entity.clone();
+                    base.child(
+                        Button::new("note-menu-rename")
+                            .ghost()
+                            .w_full()
                             .h(px(38.0))
-                            .flex()
-                            .items_center()
-                            .gap_3()
-                            .px_3()
-                            .rounded_md()
-                            .cursor_pointer()
-                            .hover(|style| style.bg(rgb(0x303642)))
-                            .child(Icon::Rename.render(16.0).text_color(rgb(0x9da6b6)))
-                            .child("Rename")
-                            .on_click(cx.listener(move |this, _, window, cx| {
+                            .justify_start()
+                            .child(Icon::Rename.render(16.0))
+                            .label("Rename")
+                            .on_click(move |_, window, cx| {
                                 cx.stop_propagation();
-                                this.begin_inline_rename(rename_target.clone(), window, cx);
-                            })),
+                                rename_app.update(cx, |this, cx| {
+                                    this.begin_inline_rename(rename_target.clone(), window, cx);
+                                });
+                            }),
                     )
                     .child(
-                        div()
-                            .id("note-menu-reveal")
+                        Button::new("note-menu-reveal")
+                            .ghost()
+                            .w_full()
                             .h(px(38.0))
-                            .flex()
-                            .items_center()
-                            .gap_3()
-                            .px_3()
-                            .rounded_md()
-                            .cursor_pointer()
-                            .hover(|style| style.bg(rgb(0x303642)))
-                            .child(Icon::Reveal.render(16.0).text_color(rgb(0x9da6b6)))
-                            .child("Reveal in Finder")
-                            .on_click(cx.listener(move |this, _, _, cx| {
+                            .justify_start()
+                            .child(Icon::Reveal.render(16.0))
+                            .label("Reveal in Finder")
+                            .on_click(move |_, _, cx| {
                                 cx.stop_propagation();
-                                this.reveal_tree_target(&reveal_target, cx);
-                            })),
+                                reveal_app.update(cx, |this, cx| {
+                                    this.reveal_tree_target(&reveal_target, cx);
+                                });
+                            }),
                     )
-                    .child(div().h(px(1.0)).mx_2().my_1().bg(rgb(0x3a404c)))
+                    .child(div().h(px(1.0)).mx_2().my_1().bg(theme.border))
                     .child(
-                        div()
-                            .id("note-menu-trash")
+                        Button::new("note-menu-trash")
+                            .danger()
+                            .outline()
+                            .w_full()
                             .h(px(38.0))
-                            .flex()
-                            .items_center()
-                            .gap_3()
-                            .px_3()
-                            .rounded_md()
-                            .text_color(rgb(0xee7f84))
-                            .cursor_pointer()
-                            .hover(|style| style.bg(rgb(0x3b292e)))
-                            .child(Icon::Trash.render(16.0).text_color(rgb(0xee7f84)))
-                            .child("Move to Trash")
-                            .on_click(cx.listener(move |this, _, _, cx| {
+                            .justify_start()
+                            .child(Icon::Trash.render(16.0))
+                            .label("Move to Trash")
+                            .on_click(move |_, _, cx| {
                                 cx.stop_propagation();
-                                this.trash_tree_target(&trash_target, cx);
-                            })),
+                                trash_app.update(cx, |this, cx| {
+                                    this.trash_tree_target(&trash_target, cx);
+                                });
+                            }),
                     )
-                    .into_any_element(),
+                    .into_any_element()
+                }
             }
         });
 
         let command_palette = self.command_palette_open.then(|| {
+            let new_note_app = app_entity.clone();
+            let open_vault_app = app_entity.clone();
+            let todo_app = app_entity.clone();
+            let bookmarks_app = app_entity.clone();
+            let settings_app = app_entity.clone();
             div()
                 .id("command-palette-backdrop")
                 .absolute()
@@ -1820,125 +2318,107 @@ impl Render for SynapseApp {
                         .p_2()
                         .rounded_lg()
                         .border_1()
-                        .border_color(rgb(0x333943))
-                        .bg(rgb(0x1b1e23))
+                        .border_color(theme.border)
+                        .bg(theme.popover)
                         .text_sm()
-                        .text_color(rgb(0xb8bfcb))
+                        .text_color(theme.popover_foreground)
                         .opacity(0.0)
                         .on_click(cx.listener(|_, _, _, cx| {
                             cx.stop_propagation();
                         }))
                         .child(
                             div()
-                                .h(px(44.0))
-                                .flex()
-                                .items_center()
-                                .gap_3()
-                                .px_3()
+                                .h(px(48.0))
+                                .p_1()
                                 .border_b_1()
-                                .border_color(rgb(0x2b3038))
-                                .text_base()
-                                .child(Icon::Search.render(17.0).text_color(rgb(0x858e9d)))
+                                .border_color(theme.border)
                                 .child(
-                                    div()
-                                        .flex_1()
-                                        .text_color(rgb(0x858e9d))
-                                        .child("Search any..."),
+                                    Input::new(&self.command_search)
+                                        .appearance(false)
+                                        .prefix(IconName::Search)
+                                        .when_some(command_kbd.clone(), |input, kbd| {
+                                            input.suffix(kbd)
+                                        }),
                                 ),
                         )
                         .child(
-                            div()
-                                .id("palette-new-note")
+                            Button::new("palette-new-note")
+                                .primary()
+                                .w_full()
                                 .h(px(38.0))
                                 .mt_2()
-                                .flex()
-                                .items_center()
-                                .gap_3()
-                                .px_3()
-                                .rounded_md()
-                                .bg(rgb(0x30343b))
-                                .cursor_pointer()
-                                .child(Icon::FilePlus.render(17.0).text_color(rgb(0xb8bfcb)))
-                                .child(div().flex_1().child("New Note"))
-                                .child(div().text_xs().text_color(rgb(0x737b89)).child("⌘N"))
-                                .on_click(cx.listener(|this, _, window, cx| {
+                                .justify_start()
+                                .child(Icon::FilePlus.render(17.0))
+                                .child(div().flex_1().text_left().child("New Note"))
+                                .child(div().text_xs().child("⌘N"))
+                                .on_click(move |_, window, cx| {
                                     cx.stop_propagation();
-                                    this.create_untitled_note(Path::new(""), window, cx);
-                                })),
+                                    new_note_app.update(cx, |this, cx| {
+                                        this.create_untitled_note(Path::new(""), window, cx);
+                                    });
+                                }),
                         )
                         .child(
-                            div()
-                                .id("palette-open-vault")
+                            Button::new("palette-open-vault")
+                                .ghost()
+                                .w_full()
                                 .h(px(38.0))
-                                .flex()
-                                .items_center()
-                                .gap_3()
-                                .px_3()
-                                .rounded_md()
-                                .cursor_pointer()
-                                .hover(|style| style.bg(rgb(0x282d35)))
-                                .child(Icon::FolderOpen.render(17.0).text_color(rgb(0x8f98a8)))
+                                .justify_start()
+                                .child(Icon::FolderOpen.render(17.0))
                                 .child(div().flex_1().child("Open Vault…"))
-                                .on_click(cx.listener(|this, _, _, cx| {
+                                .on_click(move |_, _, cx| {
                                     cx.stop_propagation();
-                                    this.dismiss_command_palette(cx);
-                                    this.prompt_for_vault(cx);
-                                })),
+                                    open_vault_app.update(cx, |this, cx| {
+                                        this.dismiss_command_palette(cx);
+                                        this.prompt_for_vault(cx);
+                                    });
+                                }),
                         )
                         .child(
-                            div()
-                                .id("palette-todo")
+                            Button::new("palette-todo")
+                                .ghost()
+                                .w_full()
                                 .h(px(38.0))
-                                .flex()
-                                .items_center()
-                                .gap_3()
-                                .px_3()
-                                .rounded_md()
-                                .cursor_pointer()
-                                .hover(|style| style.bg(rgb(0x282d35)))
-                                .child(Icon::Todo.render(17.0).text_color(rgb(0x8f98a8)))
+                                .justify_start()
+                                .child(Icon::Todo.render(17.0))
                                 .child(div().flex_1().child("Open Todo"))
-                                .on_click(cx.listener(|this, _, _, cx| {
+                                .on_click(move |_, _, cx| {
                                     cx.stop_propagation();
-                                    this.dismiss_command_palette(cx);
-                                })),
+                                    todo_app.update(cx, |this, cx| {
+                                        this.dismiss_command_palette(cx);
+                                    });
+                                }),
                         )
                         .child(
-                            div()
-                                .id("palette-bookmarks")
+                            Button::new("palette-bookmarks")
+                                .ghost()
+                                .w_full()
                                 .h(px(38.0))
-                                .flex()
-                                .items_center()
-                                .gap_3()
-                                .px_3()
-                                .rounded_md()
-                                .cursor_pointer()
-                                .hover(|style| style.bg(rgb(0x282d35)))
-                                .child(Icon::Bookmark.render(17.0).text_color(rgb(0x8f98a8)))
+                                .justify_start()
+                                .child(Icon::Bookmark.render(17.0))
                                 .child(div().flex_1().child("Open Bookmarks"))
-                                .on_click(cx.listener(|this, _, _, cx| {
+                                .on_click(move |_, _, cx| {
                                     cx.stop_propagation();
-                                    this.dismiss_command_palette(cx);
-                                })),
+                                    bookmarks_app.update(cx, |this, cx| {
+                                        this.dismiss_command_palette(cx);
+                                    });
+                                }),
                         )
-                        .child(div().h(px(1.0)).mx_2().my_2().bg(rgb(0x30353e)))
+                        .child(div().h(px(1.0)).mx_2().my_2().bg(theme.border))
                         .child(
-                            div()
-                                .id("palette-settings")
+                            Button::new("palette-settings")
+                                .ghost()
+                                .w_full()
                                 .h(px(38.0))
-                                .flex()
-                                .items_center()
-                                .gap_3()
-                                .px_3()
-                                .rounded_md()
-                                .cursor_pointer()
-                                .hover(|style| style.bg(rgb(0x282d35)))
-                                .child(Icon::Settings.render(17.0).text_color(rgb(0x8f98a8)))
+                                .justify_start()
+                                .child(Icon::Settings.render(17.0))
                                 .child(div().flex_1().child("Settings"))
-                                .on_click(cx.listener(|this, _, _, cx| {
+                                .on_click(move |_, _, cx| {
                                     cx.stop_propagation();
-                                    this.dismiss_command_palette(cx);
-                                })),
+                                    settings_app.update(cx, |this, cx| {
+                                        this.open_theme_settings(cx);
+                                    });
+                                }),
                         )
                         .with_transition("command-palette-transition")
                         .transition_when_else(
@@ -1952,14 +2432,142 @@ impl Render for SynapseApp {
                 .into_any_element()
         });
 
+        let theme_settings = self.theme_settings_open.then(|| {
+            let selected_preference = self.theme_preference;
+            let close_app = app_entity.clone();
+            let persistence_error = self.theme_persistence_error.clone();
+            div()
+                .id("theme-settings-backdrop")
+                .absolute()
+                .top(px(0.0))
+                .right(px(0.0))
+                .bottom(px(0.0))
+                .left(px(0.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .opacity(0.0)
+                .bg(if theme.is_dark() {
+                    hsla(0.0, 0.0, 0.0, 0.62)
+                } else {
+                    hsla(0.0, 0.0, 0.0, 0.22)
+                })
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.close_theme_settings(cx);
+                }))
+                .child(
+                    div()
+                        .id("theme-settings-dialog")
+                        .w(px(420.0))
+                        .max_w(relative(0.92))
+                        .p_4()
+                        .rounded_lg()
+                        .border_1()
+                        .border_color(theme.border)
+                        .bg(theme.popover)
+                        .text_color(theme.popover_foreground)
+                        .on_click(cx.listener(|_, _, _, cx| {
+                            cx.stop_propagation();
+                        }))
+                        .child(
+                            div()
+                                .h(px(40.0))
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .child(
+                                    div()
+                                        .text_base()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .child("Appearance"),
+                                )
+                                .child(
+                                    Button::new("close-theme-settings")
+                                        .ghost()
+                                        .size(px(40.0))
+                                        .tooltip("Close settings")
+                                        .child(IconName::Close)
+                                        .on_click(move |_, _, cx| {
+                                            close_app.update(cx, |this, cx| {
+                                                this.close_theme_settings(cx);
+                                            });
+                                        }),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .mb_3()
+                                .text_sm()
+                                .text_color(theme.muted_foreground)
+                                .child("Choose a theme or keep Synapse in sync with the system."),
+                        )
+                        .children(ThemePreference::ALL.into_iter().map(|preference| {
+                            let app = app_entity.clone();
+                            let selected = preference == selected_preference;
+                            Button::new(SharedString::from(format!(
+                                "theme-preference-{}",
+                                preference.as_str()
+                            )))
+                            .when(selected, |button| button.primary())
+                            .when(!selected, |button| button.outline())
+                            .w_full()
+                            .h(px(48.0))
+                            .mb_2()
+                            .justify_start()
+                            .child(gpui_component::Icon::new(preference.icon()).small())
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .flex()
+                                    .flex_col()
+                                    .items_start()
+                                    .child(preference.label())
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(if selected {
+                                                theme.primary_foreground
+                                            } else {
+                                                theme.muted_foreground
+                                            })
+                                            .child(preference.description()),
+                                    ),
+                            )
+                            .when(selected, |button| button.child(IconName::Check))
+                            .on_click(move |_, window, cx| {
+                                app.update(cx, |this, cx| {
+                                    this.set_theme_preference(preference, window, cx);
+                                });
+                            })
+                        }))
+                        .when_some(persistence_error, |dialog, error| {
+                            dialog
+                                .child(div().mt_1().text_xs().text_color(theme.danger).child(error))
+                        }),
+                )
+                .with_transition("theme-settings-transition")
+                .transition_when_else(
+                    !self.theme_settings_closing,
+                    QUICK_TRANSITION,
+                    EaseOutQuad,
+                    |style| style.opacity(1.0),
+                    |style| style.opacity(0.0),
+                )
+                .into_any_element()
+        });
+
+        let toolbar_app = app_entity.clone();
+        let sidebar_toggle_app = app_entity;
         div()
             .size_full()
             .relative()
             .flex()
             .flex_col()
             .overflow_hidden()
-            .bg(rgb(0x111318))
-            .text_color(rgb(0xd8dce7))
+            .bg(theme.background)
+            .text_color(theme.foreground)
+            .on_action(cx.listener(Self::open_command_palette_action))
             .child(
                 div()
                     .id("workspace-toolbar")
@@ -1971,8 +2579,8 @@ impl Render for SynapseApp {
                     .pl(toolbar_left_padding())
                     .pr_3()
                     .border_b_1()
-                    .border_color(rgb(0x2a2e36))
-                    .bg(rgb(0x171a20))
+                    .border_color(theme.border)
+                    .bg(theme.tab_bar)
                     .child(div().flex_1())
                     .child(
                         div()
@@ -1981,19 +2589,15 @@ impl Render for SynapseApp {
                             .child(status_message),
                     )
                     .child(
-                        div()
-                            .id("open-vault-toolbar")
-                            .px_3()
-                            .py_1()
-                            .rounded_sm()
-                            .text_xs()
-                            .text_color(rgb(0xaeb7c8))
-                            .cursor_pointer()
-                            .hover(|style| style.bg(rgb(0x2a303a)))
-                            .child("Open Vault")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.prompt_for_vault(cx);
-                            })),
+                        Button::new("open-vault-toolbar")
+                            .ghost()
+                            .small()
+                            .label("Open Vault")
+                            .on_click(move |_, _, cx| {
+                                toolbar_app.update(cx, |this, cx| {
+                                    this.prompt_for_vault(cx);
+                                });
+                            }),
                     ),
             )
             .child(
@@ -2011,7 +2615,7 @@ impl Render for SynapseApp {
                             .overflow_hidden()
                             .flex()
                             .flex_col()
-                            .bg(rgb(0x15181e))
+                            .bg(theme.background)
                             .child(tab_bar)
                             .child(editor_body)
                             .child(
@@ -2023,25 +2627,23 @@ impl Render for SynapseApp {
                                     .justify_between()
                                     .pr_3()
                                     .border_t_1()
-                                    .border_color(rgb(0x2a2e36))
+                                    .border_color(theme.border)
                                     .text_xs()
-                                    .text_color(rgb(0x5f687a))
+                                    .text_color(theme.muted_foreground)
                                     .child(
                                         div()
                                             .h_full()
                                             .flex()
                                             .items_center()
                                             .child(
-                                                div()
-                                                    .id("toggle-left-sidebar")
+                                                Button::new("toggle-left-sidebar")
+                                                    .ghost()
                                                     .size(px(BOTTOM_BAR_HEIGHT))
-                                                    .flex_none()
-                                                    .flex()
-                                                    .items_center()
-                                                    .justify_center()
-                                                    .text_color(rgb(0x858d9b))
-                                                    .cursor_pointer()
-                                                    .hover(|style| style.bg(rgb(0x252a33)))
+                                                    .tooltip(if self.left_sidebar_open {
+                                                        "Hide sidebar"
+                                                    } else {
+                                                        "Show sidebar"
+                                                    })
                                                     .child(
                                                         if self.left_sidebar_open {
                                                             Icon::PanelLeft
@@ -2049,21 +2651,16 @@ impl Render for SynapseApp {
                                                             Icon::PanelRight
                                                         }
                                                         .render(17.0)
-                                                        .text_color(rgb(0x858d9b)),
+                                                        .text_color(theme.muted_foreground),
                                                     )
-                                                    .on_click(cx.listener(|this, _, _, cx| {
-                                                        this.left_sidebar_open =
-                                                            !this.left_sidebar_open;
-                                                        this.dismiss_context_menus(cx);
-                                                    }))
-                                                    .with_transition(
-                                                        "bottom-sidebar-toggle-transition",
-                                                    )
-                                                    .transition_on_click(
-                                                        QUICK_TRANSITION,
-                                                        EaseOutQuad,
-                                                        |_, style| style.opacity(0.72),
-                                                    ),
+                                                    .on_click(move |_, _, cx| {
+                                                        sidebar_toggle_app.update(
+                                                            cx,
+                                                            |this, cx| {
+                                                                this.toggle_left_sidebar(cx);
+                                                            },
+                                                        );
+                                                    }),
                                             )
                                             .child(div().pl_2().child("LOCAL  •  MARKDOWN")),
                                     )
@@ -2075,6 +2672,7 @@ impl Render for SynapseApp {
             .children(context_menu)
             .children(tree_context_menu)
             .children(command_palette)
+            .children(theme_settings)
     }
 }
 
@@ -2155,11 +2753,17 @@ fn synapse_titlebar_options() -> TitlebarOptions {
 
 fn main() {
     let state = ShellState::from_vault_argument(std::env::args_os().nth(1));
+    let theme_preference = load_theme_preference();
 
     Application::new()
         .with_assets(SynapseAssets)
         .run(move |cx: &mut App| {
+            gpui_component::init(cx);
+            apply_synapse_theme(theme_preference, None, cx);
+            let [macos_palette_key, cross_platform_palette_key] = command_palette_key_bindings();
             cx.bind_keys([
+                KeyBinding::new(macos_palette_key, OpenCommandPalette, None),
+                KeyBinding::new(cross_platform_palette_key, OpenCommandPalette, None),
                 KeyBinding::new("cmd-s", Save, Some("SynapseEditor")),
                 KeyBinding::new("ctrl-s", Save, Some("SynapseEditor")),
                 KeyBinding::new("backspace", Backspace, Some("SynapseEditor")),
@@ -2196,11 +2800,39 @@ fn main() {
                     window_min_size: Some(size(px(WINDOW_MIN_WIDTH), px(WINDOW_MIN_HEIGHT))),
                     ..Default::default()
                 },
-                move |_, cx| {
+                move |window, cx| {
+                    apply_synapse_theme(theme_preference, Some(window), cx);
+                    let command_search = cx.new(|cx| {
+                        InputState::new(window, cx)
+                            .placeholder("Search any...")
+                            .clean_on_escape()
+                    });
+                    let editor_line_layouts = Rc::new(RefCell::new(Vec::new()));
+                    let editor_list_state = ListState::new(0, ListAlignment::Top, px(320.0));
+                    editor_list_state.set_scroll_handler({
+                        let editor_line_layouts = editor_line_layouts.clone();
+                        move |event, _, _| {
+                            for (index, layout) in
+                                editor_line_layouts.borrow_mut().iter_mut().enumerate()
+                            {
+                                if !event.visible_range.contains(&index) {
+                                    *layout = None;
+                                }
+                            }
+                        }
+                    });
                     let app = cx.new(|cx| SynapseApp {
                         state,
                         editor_focus: cx.focus_handle(),
+                        command_search,
+                        theme_preference,
+                        theme_settings_open: false,
+                        theme_settings_closing: false,
+                        theme_settings_generation: 0,
+                        theme_persistence_error: None,
                         left_sidebar_open: true,
+                        left_sidebar_mounted: true,
+                        left_sidebar_generation: 0,
                         command_palette_open: false,
                         command_palette_closing: false,
                         command_palette_generation: 0,
@@ -2212,11 +2844,22 @@ fn main() {
                         collapsed_directories: BTreeSet::new(),
                         editor_marked_range: None,
                         editor_selection: EditorSelection::collapsed(0),
-                        editor_line_layouts: Vec::new(),
+                        editor_line_layouts,
+                        editor_list_state,
+                        editor_render_cache: None,
                         editor_blink: CursorBlinkState::default(),
                     });
-                    app.update(cx, |app, cx| app.restart_editor_cursor_blink(cx));
-                    app
+                    app.update(cx, |app, cx| {
+                        app.restart_editor_cursor_blink(cx);
+                        cx.observe_window_appearance(window, |app, window, cx| {
+                            if app.theme_preference == ThemePreference::System {
+                                apply_synapse_theme(ThemePreference::System, Some(window), cx);
+                                cx.notify();
+                            }
+                        })
+                        .detach();
+                    });
+                    cx.new(|cx| Root::new(app, window, cx))
                 },
             )
             .expect("failed to open the Synapse window");
@@ -2229,16 +2872,76 @@ mod tests {
     use std::{
         collections::BTreeSet,
         path::{Path, PathBuf},
+        rc::Rc,
     };
 
     use gpui::{MouseButton, point, px, size};
     use synapse_core::{VaultEntry, VaultEntryKind};
 
     use super::{
-        BOTTOM_BAR_HEIGHT, FileTreeRow, build_file_tree_rows, context_menu_position,
-        file_manager_reveal_command, is_tab_context_trigger, normalize_clipboard_text,
+        BOTTOM_BAR_HEIGHT, EDITOR_BODY_FONT_SIZE, EDITOR_BODY_LINE_HEIGHT,
+        EDITOR_CONTENT_MAX_WIDTH, EDITOR_CONTENT_WIDTH_RATIO, EDITOR_HORIZONTAL_GUTTER,
+        EDITOR_TOP_PADDING, FileTreeRow, ThemePreference, build_file_tree_rows, changed_line_span,
+        command_palette_key_bindings, context_menu_position, file_manager_reveal_command,
+        is_tab_context_trigger, normalize_clipboard_text, source_lines, synapse_theme_palette,
         synapse_titlebar_options, toolbar_left_padding,
     };
+
+    #[test]
+    fn editor_typography_matches_the_centered_writing_layout() {
+        assert_eq!(EDITOR_CONTENT_WIDTH_RATIO, 0.92);
+        assert_eq!(EDITOR_CONTENT_MAX_WIDTH, 1100.0);
+        assert_eq!(EDITOR_HORIZONTAL_GUTTER, 24.0);
+        assert_eq!(EDITOR_TOP_PADDING, 24.0);
+        assert_eq!(EDITOR_BODY_FONT_SIZE, 16.0);
+        assert_eq!(EDITOR_BODY_LINE_HEIGHT, 26.4);
+    }
+
+    #[test]
+    fn editor_virtual_list_invalidates_only_the_changed_line_span() {
+        let old = source_lines("one\ntwo\nthree", 0, true)
+            .into_iter()
+            .map(Rc::new)
+            .collect::<Vec<_>>();
+        let new = source_lines("one\nchanged\nthree", 0, true)
+            .into_iter()
+            .map(Rc::new)
+            .collect::<Vec<_>>();
+
+        assert_eq!(changed_line_span(&old, &new), Some((1..2, 1)));
+        assert_eq!(changed_line_span(&old, &old), None);
+
+        let inserted = source_lines("one\ninserted\ntwo\nthree", 0, true)
+            .into_iter()
+            .map(Rc::new)
+            .collect::<Vec<_>>();
+        assert_eq!(changed_line_span(&old, &inserted), Some((1..1, 1)));
+    }
+
+    #[test]
+    fn editor_theme_supports_system_light_and_dark_preferences() {
+        assert_eq!(
+            ThemePreference::parse("system"),
+            Some(ThemePreference::System)
+        );
+        assert_eq!(
+            ThemePreference::parse("LIGHT\n"),
+            Some(ThemePreference::Light)
+        );
+        assert_eq!(ThemePreference::parse("dark"), Some(ThemePreference::Dark));
+        assert_eq!(ThemePreference::parse("unknown"), None);
+
+        let light = synapse_theme_palette(false);
+        let dark = synapse_theme_palette(true);
+        assert_ne!(light.background, light.panel);
+        assert_ne!(dark.background, dark.panel);
+        assert_ne!(light.background, dark.background);
+    }
+
+    #[test]
+    fn component_command_palette_has_native_cross_platform_shortcuts() {
+        assert_eq!(command_palette_key_bindings(), ["cmd-k", "ctrl-k"]);
+    }
 
     #[test]
     fn p2_clipboard_normalizes_platform_newlines_without_dropping_markdown() {
@@ -2249,7 +2952,7 @@ mod tests {
     }
 
     #[test]
-    fn macos_uses_a_dark_custom_titlebar_area() {
+    fn macos_uses_a_theme_adaptive_custom_titlebar_area() {
         let titlebar = synapse_titlebar_options();
 
         assert_eq!(titlebar.appears_transparent, cfg!(target_os = "macos"));

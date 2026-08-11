@@ -8,6 +8,8 @@ rust-version.workspace = true
 [dependencies]
 gpui.workspace = true
 gpui-animation.workspace = true
+gpui-component.workspace = true
+gpui-component-assets.workspace = true
 synapse-core.workspace = true
 writ.workspace = true
 

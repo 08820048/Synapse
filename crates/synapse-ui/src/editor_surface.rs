@@ -4,7 +4,7 @@ use gpui::{
     App, Bounds, Context, Element, ElementId, ElementInputHandler, Entity, EntityInputHandler,
     Font, GlobalElementId, InspectorElementId, IntoElement, LayoutId, PaintQuad, Pixels,
     StrikethroughStyle, Style, TextRun, UTF16Selection, UnderlineStyle, Window, WrappedLine, fill,
-    point, px, relative, rgb, rgba, size,
+    point, px, relative, size,
 };
 use writ::{
     buffer::Buffer,
@@ -103,6 +103,7 @@ pub struct MarkdownStyleRun {
     pub bold: bool,
     pub italic: bool,
     pub mono: bool,
+    pub muted: bool,
     pub underline: bool,
     pub strikethrough: bool,
 }
@@ -133,12 +134,16 @@ pub struct SourceLine {
     pub presentation: MarkdownLinePresentation,
 }
 
-pub fn source_lines(text: &str, cursor: usize) -> Vec<SourceLine> {
+pub fn source_lines(text: &str, cursor: usize, dark_mode: bool) -> Vec<SourceLine> {
     let mut buffer: Buffer = text.parse().expect("writ buffer parsing is infallible");
     let snapshot = buffer.render_snapshot();
     let styles_by_line = snapshot.inline_styles_by_line();
     let cursor_byte = char_to_byte(text, cursor);
-    let theme = EditorTheme::nord();
+    let theme = if dark_mode {
+        EditorTheme::nord()
+    } else {
+        EditorTheme::solarized_light()
+    };
     let mut start_char = 0;
 
     let mut lines: Vec<_> = (0..snapshot.line_count())
@@ -153,6 +158,7 @@ pub fn source_lines(text: &str, cursor: usize) -> Vec<SourceLine> {
                 .to_string();
             let source_len_chars = source.chars().count();
             let markers = snapshot.line_markers(line_index);
+            let cursor_on_line = (byte_range.start..=byte_range.end).contains(&cursor_byte);
             let render = build_line_render(
                 &snapshot,
                 line_index,
@@ -166,14 +172,42 @@ pub fn source_lines(text: &str, cursor: usize) -> Vec<SourceLine> {
                 &[],
                 None,
             );
+            let mut muted_ranges: Vec<_> = render
+                .runs
+                .iter()
+                .filter(|run| run.color == theme.comment)
+                .map(|run| run.range.clone())
+                .collect();
+            if cursor_on_line {
+                for marker in &markers.markers {
+                    let display = render.map.buffer_range_to_display(marker.range.clone());
+                    if !display.is_empty() {
+                        muted_ranges.push(display);
+                    }
+                }
+                for region in &styles_by_line[line_index] {
+                    let full = render
+                        .map
+                        .buffer_range_to_display(region.full_range.clone());
+                    let content = render
+                        .map
+                        .buffer_range_to_display(region.content_range.clone());
+                    if full.start < content.start {
+                        muted_ranges.push(full.start..content.start);
+                    }
+                    if content.end < full.end {
+                        muted_ranges.push(content.end..full.end);
+                    }
+                }
+            }
             let kind = markdown_block_kind(&markers, &snapshot, line_index, &source);
-            let cursor_on_line = (byte_range.start..=byte_range.end).contains(&cursor_byte);
             let presentation = presentation_from_writ(
                 source.as_str(),
                 byte_range.start,
                 render,
                 kind,
                 cursor_on_line,
+                &muted_ranges,
             );
             let line = SourceLine {
                 start_char,
@@ -297,6 +331,7 @@ fn presentation_from_writ(
     render: writ::render::LineRender,
     kind: MarkdownBlockKind,
     cursor_on_line: bool,
+    muted_ranges: &[Range<usize>],
 ) -> MarkdownLinePresentation {
     let (display, map, runs) = if matches!(kind, MarkdownBlockKind::Table) && !cursor_on_line {
         let display = table_row_preview(source);
@@ -339,27 +374,26 @@ fn presentation_from_writ(
         let len = display.len();
         (display, map, vec![plain_style_run(len)])
     } else {
-        let runs = flatten_writ_runs(render.text.len(), &render.runs);
+        let runs = flatten_writ_runs(render.text.len(), &render.runs, muted_ranges);
         (render.text, render.map, runs)
     };
 
-    let source_len_chars = source.chars().count();
-    let mut source_to_display = Vec::with_capacity(source_len_chars + 1);
-    for source_char in 0..=source_len_chars {
-        let source_byte = source_start_byte + char_to_byte(source, source_char);
+    let source_char_bytes = char_byte_boundaries(source);
+    let display_char_bytes = char_byte_boundaries(&display);
+    let mut source_to_display = Vec::with_capacity(source_char_bytes.len());
+    for source_byte in source_char_bytes.iter().copied() {
+        let source_byte = source_start_byte + source_byte;
         let display_byte = map.buffer_to_display(source_byte).min(display.len());
-        source_to_display.push(display[..display_byte].chars().count());
+        source_to_display.push(char_index_for_byte(&display_char_bytes, display_byte));
     }
 
-    let display_len_chars = display.chars().count();
-    let mut display_to_source = Vec::with_capacity(display_len_chars + 1);
-    for display_char in 0..=display_len_chars {
-        let display_byte = char_to_byte(&display, display_char);
+    let mut display_to_source = Vec::with_capacity(display_char_bytes.len());
+    for display_byte in display_char_bytes {
         let source_byte = map
             .display_to_buffer(display_byte)
             .saturating_sub(source_start_byte)
             .min(source.len());
-        display_to_source.push(source[..source_byte].chars().count());
+        display_to_source.push(char_index_for_byte(&source_char_bytes, source_byte));
     }
 
     MarkdownLinePresentation {
@@ -439,6 +473,7 @@ fn hidden_source_presentation(source: &str) -> MarkdownLinePresentation {
 fn flatten_writ_runs(
     text_len: usize,
     overlay_runs: &[writ::text_engine::StyleRun],
+    muted_ranges: &[Range<usize>],
 ) -> Vec<MarkdownStyleRun> {
     if text_len == 0 {
         return Vec::new();
@@ -447,6 +482,10 @@ fn flatten_writ_runs(
     for run in overlay_runs {
         boundaries.push(run.range.start.min(text_len));
         boundaries.push(run.range.end.min(text_len));
+    }
+    for range in muted_ranges {
+        boundaries.push(range.start.min(text_len));
+        boundaries.push(range.end.min(text_len));
     }
     boundaries.sort_unstable();
     boundaries.dedup();
@@ -467,6 +506,9 @@ fn flatten_writ_runs(
             bold: active.iter().any(|run| run.bold),
             italic: active.iter().any(|run| run.italic),
             mono: active.iter().any(|run| run.mono),
+            muted: muted_ranges
+                .iter()
+                .any(|range| range.start <= start && range.end >= end),
             underline: active.iter().any(|run| run.underline),
             strikethrough: active.iter().any(|run| run.strikethrough),
         };
@@ -485,6 +527,7 @@ fn same_markdown_style(left: &MarkdownStyleRun, right: &MarkdownStyleRun) -> boo
     left.bold == right.bold
         && left.italic == right.italic
         && left.mono == right.mono
+        && left.muted == right.muted
         && left.underline == right.underline
         && left.strikethrough == right.strikethrough
 }
@@ -495,6 +538,7 @@ fn plain_style_run(len: usize) -> MarkdownStyleRun {
         bold: false,
         italic: false,
         mono: false,
+        muted: false,
         underline: false,
         strikethrough: false,
     }
@@ -505,9 +549,7 @@ pub struct EditorLineLayout {
     pub bounds: Bounds<Pixels>,
     pub wrapped_line: WrappedLine,
     pub line_height: Pixels,
-    pub start_char: usize,
-    pub source_len_chars: usize,
-    pub presentation: MarkdownLinePresentation,
+    pub source_line: Rc<SourceLine>,
 }
 
 impl EditorLineLayout {
@@ -519,18 +561,25 @@ impl EditorLineLayout {
             .unwrap_or_else(|index| index)
             .min(self.wrapped_line.text.len());
         let display_char = self.wrapped_line.text[..byte].chars().count();
-        self.start_char + self.presentation.source_char_for_display(display_char)
+        self.source_line.start_char
+            + self
+                .source_line
+                .presentation
+                .source_char_for_display(display_char)
     }
 
     fn contains_source_char(&self, char_index: usize) -> bool {
-        (self.start_char..=self.start_char + self.source_len_chars).contains(&char_index)
+        (self.source_line.start_char
+            ..=self.source_line.start_char + self.source_line.source_len_chars)
+            .contains(&char_index)
     }
 
     fn point_for_source_char(&self, char_index: usize) -> gpui::Point<Pixels> {
-        let local_source = char_index.saturating_sub(self.start_char);
+        let local_source = char_index.saturating_sub(self.source_line.start_char);
         let display_char = self
+            .source_line
             .presentation
-            .display_char_for_source(local_source.min(self.source_len_chars));
+            .display_char_for_source(local_source.min(self.source_line.source_len_chars));
         let byte = char_to_byte(&self.wrapped_line.text, display_char);
         self.wrapped_line
             .position_for_index(byte, self.line_height)
@@ -540,12 +589,16 @@ impl EditorLineLayout {
 
 pub struct MarkdownLineElement {
     pub app: Entity<SynapseApp>,
+    pub line_layouts: Rc<RefCell<Vec<Option<EditorLineLayout>>>>,
     pub line_index: usize,
-    pub source_line: SourceLine,
+    pub source_line: Rc<SourceLine>,
     pub active: bool,
     pub cursor: usize,
     pub selection: Range<usize>,
     pub cursor_visible: bool,
+    pub marker_color: gpui::Hsla,
+    pub cursor_color: gpui::Hsla,
+    pub selection_color: gpui::Hsla,
 }
 
 #[derive(Clone, Default)]
@@ -614,7 +667,7 @@ impl Element for MarkdownLineElement {
                 .presentation
                 .runs
                 .iter()
-                .map(|run| text_run_from_markdown(run, &base_font, base_color))
+                .map(|run| text_run_from_markdown(run, &base_font, base_color, self.marker_color))
                 .collect()
         };
         let state = WrappedLayoutState {
@@ -671,7 +724,7 @@ impl Element for MarkdownLineElement {
                 .unwrap_or_default();
             fill(
                 Bounds::new(bounds.origin + cursor_position, size(px(1.0), line_height)),
-                rgb(0xd7dde8),
+                self.cursor_color,
             )
         });
         let line_start = self.source_line.start_char;
@@ -698,6 +751,7 @@ impl Element for MarkdownLineElement {
                 bounds,
                 start_byte..end_byte,
                 self.selection.end > line_end,
+                self.selection_color,
             )
         } else {
             Vec::new()
@@ -750,15 +804,11 @@ impl Element for MarkdownLineElement {
             bounds,
             wrapped_line: line,
             line_height: prepaint.line_height,
-            start_char: self.source_line.start_char,
-            source_len_chars: self.source_line.source_len_chars,
-            presentation: self.source_line.presentation.clone(),
+            source_line: self.source_line.clone(),
         };
-        self.app.update(cx, |app, _| {
-            if let Some(slot) = app.editor_line_layouts.get_mut(self.line_index) {
-                *slot = Some(layout);
-            }
-        });
+        if let Some(slot) = self.line_layouts.borrow_mut().get_mut(self.line_index) {
+            *slot = Some(layout);
+        }
     }
 }
 
@@ -766,6 +816,7 @@ fn text_run_from_markdown(
     run: &MarkdownStyleRun,
     base_font: &Font,
     base_color: gpui::Hsla,
+    marker_color: gpui::Hsla,
 ) -> TextRun {
     let mut font = base_font.clone();
     if run.bold {
@@ -774,13 +825,7 @@ fn text_run_from_markdown(
     if run.italic {
         font = font.italic();
     }
-    let color: gpui::Hsla = if run.underline {
-        rgb(0x8fb9e8).into()
-    } else if run.mono {
-        rgb(0xb6c9a8).into()
-    } else {
-        base_color
-    };
+    let color = if run.muted { marker_color } else { base_color };
     TextRun {
         len: run.len,
         font,
@@ -816,6 +861,7 @@ fn selection_quads_for_wrapped_line(
     bounds: Bounds<Pixels>,
     selected: Range<usize>,
     includes_source_newline: bool,
+    selection_color: gpui::Hsla,
 ) -> Vec<PaintQuad> {
     let wrap_boundaries: Vec<_> = line
         .wrap_boundaries()
@@ -839,7 +885,7 @@ fn selection_quads_for_wrapped_line(
         let top = bounds.top() + line_height * row_index;
         quads.push(fill(
             Bounds::from_corners(point(left, top), point(right, top + line_height)),
-            rgba(0x4b76a866),
+            selection_color,
         ));
     }
     quads
@@ -952,12 +998,14 @@ impl EntityInputHandler for SynapseApp {
     ) -> Option<Bounds<Pixels>> {
         let text = self.state.active_document()?.text();
         let range = utf16_range_to_char(&text, &range_utf16);
-        let layout = self
-            .editor_line_layouts
+        let line_layouts = self.editor_line_layouts.borrow();
+        let layout = line_layouts
             .iter()
             .flatten()
             .find(|layout| layout.contains_source_char(range.start))?;
-        let right_char = range.end.min(layout.start_char + layout.source_len_chars);
+        let right_char = range
+            .end
+            .min(layout.source_line.start_char + layout.source_line.source_len_chars);
         let start = layout.point_for_source_char(range.start);
         let end = layout.point_for_source_char(right_char);
         Some(Bounds::from_corners(
@@ -973,7 +1021,8 @@ impl EntityInputHandler for SynapseApp {
         _: &mut Context<Self>,
     ) -> Option<usize> {
         let text = self.state.active_document()?.text();
-        let layout = self.editor_line_layouts.iter().flatten().find(|layout| {
+        let line_layouts = self.editor_line_layouts.borrow();
+        let layout = line_layouts.iter().flatten().find(|layout| {
             position.y >= layout.bounds.top() && position.y <= layout.bounds.bottom()
         })?;
         Some(char_offset_to_utf16(
@@ -987,6 +1036,17 @@ fn char_to_byte(text: &str, char_offset: usize) -> usize {
     text.char_indices()
         .nth(char_offset)
         .map_or(text.len(), |(byte, _)| byte)
+}
+
+fn char_byte_boundaries(text: &str) -> Vec<usize> {
+    text.char_indices()
+        .map(|(byte, _)| byte)
+        .chain(std::iter::once(text.len()))
+        .collect()
+}
+
+fn char_index_for_byte(boundaries: &[usize], byte: usize) -> usize {
+    boundaries.partition_point(|boundary| *boundary < byte)
 }
 
 fn utf16_offset_to_char(text: &str, offset: usize) -> usize {
@@ -1014,10 +1074,15 @@ fn char_range_to_utf16(text: &str, range: &Range<usize>) -> Range<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{EditorSelection, MarkdownBlockKind, source_lines, visual_row_byte_ranges};
+    use std::{hint::black_box, time::Instant};
+
+    use super::{
+        EditorSelection, MarkdownBlockKind, char_byte_boundaries, char_to_byte, source_lines,
+        visual_row_byte_ranges,
+    };
 
     fn present_markdown_line(source: &str) -> super::MarkdownLinePresentation {
-        source_lines(&format!("cursor\n{source}"), 0)
+        source_lines(&format!("cursor\n{source}"), 0, true)
             .remove(1)
             .presentation
     }
@@ -1065,6 +1130,7 @@ mod tests {
         let lines = source_lines(
             "cursor\n\n---\n\n| A | B |\n| --- | --- |\n| 1 | 2 |\n\n```rust\nfn main() {}\n```",
             0,
+            true,
         );
 
         assert_eq!(lines[2].presentation.kind, MarkdownBlockKind::ThematicBreak);
@@ -1084,7 +1150,7 @@ mod tests {
 
     #[test]
     fn p2_setext_headings_render_as_headings_and_hide_the_underline() {
-        let lines = source_lines("cursor\n\n替代标题\n========", 0);
+        let lines = source_lines("cursor\n\n替代标题\n========", 0, true);
 
         assert_eq!(lines[2].presentation.kind, MarkdownBlockKind::Heading(1));
         assert_eq!(lines[2].presentation.display, "替代标题");
@@ -1096,6 +1162,7 @@ mod tests {
         let lines = source_lines(
             "cursor\n\n| value | result |\n| --- | --- |\n| a \\| b | ok |",
             0,
+            true,
         );
 
         assert_eq!(lines[4].presentation.display, "│ a | b │ ok │");
@@ -1103,7 +1170,7 @@ mod tests {
 
     #[test]
     fn p2_source_lines_preserve_trailing_empty_line_offsets() {
-        let lines = source_lines("你a\n", 0);
+        let lines = source_lines("你a\n", 0, true);
 
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[0].start_char, 0);
@@ -1112,10 +1179,20 @@ mod tests {
 
     #[test]
     fn p2_cursor_line_reveals_markdown_source_while_other_lines_stay_rendered() {
-        let lines = source_lines("# 当前标题\n**预览**", 4);
+        let lines = source_lines("# 当前标题\n**预览**", 4, true);
 
         assert_eq!(lines[0].presentation.display, "# 当前标题");
         assert_eq!(lines[1].presentation.display, "预览");
+    }
+
+    #[test]
+    fn editor_active_markdown_markers_use_muted_style_runs() {
+        let line = source_lines("**bold**", 1, true).remove(0).presentation;
+
+        assert_eq!(line.display, "**bold**");
+        assert!(line.runs.first().is_some_and(|run| run.muted));
+        assert!(line.runs.last().is_some_and(|run| run.muted));
+        assert!(line.runs.iter().any(|run| run.bold && !run.muted));
     }
 
     #[test]
@@ -1151,7 +1228,7 @@ mod tests {
     #[test]
     fn p2_markdown_fixture_keeps_render_runs_and_unicode_maps_consistent() {
         let fixture = include_str!("../../../docs/Markdown语法完整性测试.md");
-        let lines = source_lines(fixture, 0);
+        let lines = source_lines(fixture, 0, true);
 
         assert!(lines.len() > 300);
         assert!(
@@ -1188,5 +1265,28 @@ mod tests {
                 presentation.display.chars().count() + 1
             );
         }
+    }
+
+    #[test]
+    #[ignore = "manual non-visual performance probe"]
+    fn character_boundary_lookup_performance_probe() {
+        let source = "中文ab🙂".repeat(2_000);
+        let char_count = source.chars().count();
+
+        let legacy_started = Instant::now();
+        for index in 0..=char_count {
+            black_box(char_to_byte(&source, index));
+        }
+        let legacy = legacy_started.elapsed();
+
+        let optimized_started = Instant::now();
+        let boundaries = char_byte_boundaries(&source);
+        for byte in boundaries {
+            black_box(byte);
+        }
+        let optimized = optimized_started.elapsed();
+
+        eprintln!("legacy={legacy:?} optimized={optimized:?}");
+        assert!(optimized < legacy);
     }
 }

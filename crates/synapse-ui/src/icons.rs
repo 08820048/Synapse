@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 
 use gpui::{AssetSource, Result, SharedString, Svg, prelude::*, px, svg};
+use gpui_component_assets::Assets as ComponentAssets;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Icon {
@@ -114,18 +115,23 @@ impl AssetSource for SynapseAssets {
             _ => None,
         };
 
-        Ok(bytes.map(Cow::Borrowed))
+        if let Some(bytes) = bytes {
+            Ok(Some(Cow::Borrowed(bytes)))
+        } else {
+            ComponentAssets.load(path)
+        }
     }
 
     fn list(&self, path: &str) -> Result<Vec<SharedString>> {
-        if path != "lucide" {
-            return Ok(Vec::new());
+        let mut assets = ComponentAssets.list(path)?;
+        if path == "lucide" {
+            assets.extend(
+                Icon::ALL
+                    .into_iter()
+                    .map(|icon| SharedString::from(icon.path())),
+            );
         }
-
-        Ok(Icon::ALL
-            .into_iter()
-            .map(|icon| SharedString::from(icon.path()))
-            .collect())
+        Ok(assets)
     }
 }
 
