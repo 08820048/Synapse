@@ -63,6 +63,12 @@ const WINDOW_DEFAULT_HEIGHT: f32 = 1332.0;
 const WINDOW_MIN_WIDTH: f32 = 900.0;
 const WINDOW_MIN_HEIGHT: f32 = 560.0;
 const SIDEBAR_FOOTER_HEIGHT: f32 = 40.0;
+const SIDEBAR_SHORTCUT_HEIGHT: f32 = 40.0;
+const SIDEBAR_SHORTCUT_ACTION_WIDTH: f32 = 40.0;
+const SIDEBAR_SEARCH_OUTER_MARGIN: f32 = 8.0;
+const SIDEBAR_SEARCH_INNER_PADDING: f32 = 12.0;
+const SIDEBAR_SEARCH_CONTENT_WIDTH: f32 =
+    SIDEBAR_WIDTH - SIDEBAR_SEARCH_OUTER_MARGIN * 2.0 - SIDEBAR_SEARCH_INNER_PADDING * 2.0;
 const QUICK_TRANSITION: Duration = Duration::from_millis(140);
 const PANEL_TRANSITION: Duration = Duration::from_millis(180);
 const EDITOR_CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(530);
@@ -3528,10 +3534,11 @@ impl Render for SynapseApp {
                     .outline()
                     .w_full()
                     .h(px(36.0))
+                    .px(px(SIDEBAR_SEARCH_INNER_PADDING))
                     .justify_start()
                     .child(
                         div()
-                            .w_full()
+                            .w(px(SIDEBAR_SEARCH_CONTENT_WIDTH))
                             .flex()
                             .items_center()
                             .gap_2()
@@ -3560,70 +3567,114 @@ impl Render for SynapseApp {
                     .child("MY NOTES"),
             )
             .child({
-                let app = app_entity.clone();
-                Button::new("todo-shortcut")
-                    .ghost()
+                let shortcut_app = app_entity.clone();
+                let add_app = app_entity.clone();
+                div()
                     .w_full()
-                    .h(px(34.0))
-                    .justify_start()
+                    .h(px(SIDEBAR_SHORTCUT_HEIGHT))
+                    .flex()
+                    .items_center()
                     .child(
-                        div()
-                            .w_full()
-                            .flex()
-                            .items_center()
-                            .gap_2()
+                        Button::new("todo-shortcut")
+                            .ghost()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .h_full()
+                            .px_3()
+                            .justify_start()
                             .child(
-                                Icon::Todo
-                                    .render(16.0)
-                                    .flex_none()
-                                    .text_color(theme.muted_foreground),
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        Icon::Todo
+                                            .render(16.0)
+                                            .flex_none()
+                                            .text_color(theme.muted_foreground),
+                                    )
+                                    .child("Todo"),
                             )
-                            .child(div().flex_1().text_left().child("Todo"))
+                            .on_click(move |_, window, cx| {
+                                shortcut_app.update(cx, |this, cx| {
+                                    this.open_command_palette(window, cx);
+                                });
+                            }),
+                    )
+                    .child(
+                        Button::new("todo-add")
+                            .ghost()
+                            .w(px(SIDEBAR_SHORTCUT_ACTION_WIDTH))
+                            .h_full()
+                            .p_0()
+                            .rounded(ButtonRounded::None)
                             .child(
                                 Icon::Plus
                                     .render(14.0)
                                     .flex_none()
                                     .text_color(theme.muted_foreground),
-                            ),
+                            )
+                            .on_click(move |_, window, cx| {
+                                add_app.update(cx, |this, cx| {
+                                    this.open_command_palette(window, cx);
+                                });
+                            }),
                     )
-                    .on_click(move |_, window, cx| {
-                        app.update(cx, |this, cx| {
-                            this.open_command_palette(window, cx);
-                        });
-                    })
             })
             .child({
-                let app = app_entity.clone();
-                Button::new("bookmark-shortcut")
-                    .ghost()
+                let shortcut_app = app_entity.clone();
+                let add_app = app_entity.clone();
+                div()
                     .w_full()
-                    .h(px(34.0))
-                    .justify_start()
+                    .h(px(SIDEBAR_SHORTCUT_HEIGHT))
+                    .flex()
+                    .items_center()
                     .child(
-                        div()
-                            .w_full()
-                            .flex()
-                            .items_center()
-                            .gap_2()
+                        Button::new("bookmark-shortcut")
+                            .ghost()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .h_full()
+                            .px_3()
+                            .justify_start()
                             .child(
-                                Icon::Bookmark
-                                    .render(16.0)
-                                    .flex_none()
-                                    .text_color(theme.muted_foreground),
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        Icon::Bookmark
+                                            .render(16.0)
+                                            .flex_none()
+                                            .text_color(theme.muted_foreground),
+                                    )
+                                    .child("Bookmarks"),
                             )
-                            .child(div().flex_1().text_left().child("Bookmarks"))
+                            .on_click(move |_, window, cx| {
+                                shortcut_app.update(cx, |this, cx| {
+                                    this.open_command_palette(window, cx);
+                                });
+                            }),
+                    )
+                    .child(
+                        Button::new("bookmark-add")
+                            .ghost()
+                            .w(px(SIDEBAR_SHORTCUT_ACTION_WIDTH))
+                            .h_full()
+                            .p_0()
+                            .rounded(ButtonRounded::None)
                             .child(
                                 Icon::Plus
                                     .render(14.0)
                                     .flex_none()
                                     .text_color(theme.muted_foreground),
-                            ),
+                            )
+                            .on_click(move |_, window, cx| {
+                                add_app.update(cx, |this, cx| {
+                                    this.open_command_palette(window, cx);
+                                });
+                            }),
                     )
-                    .on_click(move |_, window, cx| {
-                        app.update(cx, |this, cx| {
-                            this.open_command_palette(window, cx);
-                        });
-                    })
             })
             .child(
                 div()
@@ -4987,10 +5038,12 @@ mod tests {
         EDITOR_PAGE_MAX_WIDTH, EDITOR_REGULAR_GUTTER, EDITOR_RULE_BLOCK_HEIGHT,
         EDITOR_RULE_THICKNESS, EDITOR_TOP_PADDING, EDITOR_WIDE_GUTTER, FileTreeRow,
         MENU_ITEM_ICON_SIZE, MENU_ITEM_ICON_SLOT_SIZE, MarkdownImagePreview, SIDEBAR_FOOTER_HEIGHT,
-        TABLE_CELL_HORIZONTAL_PADDING, TABLE_CELL_VERTICAL_PADDING, TABLE_FONT_SIZE,
-        TABLE_ROW_MIN_HEIGHT, TITLEBAR_HEIGHT, ThemePreference, active_document_outline_index,
-        build_document_outline, build_file_tree_rows, build_image_previews, build_math_previews,
-        build_mermaid_previews, changed_line_span, clipboard_image_extension, code_block_edges,
+        SIDEBAR_SEARCH_CONTENT_WIDTH, SIDEBAR_SEARCH_INNER_PADDING, SIDEBAR_SEARCH_OUTER_MARGIN,
+        SIDEBAR_SHORTCUT_ACTION_WIDTH, SIDEBAR_SHORTCUT_HEIGHT, TABLE_CELL_HORIZONTAL_PADDING,
+        TABLE_CELL_VERTICAL_PADDING, TABLE_FONT_SIZE, TABLE_ROW_MIN_HEIGHT, TITLEBAR_HEIGHT,
+        ThemePreference, active_document_outline_index, build_document_outline,
+        build_file_tree_rows, build_image_previews, build_math_previews, build_mermaid_previews,
+        changed_line_span, clipboard_image_extension, code_block_edges,
         command_palette_key_bindings, default_window_size, document_outline_horizontal_layout,
         document_outline_is_visible, document_outline_layout, editor_horizontal_gutter,
         editor_page_content_width, file_manager_reveal_command, is_tab_context_trigger,
@@ -5456,6 +5509,11 @@ mod tests {
     #[test]
     fn sidebar_footer_and_titlebar_control_keep_minimum_hit_area() {
         assert_eq!(SIDEBAR_FOOTER_HEIGHT, 40.0);
+        assert_eq!(SIDEBAR_SHORTCUT_HEIGHT, 40.0);
+        assert_eq!(SIDEBAR_SHORTCUT_ACTION_WIDTH, 40.0);
+        assert_eq!(SIDEBAR_SEARCH_OUTER_MARGIN, 8.0);
+        assert_eq!(SIDEBAR_SEARCH_INNER_PADDING, 12.0);
+        assert_eq!(SIDEBAR_SEARCH_CONTENT_WIDTH, 208.0);
         assert_eq!(TITLEBAR_HEIGHT, 44.0);
     }
 
