@@ -40,8 +40,9 @@ mod math_renderer;
 
 use editor_blink::CursorBlinkState;
 use editor_surface::{
-    EditorLineLayout, EditorSelection, MarkdownBlockKind, MarkdownInlineMath, MarkdownLineElement,
-    MarkdownTableRow, SourceLine, source_lines, source_lines_with_mode,
+    EditorLineLayout, EditorSelection, MarkdownBlockKind, MarkdownCalloutKind,
+    MarkdownInlineFootnote, MarkdownInlineMath, MarkdownLineElement, MarkdownTableRow, SourceLine,
+    footnote_preview_line, source_lines, source_lines_with_mode, task_preview_line,
 };
 use icons::{Icon, SynapseAssets};
 use inline_rename::{InlineRenameEvent, InlineRenameInput};
@@ -66,6 +67,9 @@ const EDITOR_WIDE_GUTTER: f32 = 32.0;
 const EDITOR_TOP_PADDING: f32 = 24.0;
 const EDITOR_BODY_FONT_SIZE: f32 = 16.0;
 const EDITOR_BODY_LINE_HEIGHT: f32 = 26.4;
+const TASK_CHECKBOX_SIZE: f32 = 16.0;
+const TASK_CHECKBOX_GAP: f32 = 8.0;
+const FOOTNOTE_LABEL_WIDTH: f32 = 34.0;
 const EDITOR_RULE_THICKNESS: f32 = 1.0;
 const EDITOR_RULE_BLOCK_HEIGHT: f32 = 65.0;
 const EDITOR_TOOLBAR_HEIGHT: f32 = 40.0;
@@ -697,6 +701,26 @@ fn build_math_previews(
 }
 
 impl SynapseApp {
+    fn toggle_task_item(
+        &mut self,
+        checkbox_range: Range<usize>,
+        checked: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let cursor = self.state.cursor();
+        if self
+            .state
+            .replace_active_range(checkbox_range, if checked { "[ ]" } else { "[x]" })
+            .is_ok()
+        {
+            self.state.set_cursor(cursor);
+            self.editor_selection.collapse(cursor);
+            self.editor_marked_range = None;
+            self.restart_editor_cursor_blink(cx);
+            cx.notify();
+        }
+    }
+
     fn toggle_left_sidebar(&mut self, cx: &mut Context<Self>) {
         self.left_sidebar_open = !self.left_sidebar_open;
         self.dismiss_context_menus(cx);
@@ -1453,6 +1477,28 @@ struct MermaidPreviewStyle {
     danger: Hsla,
 }
 
+#[derive(Clone)]
+struct TaskPreviewStyle {
+    foreground: Hsla,
+    muted: Hsla,
+    border: Hsla,
+    checked_background: Hsla,
+    checked_foreground: Hsla,
+    mono_font_family: SharedString,
+    cursor: Hsla,
+    selection: Hsla,
+}
+
+#[derive(Clone)]
+struct FootnotePreviewStyle {
+    foreground: Hsla,
+    muted: Hsla,
+    border: Hsla,
+    mono_font_family: SharedString,
+    selection: Hsla,
+    dark_mode: bool,
+}
+
 fn editor_block_layout_canvas(
     index: usize,
     line: Rc<SourceLine>,
@@ -1758,6 +1804,226 @@ fn render_math_block_row(
         .into_any_element()
 }
 
+fn callout_accent(kind: MarkdownCalloutKind, dark_mode: bool, muted: Hsla) -> Hsla {
+    match kind {
+        MarkdownCalloutKind::Note | MarkdownCalloutKind::Info | MarkdownCalloutKind::Todo => {
+            if dark_mode {
+                rgb(0x69a7ff)
+            } else {
+                rgb(0x2563eb)
+            }
+            .into()
+        }
+        MarkdownCalloutKind::Abstract | MarkdownCalloutKind::Tip | MarkdownCalloutKind::Success => {
+            if dark_mode {
+                rgb(0x59c98b)
+            } else {
+                rgb(0x16834b)
+            }
+            .into()
+        }
+        MarkdownCalloutKind::Question | MarkdownCalloutKind::Warning => if dark_mode {
+            rgb(0xf4b860)
+        } else {
+            rgb(0xb86108)
+        }
+        .into(),
+        MarkdownCalloutKind::Failure | MarkdownCalloutKind::Danger | MarkdownCalloutKind::Bug => {
+            if dark_mode {
+                rgb(0xff7770)
+            } else {
+                rgb(0xc9362b)
+            }
+            .into()
+        }
+        MarkdownCalloutKind::Example => if dark_mode {
+            rgb(0xc697ff)
+        } else {
+            rgb(0x7c3fc2)
+        }
+        .into(),
+        MarkdownCalloutKind::Quote => muted,
+    }
+}
+
+fn render_task_row(
+    index: usize,
+    line: Rc<SourceLine>,
+    row_context: &EditorRowContext,
+    preview_style: TaskPreviewStyle,
+) -> AnyElement {
+    let Some(task) = line.presentation.task_item.clone() else {
+        return div().into_any_element();
+    };
+    let preview = Rc::new(task_preview_line(&line));
+    let app = row_context.app.clone();
+    let checkbox_range = task.checkbox_start_char..task.checkbox_end_char;
+    let checked = task.checked;
+    let checkbox = div()
+        .id(("task-checkbox", task.checkbox_start_char))
+        .mt(px((EDITOR_BODY_LINE_HEIGHT - TASK_CHECKBOX_SIZE) / 2.0))
+        .size(px(TASK_CHECKBOX_SIZE))
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(4.0))
+        .border_1()
+        .border_color(if checked {
+            preview_style.checked_background
+        } else {
+            preview_style.border
+        })
+        .bg(if checked {
+            preview_style.checked_background
+        } else {
+            gpui::transparent_black()
+        })
+        .cursor_pointer()
+        .when(checked, |checkbox| {
+            checkbox.child(
+                Icon::Check
+                    .render(12.0)
+                    .text_color(preview_style.checked_foreground),
+            )
+        })
+        .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+            cx.stop_propagation();
+            app.update(cx, |app, cx| {
+                app.toggle_task_item(checkbox_range.clone(), checked, cx);
+            });
+        });
+
+    div()
+        .w_full()
+        .min_w(px(0.0))
+        .when(index == 0, |style| style.pt(px(EDITOR_TOP_PADDING)))
+        .when(index + 1 == row_context.line_count, |style| {
+            style.pb(px(180.0))
+        })
+        .child(
+            div()
+                .w_full()
+                .max_w(px(EDITOR_PAGE_MAX_WIDTH))
+                .min_w(px(0.0))
+                .mx_auto()
+                .px(px(row_context.horizontal_gutter))
+                .child(
+                    div()
+                        .w_full()
+                        .min_w(px(0.0))
+                        .min_h(px(EDITOR_BODY_LINE_HEIGHT))
+                        .flex()
+                        .items_start()
+                        .pl(px(task.indent_chars as f32 * 8.0))
+                        .text_size(px(EDITOR_BODY_FONT_SIZE))
+                        .line_height(px(EDITOR_BODY_LINE_HEIGHT))
+                        .text_color(if checked {
+                            preview_style.muted
+                        } else {
+                            preview_style.foreground
+                        })
+                        .child(checkbox)
+                        .child(div().w(px(TASK_CHECKBOX_GAP)).flex_none())
+                        .child(div().flex_1().min_w(px(0.0)).child(MarkdownLineElement {
+                            app: row_context.app.clone(),
+                            line_layouts: row_context.line_layouts.clone(),
+                            line_index: index,
+                            source_line: preview,
+                            active: false,
+                            cursor: row_context.cursor,
+                            selection: row_context.selection.clone(),
+                            cursor_visible: row_context.cursor_visible,
+                            marker_color: preview_style.muted,
+                            list_marker_color: preview_style.muted,
+                            mono_font_family: preview_style.mono_font_family,
+                            cursor_color: preview_style.cursor,
+                            selection_color: preview_style.selection,
+                        })),
+                ),
+        )
+        .into_any_element()
+}
+
+fn render_footnote_definition_row(
+    index: usize,
+    line: Rc<SourceLine>,
+    row_context: &EditorRowContext,
+    preview_style: FootnotePreviewStyle,
+) -> AnyElement {
+    let Some(footnote) = line.presentation.footnote_definition.clone() else {
+        return div().into_any_element();
+    };
+    let preview = Rc::new(footnote_preview_line(&line, preview_style.dark_mode));
+    let is_blank = preview.presentation.display.is_empty();
+    div()
+        .w_full()
+        .min_w(px(0.0))
+        .when(index == 0, |style| style.pt(px(EDITOR_TOP_PADDING)))
+        .when(index + 1 == row_context.line_count, |style| {
+            style.pb(px(180.0))
+        })
+        .child(
+            div()
+                .w_full()
+                .max_w(px(EDITOR_PAGE_MAX_WIDTH))
+                .min_w(px(0.0))
+                .mx_auto()
+                .px(px(row_context.horizontal_gutter))
+                .child(
+                    div()
+                        .w_full()
+                        .min_w(px(0.0))
+                        .flex()
+                        .items_start()
+                        .text_size(px(14.0))
+                        .line_height(px(22.0))
+                        .text_color(preview_style.muted)
+                        .when(footnote.starts_section, |style| {
+                            style
+                                .mt(px(24.0))
+                                .pt(px(12.0))
+                                .border_t_1()
+                                .border_color(preview_style.border)
+                        })
+                        .when(footnote.is_last, |style| style.pb(px(8.0)))
+                        .when(is_blank, |style| style.h(px(8.0)))
+                        .when(footnote.is_header, |style| {
+                            style.child(
+                                div()
+                                    .w(px(FOOTNOTE_LABEL_WIDTH))
+                                    .flex_none()
+                                    .text_size(px(11.0))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(preview_style.foreground)
+                                    .child(footnote.label.clone()),
+                            )
+                        })
+                        .when(!footnote.is_header, |style| {
+                            style.pl(px(FOOTNOTE_LABEL_WIDTH))
+                        })
+                        .when(!is_blank, |style| {
+                            style.child(div().flex_1().min_w(px(0.0)).child(MarkdownLineElement {
+                                app: row_context.app.clone(),
+                                line_layouts: row_context.line_layouts.clone(),
+                                line_index: index,
+                                source_line: preview,
+                                active: false,
+                                cursor: row_context.cursor,
+                                selection: row_context.selection.clone(),
+                                cursor_visible: row_context.cursor_visible,
+                                marker_color: preview_style.muted,
+                                list_marker_color: preview_style.muted,
+                                mono_font_family: preview_style.mono_font_family,
+                                cursor_color: preview_style.foreground,
+                                selection_color: preview_style.selection,
+                            }))
+                        }),
+                ),
+        )
+        .into_any_element()
+}
+
 fn render_inline_math_item(
     inline: &MarkdownInlineMath,
     preview: Option<&MathPreview>,
@@ -1802,23 +2068,60 @@ fn render_inline_math_item(
     }
 }
 
-fn render_inline_math_row(
+fn render_inline_footnote_item(footnote: &MarkdownInlineFootnote, accent: Hsla) -> AnyElement {
+    div()
+        .relative()
+        .top(px(-4.0))
+        .flex_none()
+        .px(px(1.0))
+        .text_size(px(11.0))
+        .line_height(px(14.0))
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(accent)
+        .child(footnote.label.clone())
+        .into_any_element()
+}
+
+fn render_inline_preview_row(
     index: usize,
     line: Rc<SourceLine>,
     row_context: &EditorRowContext,
     muted: Hsla,
     danger: Hsla,
+    footnote_accent: Hsla,
 ) -> AnyElement {
     let display = &line.presentation.display;
     let display_len = display.chars().count();
+    let mut inline_items: Vec<(usize, usize, AnyElement)> = line
+        .presentation
+        .inline_math
+        .iter()
+        .map(|inline| {
+            (
+                inline.display_start_char,
+                inline.display_end_char,
+                render_inline_math_item(
+                    inline,
+                    row_context.math_previews.get(&inline.source_start_char),
+                    muted,
+                    danger,
+                ),
+            )
+        })
+        .chain(line.presentation.inline_footnotes.iter().map(|footnote| {
+            (
+                footnote.display_start_char,
+                footnote.display_end_char,
+                render_inline_footnote_item(footnote, footnote_accent),
+            )
+        }))
+        .collect();
+    inline_items.sort_by_key(|(start, _, _)| *start);
     let mut elements = Vec::new();
     let mut display_cursor = 0;
-    for inline in &line.presentation.inline_math {
-        let start = inline
-            .display_start_char
-            .min(display_len)
-            .max(display_cursor);
-        let end = inline.display_end_char.min(display_len).max(start);
+    for (item_start, item_end, item) in inline_items {
+        let start = item_start.min(display_len).max(display_cursor);
+        let end = item_end.min(display_len).max(start);
         if start > display_cursor {
             elements.push(
                 div()
@@ -1828,12 +2131,7 @@ fn render_inline_math_row(
                     .into_any_element(),
             );
         }
-        elements.push(render_inline_math_item(
-            inline,
-            row_context.math_previews.get(&inline.source_start_char),
-            muted,
-            danger,
-        ));
+        elements.push(item);
         display_cursor = end;
     }
     if display_cursor < display_len {
@@ -1961,6 +2259,38 @@ fn render_editor_row(
     if matches!(kind, MarkdownBlockKind::ThematicBreak) {
         return render_thematic_break_row(index, line, row_context, active, theme.border);
     }
+    if !active && line.presentation.footnote_definition.is_some() {
+        return render_footnote_definition_row(
+            index,
+            line,
+            row_context,
+            FootnotePreviewStyle {
+                foreground: theme.foreground,
+                muted: theme.muted_foreground,
+                border: theme.border,
+                mono_font_family: theme.mono_font_family.clone(),
+                selection: theme.selection,
+                dark_mode: theme.is_dark(),
+            },
+        );
+    }
+    if !active && line.presentation.task_item.is_some() {
+        return render_task_row(
+            index,
+            line,
+            row_context,
+            TaskPreviewStyle {
+                foreground: theme.foreground,
+                muted: theme.muted_foreground,
+                border: theme.border,
+                checked_background: theme.primary,
+                checked_foreground: theme.primary_foreground,
+                mono_font_family: theme.mono_font_family.clone(),
+                cursor: theme.caret,
+                selection: theme.selection,
+            },
+        );
+    }
     if !active && let Some(table) = line.presentation.table_row.as_ref() {
         return render_table_row(
             index,
@@ -1972,23 +2302,36 @@ fn render_editor_row(
             theme.foreground,
         );
     }
-    if !active && !line.presentation.inline_math.is_empty() {
-        return render_inline_math_row(
+    if !active
+        && (!line.presentation.inline_math.is_empty()
+            || !line.presentation.inline_footnotes.is_empty())
+    {
+        return render_inline_preview_row(
             index,
             line.clone(),
             row_context,
             theme.muted_foreground,
             theme.danger,
+            theme.link,
         );
     }
-    let quote_first = line
-        .presentation
-        .quote_line
-        .is_some_and(|quote| quote.is_first);
-    let quote_last = line
-        .presentation
-        .quote_line
-        .is_some_and(|quote| quote.is_last);
+    let callout = line.presentation.callout_line.as_ref();
+    let callout_first = callout.is_some_and(|callout| callout.is_first);
+    let callout_last = callout.is_some_and(|callout| callout.is_last);
+    let callout_header = callout.is_some_and(|callout| callout.is_header);
+    let callout_color = callout
+        .map(|callout| callout_accent(callout.kind, theme.is_dark(), theme.muted_foreground))
+        .unwrap_or(theme.foreground);
+    let quote_first = callout.is_none()
+        && line
+            .presentation
+            .quote_line
+            .is_some_and(|quote| quote.is_first);
+    let quote_last = callout.is_none()
+        && line
+            .presentation
+            .quote_line
+            .is_some_and(|quote| quote.is_last);
     let code_line = line.presentation.code_line;
     if !active && !mermaid_block_active && code_line.is_some_and(|code| code.is_fence) {
         return div().h(px(0.0)).overflow_hidden().into_any_element();
@@ -2000,6 +2343,8 @@ fn render_editor_row(
         .when(index == 0, |style| style.pt(px(EDITOR_TOP_PADDING)))
         .when(quote_first, |style| style.pt(px(12.8)))
         .when(quote_last, |style| style.pb(px(12.8)))
+        .when(callout_first, |style| style.pt(px(12.8)))
+        .when(callout_last, |style| style.pb(px(12.8)))
         .when(code_first, |style| style.pt(px(16.0)))
         .when(code_last, |style| style.pb(px(16.0)))
         .when(index + 1 == row_context.line_count, |style| {
@@ -2030,11 +2375,15 @@ fn render_editor_row(
                             _ => px(EDITOR_BODY_LINE_HEIGHT),
                         })
                         .cursor(CursorStyle::IBeam)
-                        .text_color(match kind {
-                            MarkdownBlockKind::Quote | MarkdownBlockKind::Task(true) => {
-                                theme.muted_foreground
+                        .text_color(if callout_header {
+                            callout_color
+                        } else {
+                            match kind {
+                                MarkdownBlockKind::Quote if callout.is_none() => {
+                                    theme.muted_foreground
+                                }
+                                _ => theme.foreground,
                             }
-                            _ => theme.foreground,
                         })
                         .when(matches!(kind, MarkdownBlockKind::Heading(1)), |style| {
                             style
@@ -2110,11 +2459,23 @@ fn render_editor_row(
                                 .line_height(px(24.0))
                                 .font_family(theme.mono_font_family.clone())
                         })
-                        .when(matches!(kind, MarkdownBlockKind::Quote), |style| {
+                        .when(
+                            matches!(kind, MarkdownBlockKind::Quote) && callout.is_none(),
+                            |style| {
+                                style
+                                    .border_l_2()
+                                    .border_color(theme.foreground)
+                                    .pl(px(6.0))
+                            },
+                        )
+                        .when(callout.is_some(), |style| {
                             style
                                 .border_l_2()
-                                .border_color(theme.foreground)
-                                .pl(px(6.0))
+                                .border_color(callout_color)
+                                .bg(callout_color.alpha(if theme.is_dark() { 0.10 } else { 0.07 }))
+                                .px(px(12.0))
+                                .when(callout_first, |style| style.rounded_t_lg().pt(px(8.0)))
+                                .when(callout_last, |style| style.rounded_b_lg().pb(px(8.0)))
                         })
                         .child(MarkdownLineElement {
                             app: row_context.app.clone(),

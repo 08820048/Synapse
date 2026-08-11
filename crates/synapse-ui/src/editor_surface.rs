@@ -8,9 +8,10 @@ use gpui::{
 };
 use writ::{
     buffer::Buffer,
+    callout::{CalloutInfo, CalloutKind},
     editor::EditorTheme,
     marker::{LineMarkers, MarkerKind},
-    render::build_line_render,
+    render::{CalloutHeader, build_line_render},
     segment_map::{SegmentMap, Special},
 };
 
@@ -126,6 +127,10 @@ pub struct MarkdownLinePresentation {
     pub mermaid_block: Option<MarkdownMermaidBlock>,
     pub math_block: Option<MarkdownMathBlock>,
     pub inline_math: Vec<MarkdownInlineMath>,
+    pub task_item: Option<MarkdownTaskItem>,
+    pub callout_line: Option<MarkdownCalloutLine>,
+    pub footnote_definition: Option<MarkdownFootnoteDefinition>,
+    pub inline_footnotes: Vec<MarkdownInlineFootnote>,
     source_to_display: Vec<usize>,
     display_to_source: Vec<usize>,
 }
@@ -168,6 +173,60 @@ pub struct MarkdownInlineMath {
     pub display_start_char: usize,
     pub display_end_char: usize,
     pub formula_source: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MarkdownTaskItem {
+    pub checked: bool,
+    pub checkbox_start_char: usize,
+    pub checkbox_end_char: usize,
+    pub content_start_char: usize,
+    pub indent_chars: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MarkdownCalloutKind {
+    Note,
+    Abstract,
+    Info,
+    Todo,
+    Tip,
+    Success,
+    Question,
+    Warning,
+    Failure,
+    Danger,
+    Bug,
+    Example,
+    Quote,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MarkdownCalloutLine {
+    pub kind: MarkdownCalloutKind,
+    pub title: String,
+    pub is_header: bool,
+    pub is_first: bool,
+    pub is_last: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MarkdownFootnoteDefinition {
+    pub label: String,
+    pub content: String,
+    pub content_start_char: usize,
+    pub is_header: bool,
+    pub is_last: bool,
+    pub starts_section: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MarkdownInlineFootnote {
+    pub source_start_char: usize,
+    pub source_end_char: usize,
+    pub display_start_char: usize,
+    pub display_end_char: usize,
+    pub label: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -252,7 +311,12 @@ pub fn source_lines_with_mode(
                 None,
                 &[],
                 &[],
-                None,
+                snapshot
+                    .callout_header_at_line(line_index)
+                    .map(|callout| CalloutHeader {
+                        display: format!("{}  {}", callout.kind.icon(), callout.title),
+                        color: callout.kind.color(&theme),
+                    }),
             );
             let kind = markdown_block_kind(&markers, &snapshot, line_index, &source);
             let mut muted_ranges: Vec<_> = render
@@ -331,10 +395,13 @@ pub fn source_lines_with_mode(
     }
     annotate_table_rows(&mut lines, &raw_lines);
     annotate_quote_lines(&mut lines);
+    annotate_callout_lines(&mut lines, snapshot.callouts());
     annotate_code_lines(&mut lines, &raw_lines);
     annotate_mermaid_blocks(&mut lines, &raw_lines);
     reveal_active_mermaid_fences(&mut lines, &raw_lines, cursor);
     annotate_math(&mut lines, &raw_lines);
+    annotate_task_items(&mut lines, &raw_lines);
+    annotate_footnotes(&mut lines, &raw_lines);
     lines
 }
 
@@ -359,6 +426,10 @@ fn raw_source_lines(text: &str) -> Vec<SourceLine> {
                     mermaid_block: None,
                     math_block: None,
                     inline_math: Vec::new(),
+                    task_item: None,
+                    callout_line: None,
+                    footnote_definition: None,
+                    inline_footnotes: Vec::new(),
                     source_to_display: (0..=len).collect(),
                     display_to_source: (0..=len).collect(),
                 },
@@ -561,6 +632,10 @@ fn presentation_from_writ(
         mermaid_block: None,
         math_block: None,
         inline_math: Vec::new(),
+        task_item: None,
+        callout_line: None,
+        footnote_definition: None,
+        inline_footnotes: Vec::new(),
         source_to_display,
         display_to_source,
     }
@@ -585,6 +660,47 @@ fn annotate_quote_lines(lines: &mut [SourceLine]) {
             });
         }
         start = end;
+    }
+}
+
+fn annotate_callout_lines(lines: &mut [SourceLine], callouts: &[CalloutInfo]) {
+    for callout in callouts {
+        let end = callout.end_line.min(lines.len());
+        if callout.header_line >= end {
+            continue;
+        }
+        for (index, line) in lines
+            .iter_mut()
+            .enumerate()
+            .take(end)
+            .skip(callout.header_line)
+        {
+            line.presentation.callout_line = Some(MarkdownCalloutLine {
+                kind: markdown_callout_kind(callout.kind),
+                title: callout.title.clone(),
+                is_header: index == callout.header_line,
+                is_first: index == callout.header_line,
+                is_last: index + 1 == end,
+            });
+        }
+    }
+}
+
+fn markdown_callout_kind(kind: CalloutKind) -> MarkdownCalloutKind {
+    match kind {
+        CalloutKind::Note => MarkdownCalloutKind::Note,
+        CalloutKind::Abstract => MarkdownCalloutKind::Abstract,
+        CalloutKind::Info => MarkdownCalloutKind::Info,
+        CalloutKind::Todo => MarkdownCalloutKind::Todo,
+        CalloutKind::Tip => MarkdownCalloutKind::Tip,
+        CalloutKind::Success => MarkdownCalloutKind::Success,
+        CalloutKind::Question => MarkdownCalloutKind::Question,
+        CalloutKind::Warning => MarkdownCalloutKind::Warning,
+        CalloutKind::Failure => MarkdownCalloutKind::Failure,
+        CalloutKind::Danger => MarkdownCalloutKind::Danger,
+        CalloutKind::Bug => MarkdownCalloutKind::Bug,
+        CalloutKind::Example => MarkdownCalloutKind::Example,
+        CalloutKind::Quote => MarkdownCalloutKind::Quote,
     }
 }
 
@@ -839,6 +955,320 @@ fn inline_code_ranges(source: &str) -> Vec<Range<usize>> {
     ranges
 }
 
+fn annotate_task_items(lines: &mut [SourceLine], raw_lines: &[&str]) {
+    for (line, source) in lines.iter_mut().zip(raw_lines) {
+        if !matches!(line.presentation.kind, MarkdownBlockKind::Task(_)) {
+            continue;
+        }
+        let Some((checked, checkbox, content_start, indent_chars)) = parse_task_item(source) else {
+            continue;
+        };
+        line.presentation.task_item = Some(MarkdownTaskItem {
+            checked,
+            checkbox_start_char: line.start_char + checkbox.start,
+            checkbox_end_char: line.start_char + checkbox.end,
+            content_start_char: line.start_char + content_start,
+            indent_chars,
+        });
+    }
+}
+
+fn parse_task_item(source: &str) -> Option<(bool, Range<usize>, usize, usize)> {
+    let bytes = source.as_bytes();
+    let mut cursor = bytes
+        .iter()
+        .take_while(|byte| matches!(byte, b' ' | b'\t'))
+        .count();
+    let indent_chars = source[..cursor].chars().count();
+
+    if matches!(bytes.get(cursor), Some(b'-' | b'*' | b'+'))
+        && bytes.get(cursor + 1).is_some_and(u8::is_ascii_whitespace)
+    {
+        cursor += 2;
+    } else {
+        let digits = bytes[cursor..]
+            .iter()
+            .take_while(|byte| byte.is_ascii_digit())
+            .count();
+        if digits == 0
+            || !matches!(bytes.get(cursor + digits), Some(b'.' | b')'))
+            || !bytes
+                .get(cursor + digits + 1)
+                .is_some_and(u8::is_ascii_whitespace)
+        {
+            return None;
+        }
+        cursor += digits + 2;
+    }
+
+    if bytes.get(cursor) != Some(&b'[')
+        || bytes.get(cursor + 2) != Some(&b']')
+        || !matches!(bytes.get(cursor + 1), Some(b' ' | b'x' | b'X'))
+    {
+        return None;
+    }
+    let checked = matches!(bytes[cursor + 1], b'x' | b'X');
+    let checkbox_bytes = cursor..cursor + 3;
+    cursor += 3;
+    while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+        cursor += 1;
+    }
+    let boundaries = char_byte_boundaries(source);
+    Some((
+        checked,
+        char_index_for_byte(&boundaries, checkbox_bytes.start)
+            ..char_index_for_byte(&boundaries, checkbox_bytes.end),
+        char_index_for_byte(&boundaries, cursor),
+        indent_chars,
+    ))
+}
+
+fn annotate_footnotes(lines: &mut [SourceLine], raw_lines: &[&str]) {
+    annotate_footnote_definitions(lines, raw_lines);
+    for (line, source) in lines.iter_mut().zip(raw_lines) {
+        if line.presentation.code_line.is_some()
+            || line.presentation.math_block.is_some()
+            || line.presentation.footnote_definition.is_some()
+        {
+            continue;
+        }
+        line.presentation.inline_footnotes = detect_inline_footnotes(source)
+            .into_iter()
+            .filter(|(source_range, _)| {
+                !line.presentation.inline_math.iter().any(|math| {
+                    let math_start = math.source_start_char.saturating_sub(line.start_char);
+                    let math_end = math.source_end_char.saturating_sub(line.start_char);
+                    source_range.start < math_end && math_start < source_range.end
+                })
+            })
+            .map(|(source_range, label)| MarkdownInlineFootnote {
+                source_start_char: line.start_char + source_range.start,
+                source_end_char: line.start_char + source_range.end,
+                display_start_char: line
+                    .presentation
+                    .display_char_for_source(source_range.start),
+                display_end_char: line.presentation.display_char_for_source(source_range.end),
+                label,
+            })
+            .collect();
+    }
+}
+
+fn annotate_footnote_definitions(lines: &mut [SourceLine], raw_lines: &[&str]) {
+    let limit = lines.len().min(raw_lines.len());
+    let mut index = 0;
+    let mut has_definition = false;
+    while index < limit {
+        let Some((label, content_start)) = parse_footnote_definition(raw_lines[index]) else {
+            index += 1;
+            continue;
+        };
+        let starts_section = !has_definition;
+        has_definition = true;
+        let mut block_lines = vec![index];
+        lines[index].presentation.footnote_definition = Some(MarkdownFootnoteDefinition {
+            label: label.clone(),
+            content: raw_lines[index].chars().skip(content_start).collect(),
+            content_start_char: lines[index].start_char + content_start,
+            is_header: true,
+            is_last: false,
+            starts_section,
+        });
+
+        let mut end = index + 1;
+        while end < limit {
+            if parse_footnote_definition(raw_lines[end]).is_some() {
+                break;
+            }
+            let continuation = footnote_continuation_start(raw_lines[end]);
+            let blank_before_continuation = raw_lines[end].trim().is_empty()
+                && end + 1 < limit
+                && footnote_continuation_start(raw_lines[end + 1]).is_some();
+            let Some(content_start) = continuation.or(blank_before_continuation.then_some(0))
+            else {
+                break;
+            };
+            lines[end].presentation.footnote_definition = Some(MarkdownFootnoteDefinition {
+                label: label.clone(),
+                content: raw_lines[end].chars().skip(content_start).collect(),
+                content_start_char: lines[end].start_char + content_start,
+                is_header: false,
+                is_last: false,
+                starts_section: false,
+            });
+            block_lines.push(end);
+            end += 1;
+        }
+        if let Some(last) = block_lines.last().copied()
+            && let Some(footnote) = lines[last].presentation.footnote_definition.as_mut()
+        {
+            footnote.is_last = true;
+        }
+        index = end;
+    }
+}
+
+fn parse_footnote_definition(source: &str) -> Option<(String, usize)> {
+    let bytes = source.as_bytes();
+    let indent = bytes.iter().take_while(|byte| **byte == b' ').count();
+    if indent > 3 || bytes.get(indent..indent + 2) != Some(b"[^") {
+        return None;
+    }
+    let label_end = source[indent + 2..].find(']')? + indent + 2;
+    if label_end == indent + 2 || bytes.get(label_end + 1) != Some(&b':') {
+        return None;
+    }
+    let label = &source[indent + 2..label_end];
+    if label.chars().any(char::is_whitespace) {
+        return None;
+    }
+    let mut content_start = label_end + 2;
+    while bytes
+        .get(content_start)
+        .is_some_and(u8::is_ascii_whitespace)
+    {
+        content_start += 1;
+    }
+    let boundaries = char_byte_boundaries(source);
+    Some((
+        label.to_owned(),
+        char_index_for_byte(&boundaries, content_start),
+    ))
+}
+
+fn footnote_continuation_start(source: &str) -> Option<usize> {
+    if source.starts_with('\t') {
+        Some(1)
+    } else if source.starts_with("    ") {
+        Some(4)
+    } else {
+        None
+    }
+}
+
+fn detect_inline_footnotes(source: &str) -> Vec<(Range<usize>, String)> {
+    let bytes = source.as_bytes();
+    let boundaries = char_byte_boundaries(source);
+    let code_ranges = inline_code_ranges(source);
+    let mut references = Vec::new();
+    let mut cursor = 0;
+    while cursor + 3 < bytes.len() {
+        if bytes.get(cursor..cursor + 2) != Some(b"[^")
+            || is_escaped(bytes, cursor)
+            || code_ranges.iter().any(|range| range.contains(&cursor))
+        {
+            cursor += 1;
+            continue;
+        }
+        let Some(relative_end) = source[cursor + 2..].find(']') else {
+            break;
+        };
+        let end = cursor + 2 + relative_end;
+        let label = &source[cursor + 2..end];
+        if label.is_empty()
+            || label.chars().any(char::is_whitespace)
+            || bytes.get(end + 1) == Some(&b':')
+        {
+            cursor = end + 1;
+            continue;
+        }
+        references.push((
+            char_index_for_byte(&boundaries, cursor)..char_index_for_byte(&boundaries, end + 1),
+            label.to_owned(),
+        ));
+        cursor = end + 1;
+    }
+    references
+}
+
+pub fn task_preview_line(line: &SourceLine) -> SourceLine {
+    let Some(task) = line.presentation.task_item.as_ref() else {
+        return line.clone();
+    };
+    preview_line_from_source(line, task.content_start_char)
+}
+
+pub fn footnote_preview_line(line: &SourceLine, dark_mode: bool) -> SourceLine {
+    let Some(footnote) = line.presentation.footnote_definition.as_ref() else {
+        return line.clone();
+    };
+    let mut preview = line.clone();
+    let fragment_source = format!("cursor\n{}", footnote.content);
+    let fragment = source_lines(&fragment_source, 0, dark_mode)
+        .into_iter()
+        .nth(1);
+    let Some(fragment) = fragment else {
+        return preview_line_from_source(line, footnote.content_start_char);
+    };
+    let local_source_start = footnote
+        .content_start_char
+        .saturating_sub(line.start_char)
+        .min(line.source_len_chars);
+    let fragment_len = footnote.content.chars().count();
+    let display_len = fragment.presentation.display.chars().count();
+    preview.presentation.display = fragment.presentation.display.clone();
+    preview.presentation.runs = fragment.presentation.runs.clone();
+    preview.presentation.source_to_display = (0..=line.source_len_chars)
+        .map(|source| {
+            if source < local_source_start {
+                0
+            } else if source <= local_source_start + fragment_len {
+                fragment
+                    .presentation
+                    .display_char_for_source(source - local_source_start)
+            } else {
+                display_len
+            }
+        })
+        .collect();
+    preview.presentation.display_to_source = fragment
+        .presentation
+        .display_to_source
+        .iter()
+        .map(|source| local_source_start + source)
+        .collect();
+    preview
+}
+
+fn preview_line_from_source(line: &SourceLine, content_start_char: usize) -> SourceLine {
+    let mut preview = line.clone();
+    let local_source_start = content_start_char
+        .saturating_sub(line.start_char)
+        .min(line.source_len_chars);
+    let display_start = line
+        .presentation
+        .display_char_for_source(local_source_start)
+        .min(line.presentation.display.chars().count());
+    let display_byte_start = char_to_byte(&line.presentation.display, display_start);
+    preview.presentation.display = line.presentation.display[display_byte_start..].to_owned();
+    preview.presentation.runs = slice_style_runs(&line.presentation.runs, display_byte_start);
+    preview.presentation.source_to_display = line
+        .presentation
+        .source_to_display
+        .iter()
+        .map(|display| display.saturating_sub(display_start))
+        .collect();
+    preview.presentation.display_to_source = line.presentation.display_to_source
+        [display_start.min(line.presentation.display_to_source.len() - 1)..]
+        .to_vec();
+    preview
+}
+
+fn slice_style_runs(runs: &[MarkdownStyleRun], byte_start: usize) -> Vec<MarkdownStyleRun> {
+    let mut offset = 0;
+    let mut result = Vec::new();
+    for run in runs {
+        let end = offset + run.len;
+        if end > byte_start {
+            let mut sliced = run.clone();
+            sliced.len = end - byte_start.max(offset);
+            result.push(sliced);
+        }
+        offset = end;
+    }
+    result
+}
+
 fn is_escaped(bytes: &[u8], index: usize) -> bool {
     let backslashes = bytes[..index]
         .iter()
@@ -991,6 +1421,10 @@ fn hidden_source_presentation(source: &str) -> MarkdownLinePresentation {
         mermaid_block: None,
         math_block: None,
         inline_math: Vec::new(),
+        task_item: None,
+        callout_line: None,
+        footnote_definition: None,
+        inline_footnotes: Vec::new(),
         source_to_display: vec![0; source.chars().count() + 1],
         display_to_source: vec![0],
     }
@@ -1705,8 +2139,8 @@ mod tests {
 
     use super::{
         EditorSelection, LIST_BULLET_DIAMETER, MarkdownBlockKind, char_byte_boundaries,
-        char_to_byte, hidden_bullet_marker_range, source_lines, source_lines_with_mode,
-        visual_row_byte_ranges,
+        char_to_byte, footnote_preview_line, hidden_bullet_marker_range, source_lines,
+        source_lines_with_mode, task_preview_line, visual_row_byte_ranges,
     };
 
     fn present_markdown_line(source: &str) -> super::MarkdownLinePresentation {
@@ -1921,6 +2355,101 @@ mod tests {
     }
 
     #[test]
+    fn markdown_task_items_expose_native_checkbox_and_content_preview() {
+        let lines = source_lines("cursor\n- [x] **完成**\n  - [ ] 待处理", 0, false);
+        let checked = lines[1]
+            .presentation
+            .task_item
+            .as_ref()
+            .expect("checked task metadata");
+        let unchecked = lines[2]
+            .presentation
+            .task_item
+            .as_ref()
+            .expect("unchecked task metadata");
+
+        assert!(checked.checked);
+        assert!(!unchecked.checked);
+        assert_eq!(unchecked.indent_chars, 2);
+        assert_eq!(checked.checkbox_end_char - checked.checkbox_start_char, 3);
+        let preview = task_preview_line(&lines[1]);
+        assert_eq!(preview.presentation.display, "完成");
+        assert!(preview.presentation.runs.iter().any(|run| run.bold));
+        assert_eq!(preview.presentation.source_char_for_display(0), 8);
+    }
+
+    #[test]
+    fn markdown_callouts_use_writ_headers_and_continuous_metadata() {
+        let lines = source_lines(
+            "cursor\n> [!NOTE]\n> 正文\n\n> [!WARNING] 自定义标题\n> 注意",
+            0,
+            false,
+        );
+        let note_header = lines[1]
+            .presentation
+            .callout_line
+            .as_ref()
+            .expect("note header metadata");
+        let note_body = lines[2]
+            .presentation
+            .callout_line
+            .as_ref()
+            .expect("note body metadata");
+        let warning = lines[4]
+            .presentation
+            .callout_line
+            .as_ref()
+            .expect("warning header metadata");
+
+        assert!(note_header.is_header && note_header.is_first && !note_header.is_last);
+        assert!(!note_body.is_header && note_body.is_last);
+        assert_eq!(note_header.title, "Note");
+        assert_eq!(warning.title, "自定义标题");
+        assert!(!lines[1].presentation.display.contains("[!NOTE]"));
+        assert!(lines[1].presentation.display.contains("Note"));
+    }
+
+    #[test]
+    fn markdown_footnotes_map_references_definitions_and_continuations() {
+        let source = concat!(
+            "cursor\n",
+            "正文[^1] 和 `[^code]`。\n",
+            "\n",
+            "[^1]: **第一条**\n",
+            "[^note]: 命名脚注\n",
+            "\n",
+            "    延续段落\n",
+            "plain"
+        );
+        let lines = source_lines(source, 0, false);
+        let reference = &lines[1].presentation.inline_footnotes;
+        let first = lines[3]
+            .presentation
+            .footnote_definition
+            .as_ref()
+            .expect("first definition");
+        let second = lines[4]
+            .presentation
+            .footnote_definition
+            .as_ref()
+            .expect("named definition");
+        let continuation = lines[6]
+            .presentation
+            .footnote_definition
+            .as_ref()
+            .expect("definition continuation");
+
+        assert_eq!(reference.len(), 1);
+        assert_eq!(reference[0].label, "1");
+        assert!(first.starts_section && first.is_header && first.is_last);
+        assert!(second.is_header && !second.is_last);
+        assert!(!continuation.is_header && continuation.is_last);
+        let preview = footnote_preview_line(&lines[3], false);
+        assert_eq!(preview.presentation.display, "第一条");
+        assert!(preview.presentation.runs.iter().any(|run| run.bold));
+    }
+
+    #[test]
     fn p3_source_mode_preserves_raw_markdown_and_identity_mapping() {
         let lines = source_lines_with_mode("# 标题\n> quote\n```rust", 0, true, true);
 
@@ -1934,6 +2463,10 @@ mod tests {
                 && line.presentation.mermaid_block.is_none()
                 && line.presentation.math_block.is_none()
                 && line.presentation.inline_math.is_empty()
+                && line.presentation.task_item.is_none()
+                && line.presentation.callout_line.is_none()
+                && line.presentation.footnote_definition.is_none()
+                && line.presentation.inline_footnotes.is_empty()
         }));
         assert_eq!(lines[0].presentation.display_char_for_source(3), 3);
         assert_eq!(lines[1].presentation.source_char_for_display(4), 4);

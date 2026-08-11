@@ -28,10 +28,11 @@ pub enum Icon {
     Download,
     Copy,
     CloseAll,
+    Check,
 }
 
 impl Icon {
-    const ALL: [Self; 23] = [
+    const ALL: [Self; 24] = [
         Self::Search,
         Self::Todo,
         Self::Bookmark,
@@ -55,6 +56,7 @@ impl Icon {
         Self::Download,
         Self::Copy,
         Self::CloseAll,
+        Self::Check,
     ];
 
     pub fn path(self) -> &'static str {
@@ -82,6 +84,7 @@ impl Icon {
             Self::Download => "lucide/download.svg",
             Self::Copy => "lucide/copy.svg",
             Self::CloseAll => "lucide/circle-x.svg",
+            Self::Check => "lucide/check.svg",
         }
     }
 
@@ -150,6 +153,7 @@ impl AssetSource for SynapseAssets {
             "lucide/circle-x.svg" => {
                 Some(include_bytes!("../../../assets/icons/lucide/circle-x.svg"))
             }
+            "lucide/check.svg" => Some(include_bytes!("../../../assets/icons/lucide/check.svg")),
             _ => None,
         };
 
