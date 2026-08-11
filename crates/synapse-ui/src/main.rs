@@ -2,22 +2,24 @@ use std::{
     cell::RefCell,
     collections::{BTreeMap, BTreeSet},
     ffi::OsString,
-    fs, io,
+    fs::{self, OpenOptions},
+    io::{self, Write as _},
     ops::Range,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     process::Command,
     rc::Rc,
     sync::Arc,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use gpui::{
-    AnyElement, App, Application, Bounds, ClickEvent, ClipboardItem, Context, Corner, CursorStyle,
-    ElementInputHandler, Entity, FocusHandle, Focusable, FontWeight, Hsla, Image, ImageFormat,
-    KeyBinding, ListAlignment, ListState, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, ObjectFit, PathPromptOptions, Pixels, Point, SharedString, StyledImage as _,
-    TitlebarOptions, Window, WindowBounds, WindowControlArea, WindowOptions, actions, anchored,
-    canvas, deferred, div, hsla, img, list, point, prelude::*, px, relative, rgb, rgba, size,
+    AnyElement, App, Application, Bounds, ClickEvent, ClipboardEntry, ClipboardItem, Context,
+    Corner, CursorStyle, ElementInputHandler, Entity, FocusHandle, Focusable, FontWeight, Hsla,
+    Image, ImageFormat, ImageSource, KeyBinding, ListAlignment, ListState, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, PathPromptOptions, Pixels, Point,
+    SharedString, StyledImage as _, TitlebarOptions, Window, WindowBounds, WindowControlArea,
+    WindowOptions, actions, anchored, canvas, deferred, div, hsla, img, list, point, prelude::*,
+    px, relative, rgb, rgba, size,
 };
 use gpui_animation::{
     animation::TransitionExt,
@@ -34,16 +36,18 @@ use synapse_core::{VaultEntry, VaultEntryKind};
 
 mod editor_blink;
 mod editor_surface;
+mod http_client;
 mod icons;
 mod inline_rename;
 mod math_renderer;
 
 use editor_blink::CursorBlinkState;
 use editor_surface::{
-    EditorLineLayout, EditorSelection, MarkdownBlockKind, MarkdownCalloutKind,
+    EditorLineLayout, EditorSelection, MarkdownBlockKind, MarkdownCalloutKind, MarkdownImage,
     MarkdownInlineFootnote, MarkdownInlineMath, MarkdownLineElement, MarkdownTableRow, SourceLine,
     footnote_preview_line, source_lines, source_lines_with_mode, task_preview_line,
 };
+use http_client::SynapseHttpClient;
 use icons::{Icon, SynapseAssets};
 use inline_rename::{InlineRenameEvent, InlineRenameInput};
 use math_renderer::{MathPreview, render_math_preview};
@@ -87,6 +91,8 @@ const MERMAID_PREVIEW_MAX_HEIGHT: f32 = 520.0;
 const MERMAID_PREVIEW_VERTICAL_PADDING: f32 = 16.0;
 const MATH_BLOCK_MAX_HEIGHT: f32 = 420.0;
 const MATH_BLOCK_VERTICAL_PADDING: f32 = 20.0;
+const MARKDOWN_IMAGE_MAX_HEIGHT: f32 = 720.0;
+const MARKDOWN_INLINE_IMAGE_HEIGHT: f32 = 22.0;
 
 fn default_window_size() -> gpui::Size<Pixels> {
     size(px(WINDOW_DEFAULT_WIDTH), px(WINDOW_DEFAULT_HEIGHT))
@@ -503,6 +509,7 @@ struct EditorRenderCache {
     lines: Rc<Vec<Rc<SourceLine>>>,
     mermaid_previews: Rc<BTreeMap<usize, MermaidPreview>>,
     math_previews: Rc<BTreeMap<usize, MathPreview>>,
+    image_previews: Rc<BTreeMap<usize, MarkdownImagePreview>>,
 }
 
 #[derive(Clone)]
@@ -512,6 +519,13 @@ enum MermaidPreview {
         natural_width: f32,
         natural_height: f32,
     },
+    Error(SharedString),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum MarkdownImagePreview {
+    Local(PathBuf),
+    Remote(SharedString),
     Error(SharedString),
 }
 
@@ -563,6 +577,20 @@ impl EditorRenderCache {
             && self.relative_path == relative_path
             && self.revision == revision
             && self.dark_mode == dark_mode
+    }
+
+    fn can_reuse_image_previews(
+        &self,
+        vault_root: &Path,
+        relative_path: &Path,
+        revision: u64,
+        source_mode: bool,
+    ) -> bool {
+        !source_mode
+            && !self.source_mode
+            && self.vault_root == vault_root
+            && self.relative_path == relative_path
+            && self.revision == revision
     }
 }
 
@@ -698,6 +726,125 @@ fn build_math_previews(
         }
     }
     Rc::new(previews)
+}
+
+fn build_image_previews(
+    lines: &[Rc<SourceLine>],
+    vault_root: &Path,
+    note_relative_path: &Path,
+) -> Rc<BTreeMap<usize, MarkdownImagePreview>> {
+    let mut previews = BTreeMap::new();
+    for line in lines {
+        if let Some(image) = line.presentation.image_block.as_ref() {
+            previews.insert(
+                image.source_start_char,
+                resolve_markdown_image(vault_root, note_relative_path, &image.url),
+            );
+        }
+        for image in &line.presentation.inline_images {
+            previews.insert(
+                image.source_start_char,
+                resolve_markdown_image(vault_root, note_relative_path, &image.url),
+            );
+        }
+    }
+    Rc::new(previews)
+}
+
+fn resolve_markdown_image(
+    vault_root: &Path,
+    note_relative_path: &Path,
+    url: &str,
+) -> MarkdownImagePreview {
+    let url = url.trim();
+    if url.starts_with("https://") || url.starts_with("http://") {
+        return MarkdownImagePreview::Remote(url.to_owned().into());
+    }
+    if url.contains("://") || url.starts_with("data:") || url.starts_with("file:") {
+        return MarkdownImagePreview::Error("Unsupported image URL scheme".into());
+    }
+
+    let local_url = url.split(['?', '#']).next().unwrap_or(url);
+    let decoded = match percent_decode_path(local_url) {
+        Ok(decoded) => decoded,
+        Err(error) => return MarkdownImagePreview::Error(error.into()),
+    };
+    let mut relative = if decoded.starts_with('/') {
+        PathBuf::new()
+    } else {
+        note_relative_path
+            .parent()
+            .map_or_else(PathBuf::new, Path::to_path_buf)
+    };
+    let decoded = decoded.trim_start_matches('/');
+    for component in Path::new(decoded).components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(part) => relative.push(part),
+            Component::ParentDir => {
+                if !relative.pop() {
+                    return MarkdownImagePreview::Error(
+                        "Image path escapes the current Vault".into(),
+                    );
+                }
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                return MarkdownImagePreview::Error("Unsupported absolute image path".into());
+            }
+        }
+    }
+    if relative.as_os_str().is_empty() {
+        return MarkdownImagePreview::Error("Image path is empty".into());
+    }
+
+    let candidate = vault_root.join(relative);
+    let canonical_vault = fs::canonicalize(vault_root).unwrap_or_else(|_| vault_root.to_path_buf());
+    let canonical_image = match fs::canonicalize(&candidate) {
+        Ok(path) => path,
+        Err(_) => {
+            return MarkdownImagePreview::Error(
+                format!("Image not found: {}", candidate.display()).into(),
+            );
+        }
+    };
+    if !canonical_image.starts_with(&canonical_vault) {
+        return MarkdownImagePreview::Error("Image path escapes the current Vault".into());
+    }
+    if !canonical_image.is_file() {
+        return MarkdownImagePreview::Error("Image path is not a file".into());
+    }
+    MarkdownImagePreview::Local(canonical_image)
+}
+
+fn percent_decode_path(source: &str) -> Result<String, String> {
+    let bytes = source.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut cursor = 0;
+    while cursor < bytes.len() {
+        if bytes[cursor] == b'%' {
+            let Some(high) = bytes.get(cursor + 1).and_then(|byte| hex_value(*byte)) else {
+                return Err("Invalid percent-encoded image path".to_owned());
+            };
+            let Some(low) = bytes.get(cursor + 2).and_then(|byte| hex_value(*byte)) else {
+                return Err("Invalid percent-encoded image path".to_owned());
+            };
+            decoded.push(high << 4 | low);
+            cursor += 3;
+        } else {
+            decoded.push(bytes[cursor]);
+            cursor += 1;
+        }
+    }
+    String::from_utf8(decoded).map_err(|_| "Image path is not valid UTF-8".to_owned())
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 impl SynapseApp {
@@ -1308,7 +1455,42 @@ impl SynapseApp {
     }
 
     fn paste(&mut self, _: &Paste, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+        let Some(item) = cx.read_from_clipboard() else {
+            cx.stop_propagation();
+            return;
+        };
+        if let Some(image) = item.entries().iter().find_map(|entry| match entry {
+            ClipboardEntry::Image(image) => Some(image.clone()),
+            ClipboardEntry::String(_) => None,
+        }) {
+            let image_markdown = self
+                .state
+                .vault_root()
+                .zip(self.state.active_document())
+                .ok_or_else(|| io::Error::other("Open a note before pasting an image"))
+                .and_then(|(vault_root, document)| {
+                    persist_clipboard_image(
+                        vault_root,
+                        document.relative_path(),
+                        &image,
+                        clipboard_image_timestamp(),
+                    )
+                });
+            match image_markdown {
+                Ok(markdown) => {
+                    let _ = self
+                        .state
+                        .replace_active_range(self.editor_selection.range(), &markdown);
+                    self.editor_selection.collapse(self.state.cursor());
+                    self.editor_marked_range = None;
+                    self.restart_editor_cursor_blink(cx);
+                    cx.notify();
+                }
+                Err(error) => self
+                    .state
+                    .set_error_message(format!("Unable to paste image: {error}")),
+            }
+        } else if let Some(text) = item.text() {
             let text = normalize_clipboard_text(&text);
             let _ = self
                 .state
@@ -1466,6 +1648,7 @@ struct EditorRowContext {
     page_content_width: f32,
     mermaid_previews: Rc<BTreeMap<usize, MermaidPreview>>,
     math_previews: Rc<BTreeMap<usize, MathPreview>>,
+    image_previews: Rc<BTreeMap<usize, MarkdownImagePreview>>,
 }
 
 #[derive(Clone, Copy)]
@@ -1804,6 +1987,115 @@ fn render_math_block_row(
         .into_any_element()
 }
 
+fn markdown_image_source(preview: &MarkdownImagePreview) -> Option<ImageSource> {
+    match preview {
+        MarkdownImagePreview::Local(path) => Some(path.clone().into()),
+        MarkdownImagePreview::Remote(url) => Some(url.clone().into()),
+        MarkdownImagePreview::Error(_) => None,
+    }
+}
+
+fn markdown_image_placeholder(
+    alt: SharedString,
+    detail: SharedString,
+    muted: Hsla,
+    border: Hsla,
+) -> AnyElement {
+    div()
+        .w_full()
+        .min_h(px(72.0))
+        .flex()
+        .flex_col()
+        .items_center()
+        .justify_center()
+        .gap_1()
+        .px_3()
+        .rounded_md()
+        .border_1()
+        .border_color(border)
+        .text_size(px(13.0))
+        .text_color(muted)
+        .child(if alt.is_empty() { "Image".into() } else { alt })
+        .child(div().text_xs().child(detail))
+        .into_any_element()
+}
+
+fn render_markdown_image_block(
+    index: usize,
+    line: Rc<SourceLine>,
+    row_context: &EditorRowContext,
+    image: &MarkdownImage,
+    preview: Option<&MarkdownImagePreview>,
+    muted: Hsla,
+    border: Hsla,
+) -> AnyElement {
+    let alt: SharedString = image.alt.clone().into();
+    let content = match preview {
+        Some(preview) if markdown_image_source(preview).is_some() => {
+            let source = markdown_image_source(preview).expect("checked image source");
+            let loading_alt = alt.clone();
+            let fallback_alt = alt.clone();
+            img(source)
+                .id(("markdown-image", image.source_start_char))
+                .max_w_full()
+                .max_h(px(MARKDOWN_IMAGE_MAX_HEIGHT))
+                .object_fit(ObjectFit::Contain)
+                .with_loading(move || {
+                    markdown_image_placeholder(
+                        loading_alt.clone(),
+                        "Loading image…".into(),
+                        muted,
+                        border,
+                    )
+                })
+                .with_fallback(move || {
+                    markdown_image_placeholder(
+                        fallback_alt.clone(),
+                        "Unable to load image".into(),
+                        muted,
+                        border,
+                    )
+                })
+                .into_any_element()
+        }
+        Some(MarkdownImagePreview::Error(error)) => {
+            markdown_image_placeholder(alt, error.clone(), muted, border)
+        }
+        _ => markdown_image_placeholder(alt, "Image preview unavailable".into(), muted, border),
+    };
+
+    div()
+        .w_full()
+        .min_w(px(0.0))
+        .when(index == 0, |style| style.pt(px(EDITOR_TOP_PADDING)))
+        .py(px(12.0))
+        .when(index + 1 == row_context.line_count, |style| {
+            style.pb(px(180.0))
+        })
+        .child(
+            div()
+                .w_full()
+                .max_w(px(EDITOR_PAGE_MAX_WIDTH))
+                .min_w(px(0.0))
+                .mx_auto()
+                .px(px(row_context.horizontal_gutter))
+                .child(
+                    div()
+                        .relative()
+                        .w_full()
+                        .min_w(px(0.0))
+                        .min_h(px(72.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .cursor_pointer()
+                        .child(content)
+                        .child(editor_block_layout_canvas(index, line, row_context, false)),
+                ),
+        )
+        .into_any_element()
+}
+
 fn callout_accent(kind: MarkdownCalloutKind, dark_mode: bool, muted: Hsla) -> Hsla {
     match kind {
         MarkdownCalloutKind::Note | MarkdownCalloutKind::Info | MarkdownCalloutKind::Todo => {
@@ -2082,6 +2374,52 @@ fn render_inline_footnote_item(footnote: &MarkdownInlineFootnote, accent: Hsla) 
         .into_any_element()
 }
 
+fn render_inline_image_item(
+    image: &MarkdownImage,
+    preview: Option<&MarkdownImagePreview>,
+    muted: Hsla,
+    border: Hsla,
+) -> AnyElement {
+    let alt: SharedString = image.alt.clone().into();
+    match preview.and_then(markdown_image_source) {
+        Some(source) => {
+            let fallback_alt = alt.clone();
+            img(source)
+                .id(("markdown-inline-image", image.source_start_char))
+                .h(px(MARKDOWN_INLINE_IMAGE_HEIGHT))
+                .max_w(px(180.0))
+                .object_fit(ObjectFit::Contain)
+                .with_fallback(move || {
+                    div()
+                        .h(px(MARKDOWN_INLINE_IMAGE_HEIGHT))
+                        .max_w(px(180.0))
+                        .px_1()
+                        .rounded_sm()
+                        .border_1()
+                        .border_color(border)
+                        .text_xs()
+                        .text_color(muted)
+                        .truncate()
+                        .child(fallback_alt.clone())
+                        .into_any_element()
+                })
+                .into_any_element()
+        }
+        None => div()
+            .h(px(MARKDOWN_INLINE_IMAGE_HEIGHT))
+            .max_w(px(180.0))
+            .px_1()
+            .rounded_sm()
+            .border_1()
+            .border_color(border)
+            .text_xs()
+            .text_color(muted)
+            .truncate()
+            .child(alt)
+            .into_any_element(),
+    }
+}
+
 fn render_inline_preview_row(
     index: usize,
     line: Rc<SourceLine>,
@@ -2089,6 +2427,7 @@ fn render_inline_preview_row(
     muted: Hsla,
     danger: Hsla,
     footnote_accent: Hsla,
+    border: Hsla,
 ) -> AnyElement {
     let display = &line.presentation.display;
     let display_len = display.chars().count();
@@ -2113,6 +2452,18 @@ fn render_inline_preview_row(
                 footnote.display_start_char,
                 footnote.display_end_char,
                 render_inline_footnote_item(footnote, footnote_accent),
+            )
+        }))
+        .chain(line.presentation.inline_images.iter().map(|image| {
+            (
+                image.display_start_char,
+                image.display_end_char,
+                render_inline_image_item(
+                    image,
+                    row_context.image_previews.get(&image.source_start_char),
+                    muted,
+                    border,
+                ),
             )
         }))
         .collect();
@@ -2259,6 +2610,17 @@ fn render_editor_row(
     if matches!(kind, MarkdownBlockKind::ThematicBreak) {
         return render_thematic_break_row(index, line, row_context, active, theme.border);
     }
+    if !active && let Some(image) = line.presentation.image_block.as_ref() {
+        return render_markdown_image_block(
+            index,
+            line.clone(),
+            row_context,
+            image,
+            row_context.image_previews.get(&image.source_start_char),
+            theme.muted_foreground,
+            theme.border,
+        );
+    }
     if !active && line.presentation.footnote_definition.is_some() {
         return render_footnote_definition_row(
             index,
@@ -2304,7 +2666,8 @@ fn render_editor_row(
     }
     if !active
         && (!line.presentation.inline_math.is_empty()
-            || !line.presentation.inline_footnotes.is_empty())
+            || !line.presentation.inline_footnotes.is_empty()
+            || !line.presentation.inline_images.is_empty())
     {
         return render_inline_preview_row(
             index,
@@ -2313,6 +2676,7 @@ fn render_editor_row(
             theme.muted_foreground,
             theme.danger,
             theme.link,
+            theme.border,
         );
     }
     let callout = line.presentation.callout_line.as_ref();
@@ -2542,7 +2906,7 @@ impl Render for SynapseApp {
                         source_mode,
                     )
                 });
-                let (lines, mermaid_previews, math_previews) = if cache_hit {
+                let (lines, mermaid_previews, math_previews, image_previews) = if cache_hit {
                     let cache = self
                         .editor_render_cache
                         .as_ref()
@@ -2551,6 +2915,7 @@ impl Render for SynapseApp {
                         cache.lines.clone(),
                         cache.mermaid_previews.clone(),
                         cache.math_previews.clone(),
+                        cache.image_previews.clone(),
                     )
                 } else {
                     let previous_lines = self
@@ -2586,6 +2951,18 @@ impl Render for SynapseApp {
                             )
                         })
                         .map(|cache| cache.math_previews.clone());
+                    let previous_image_previews = self
+                        .editor_render_cache
+                        .as_ref()
+                        .filter(|cache| {
+                            cache.can_reuse_image_previews(
+                                &vault_root,
+                                &relative_path,
+                                revision,
+                                source_mode,
+                            )
+                        })
+                        .map(|cache| cache.image_previews.clone());
                     let text = document.text();
                     let parsed_lines = if source_mode {
                         source_lines_with_mode(&text, cursor, dark_mode, true)
@@ -2619,6 +2996,13 @@ impl Render for SynapseApp {
                         previous_math_previews
                             .unwrap_or_else(|| build_math_previews(&parsed, dark_mode))
                     };
+                    let image_previews = if source_mode {
+                        Rc::new(BTreeMap::new())
+                    } else {
+                        previous_image_previews.unwrap_or_else(|| {
+                            build_image_previews(&parsed, &vault_root, &relative_path)
+                        })
+                    };
                     self.editor_render_cache = Some(EditorRenderCache {
                         vault_root,
                         relative_path,
@@ -2629,8 +3013,9 @@ impl Render for SynapseApp {
                         lines: parsed.clone(),
                         mermaid_previews: mermaid_previews.clone(),
                         math_previews: math_previews.clone(),
+                        image_previews: image_previews.clone(),
                     });
-                    (parsed, mermaid_previews, math_previews)
+                    (parsed, mermaid_previews, math_previews, image_previews)
                 };
                 self.editor_selection.clamp(document_len);
                 let selection = self.editor_selection.range();
@@ -2686,6 +3071,7 @@ impl Render for SynapseApp {
                                 page_content_width: editor_page_content_width,
                                 mermaid_previews,
                                 math_previews,
+                                image_previews,
                             };
                             move |index, _, cx| {
                                 render_editor_row(index, lines[index].clone(), &row_context, cx)
@@ -4252,6 +4638,70 @@ fn normalize_clipboard_text(text: &str) -> String {
     text.replace("\r\n", "\n").replace('\r', "\n")
 }
 
+fn clipboard_image_timestamp() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_millis())
+}
+
+fn clipboard_image_extension(format: ImageFormat) -> &'static str {
+    match format {
+        ImageFormat::Png => "png",
+        ImageFormat::Jpeg => "jpg",
+        ImageFormat::Webp => "webp",
+        ImageFormat::Gif => "gif",
+        ImageFormat::Svg => "svg",
+        ImageFormat::Bmp => "bmp",
+        ImageFormat::Tiff => "tiff",
+    }
+}
+
+fn persist_clipboard_image(
+    vault_root: &Path,
+    note_relative_path: &Path,
+    image: &Image,
+    timestamp: u128,
+) -> io::Result<String> {
+    if image.bytes.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "the clipboard image is empty",
+        ));
+    }
+
+    let note_parent = note_relative_path.parent().unwrap_or_else(|| Path::new(""));
+    let assets_directory = vault_root.join(note_parent).join("assets");
+    fs::create_dir_all(&assets_directory)?;
+    let extension = clipboard_image_extension(image.format);
+
+    for suffix in 0..10_000_u32 {
+        let suffix = if suffix == 0 {
+            String::new()
+        } else {
+            format!("-{suffix}")
+        };
+        let filename = format!("pasted-image-{timestamp}{suffix}.{extension}");
+        let path = assets_directory.join(&filename);
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(mut file) => {
+                if let Err(error) = file.write_all(&image.bytes) {
+                    drop(file);
+                    let _ = fs::remove_file(path);
+                    return Err(error);
+                }
+                return Ok(format!("![Pasted image](assets/{filename})"));
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "unable to allocate a unique image filename",
+    ))
+}
+
 fn file_manager_reveal_command(path: &Path) -> (&'static str, Vec<OsString>) {
     #[cfg(target_os = "macos")]
     {
@@ -4294,8 +4744,10 @@ fn synapse_titlebar_options() -> TitlebarOptions {
 fn main() {
     let state = ShellState::from_vault_argument(std::env::args_os().nth(1));
     let theme_preference = load_theme_preference();
+    let http_client = SynapseHttpClient::new().expect("failed to initialize the HTTP client");
 
     Application::new()
+        .with_http_client(http_client)
         .with_assets(SynapseAssets)
         .run(move |cx: &mut App| {
             gpui_component::init(cx);
@@ -4411,25 +4863,29 @@ fn main() {
 mod tests {
     use std::{
         collections::BTreeSet,
+        fs,
         path::{Path, PathBuf},
         rc::Rc,
     };
 
-    use gpui::{MouseButton, px, rgb};
+    use gpui::{Image, ImageFormat, MouseButton, px, rgb};
     use synapse_core::{VaultEntry, VaultEntryKind};
+    use tempfile::tempdir;
 
     use super::{
         EDITOR_BODY_FONT_SIZE, EDITOR_BODY_LINE_HEIGHT, EDITOR_COMPACT_GUTTER,
         EDITOR_PAGE_MAX_WIDTH, EDITOR_REGULAR_GUTTER, EDITOR_RULE_BLOCK_HEIGHT,
         EDITOR_RULE_THICKNESS, EDITOR_TOP_PADDING, EDITOR_WIDE_GUTTER, FileTreeRow,
-        MENU_ITEM_ICON_SIZE, MENU_ITEM_ICON_SLOT_SIZE, SIDEBAR_FOOTER_HEIGHT,
+        MENU_ITEM_ICON_SIZE, MENU_ITEM_ICON_SLOT_SIZE, MarkdownImagePreview, SIDEBAR_FOOTER_HEIGHT,
         TABLE_CELL_HORIZONTAL_PADDING, TABLE_CELL_VERTICAL_PADDING, TABLE_FONT_SIZE,
         TABLE_ROW_MIN_HEIGHT, TITLEBAR_HEIGHT, ThemePreference, build_file_tree_rows,
-        build_math_previews, build_mermaid_previews, changed_line_span, code_block_edges,
-        command_palette_key_bindings, default_window_size, editor_horizontal_gutter,
-        editor_page_content_width, file_manager_reveal_command, is_tab_context_trigger,
-        normalize_clipboard_text, note_breadcrumb_parts, source_lines, synapse_mermaid_theme,
-        synapse_theme_palette, synapse_titlebar_options, titlebar_left_inset,
+        build_image_previews, build_math_previews, build_mermaid_previews, changed_line_span,
+        clipboard_image_extension, code_block_edges, command_palette_key_bindings,
+        default_window_size, editor_horizontal_gutter, editor_page_content_width,
+        file_manager_reveal_command, is_tab_context_trigger, normalize_clipboard_text,
+        note_breadcrumb_parts, persist_clipboard_image, resolve_markdown_image, source_lines,
+        synapse_mermaid_theme, synapse_theme_palette, synapse_titlebar_options,
+        titlebar_left_inset,
     };
 
     #[test]
@@ -4530,6 +4986,37 @@ mod tests {
     }
 
     #[test]
+    fn clipboard_images_are_saved_beside_the_note_and_insert_markdown() {
+        let vault = tempdir().expect("temporary Vault");
+        let image = Image::from_bytes(ImageFormat::Png, vec![0x89, b'P', b'N', b'G']);
+
+        let first = persist_clipboard_image(
+            vault.path(),
+            Path::new("notes/example.md"),
+            &image,
+            1_726_000,
+        )
+        .expect("first pasted image");
+        let second = persist_clipboard_image(
+            vault.path(),
+            Path::new("notes/example.md"),
+            &image,
+            1_726_000,
+        )
+        .expect("second pasted image");
+
+        assert_eq!(first, "![Pasted image](assets/pasted-image-1726000.png)");
+        assert_eq!(second, "![Pasted image](assets/pasted-image-1726000-1.png)");
+        assert_eq!(
+            fs::read(vault.path().join("notes/assets/pasted-image-1726000.png"))
+                .expect("saved clipboard image"),
+            image.bytes
+        );
+        assert_eq!(clipboard_image_extension(ImageFormat::Jpeg), "jpg");
+        assert_eq!(clipboard_image_extension(ImageFormat::Svg), "svg");
+    }
+
+    #[test]
     fn macos_uses_a_theme_adaptive_custom_titlebar_area() {
         let titlebar = synapse_titlebar_options();
 
@@ -4601,7 +5088,80 @@ mod tests {
     }
 
     #[test]
-    fn p4_mermaid_cache_ignores_cursor_but_invalidates_content_theme_and_mode() {
+    fn markdown_images_resolve_relative_root_remote_and_reject_escape() {
+        let vault = tempdir().expect("temporary Vault");
+        let note_directory = vault.path().join("notes/deep");
+        let asset_directory = vault.path().join("notes/assets");
+        fs::create_dir_all(&note_directory).expect("note directory");
+        fs::create_dir_all(&asset_directory).expect("asset directory");
+        let local_image = asset_directory.join("图 片.png");
+        fs::write(&local_image, b"not decoded in resolver test").expect("image fixture");
+        let shared_directory = vault.path().join("shared");
+        fs::create_dir_all(&shared_directory).expect("shared directory");
+        let shared_image = shared_directory.join("root.png");
+        fs::write(&shared_image, b"fixture").expect("root image fixture");
+
+        assert_eq!(
+            resolve_markdown_image(
+                vault.path(),
+                Path::new("notes/deep/note.md"),
+                "../assets/%E5%9B%BE%20%E7%89%87.png",
+            ),
+            MarkdownImagePreview::Local(
+                fs::canonicalize(local_image).expect("canonical local image")
+            )
+        );
+        assert!(matches!(
+            resolve_markdown_image(
+                vault.path(),
+                Path::new("notes/deep/note.md"),
+                "/shared/root.png",
+            ),
+            MarkdownImagePreview::Local(_)
+        ));
+        assert!(matches!(
+            resolve_markdown_image(
+                vault.path(),
+                Path::new("notes/deep/note.md"),
+                "https://example.com/image.png",
+            ),
+            MarkdownImagePreview::Remote(_)
+        ));
+        assert!(matches!(
+            resolve_markdown_image(
+                vault.path(),
+                Path::new("notes/deep/note.md"),
+                "../../../outside.png",
+            ),
+            MarkdownImagePreview::Error(_)
+        ));
+    }
+
+    #[test]
+    fn markdown_image_preview_cache_uses_source_offsets() {
+        let vault = tempdir().expect("temporary Vault");
+        fs::create_dir_all(vault.path().join("assets")).expect("asset directory");
+        fs::write(vault.path().join("assets/a.png"), b"fixture").expect("image fixture");
+        let lines = source_lines("cursor\n![A](assets/a.png)", 0, false)
+            .into_iter()
+            .map(Rc::new)
+            .collect::<Vec<_>>();
+        let image_start = lines[1]
+            .presentation
+            .image_block
+            .as_ref()
+            .expect("image metadata")
+            .source_start_char;
+        let previews = build_image_previews(&lines, vault.path(), Path::new("note.md"));
+
+        assert!(matches!(
+            previews.get(&image_start),
+            Some(MarkdownImagePreview::Local(_))
+        ));
+    }
+
+    #[test]
+    fn visual_preview_caches_ignore_cursor_and_invalidate_relevant_state() {
         let cache = super::EditorRenderCache {
             vault_root: PathBuf::from("/vault"),
             relative_path: PathBuf::from("diagram.md"),
@@ -4612,6 +5172,7 @@ mod tests {
             lines: Rc::new(Vec::new()),
             mermaid_previews: Rc::new(Default::default()),
             math_previews: Rc::new(Default::default()),
+            image_previews: Rc::new(Default::default()),
         };
 
         assert!(cache.can_reuse_mermaid_previews(
@@ -4647,6 +5208,12 @@ mod tests {
             Path::new("diagram.md"),
             7,
             true,
+            false,
+        ));
+        assert!(cache.can_reuse_image_previews(
+            Path::new("/vault"),
+            Path::new("diagram.md"),
+            7,
             false,
         ));
         assert!(!cache.can_reuse_math_previews(

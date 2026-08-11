@@ -131,6 +131,8 @@ pub struct MarkdownLinePresentation {
     pub callout_line: Option<MarkdownCalloutLine>,
     pub footnote_definition: Option<MarkdownFootnoteDefinition>,
     pub inline_footnotes: Vec<MarkdownInlineFootnote>,
+    pub image_block: Option<MarkdownImage>,
+    pub inline_images: Vec<MarkdownImage>,
     source_to_display: Vec<usize>,
     display_to_source: Vec<usize>,
 }
@@ -227,6 +229,16 @@ pub struct MarkdownInlineFootnote {
     pub display_start_char: usize,
     pub display_end_char: usize,
     pub label: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MarkdownImage {
+    pub source_start_char: usize,
+    pub source_end_char: usize,
+    pub display_start_char: usize,
+    pub display_end_char: usize,
+    pub url: String,
+    pub alt: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -402,6 +414,7 @@ pub fn source_lines_with_mode(
     annotate_math(&mut lines, &raw_lines);
     annotate_task_items(&mut lines, &raw_lines);
     annotate_footnotes(&mut lines, &raw_lines);
+    annotate_images(&mut lines, &raw_lines, cursor);
     lines
 }
 
@@ -430,6 +443,8 @@ fn raw_source_lines(text: &str) -> Vec<SourceLine> {
                     callout_line: None,
                     footnote_definition: None,
                     inline_footnotes: Vec::new(),
+                    image_block: None,
+                    inline_images: Vec::new(),
                     source_to_display: (0..=len).collect(),
                     display_to_source: (0..=len).collect(),
                 },
@@ -583,22 +598,6 @@ fn presentation_from_writ(
         );
         let len = display.len();
         (display, map, vec![plain_style_run(len)])
-    } else if let Some(image) = render.image {
-        let label = if image.alt.is_empty() {
-            "🖼 Image".to_owned()
-        } else {
-            format!("🖼 {}", image.alt)
-        };
-        let (display, map) = SegmentMap::build(
-            source,
-            source_start_byte,
-            &[Special::Collapsed {
-                buffer: source_start_byte..source_start_byte + source.len(),
-                display: label,
-            }],
-        );
-        let len = display.len();
-        (display, map, vec![plain_style_run(len)])
     } else {
         let runs = flatten_writ_runs(render.text.len(), &render.runs, run_ranges, kind);
         (render.text, render.map, runs)
@@ -636,6 +635,8 @@ fn presentation_from_writ(
         callout_line: None,
         footnote_definition: None,
         inline_footnotes: Vec::new(),
+        image_block: None,
+        inline_images: Vec::new(),
         source_to_display,
         display_to_source,
     }
@@ -1181,6 +1182,178 @@ fn detect_inline_footnotes(source: &str) -> Vec<(Range<usize>, String)> {
     references
 }
 
+fn annotate_images(lines: &mut [SourceLine], raw_lines: &[&str], cursor: usize) {
+    for (line, source) in lines.iter_mut().zip(raw_lines) {
+        if line.presentation.code_line.is_some() {
+            continue;
+        }
+        let images = detect_markdown_images(source);
+        for (source_range, alt, url) in images {
+            let image = MarkdownImage {
+                source_start_char: line.start_char + source_range.start,
+                source_end_char: line.start_char + source_range.end,
+                display_start_char: line
+                    .presentation
+                    .display_char_for_source(source_range.start),
+                display_end_char: line.presentation.display_char_for_source(source_range.end),
+                url,
+                alt,
+            };
+            let standalone = source
+                .chars()
+                .take(source_range.start)
+                .all(char::is_whitespace)
+                && source
+                    .chars()
+                    .skip(source_range.end)
+                    .all(char::is_whitespace);
+            if standalone {
+                line.presentation.image_block = Some(image);
+            } else {
+                line.presentation.inline_images.push(image);
+            }
+        }
+        let active = (line.start_char..=line.start_char + line.source_len_chars).contains(&cursor);
+        if active
+            && (line.presentation.image_block.is_some()
+                || !line.presentation.inline_images.is_empty())
+        {
+            let len = source.chars().count();
+            line.presentation.display = (*source).to_owned();
+            line.presentation.runs = (!source.is_empty())
+                .then(|| plain_style_run(source.len()))
+                .into_iter()
+                .collect();
+            line.presentation.source_to_display = (0..=len).collect();
+            line.presentation.display_to_source = (0..=len).collect();
+        }
+    }
+}
+
+fn detect_markdown_images(source: &str) -> Vec<(Range<usize>, String, String)> {
+    let bytes = source.as_bytes();
+    let boundaries = char_byte_boundaries(source);
+    let code_ranges = inline_code_ranges(source);
+    let mut images = Vec::new();
+    let mut cursor = 0;
+    while cursor + 4 < bytes.len() {
+        if bytes.get(cursor..cursor + 2) != Some(b"![")
+            || is_escaped(bytes, cursor)
+            || code_ranges.iter().any(|range| range.contains(&cursor))
+        {
+            cursor += 1;
+            continue;
+        }
+        let Some(alt_end) = find_unescaped_byte(bytes, cursor + 2, b']') else {
+            break;
+        };
+        if bytes.get(alt_end + 1) != Some(&b'(') {
+            cursor = alt_end + 1;
+            continue;
+        }
+        let Some(destination_end) = find_markdown_destination_end(bytes, alt_end + 2) else {
+            cursor = alt_end + 1;
+            continue;
+        };
+        let destination = &source[alt_end + 2..destination_end];
+        let Some(url) = markdown_image_destination(destination) else {
+            cursor = destination_end + 1;
+            continue;
+        };
+        let alt = markdown_unescape(&source[cursor + 2..alt_end]);
+        images.push((
+            char_index_for_byte(&boundaries, cursor)
+                ..char_index_for_byte(&boundaries, destination_end + 1),
+            alt,
+            url,
+        ));
+        cursor = destination_end + 1;
+    }
+    images
+}
+
+fn find_unescaped_byte(bytes: &[u8], start: usize, target: u8) -> Option<usize> {
+    (start..bytes.len()).find(|index| bytes[*index] == target && !is_escaped(bytes, *index))
+}
+
+fn find_markdown_destination_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut depth = 1;
+    let mut quote = None;
+    let mut cursor = start;
+    while cursor < bytes.len() {
+        if bytes[cursor] == b'\\' {
+            cursor += 2;
+            continue;
+        }
+        if let Some(delimiter) = quote {
+            if bytes[cursor] == delimiter {
+                quote = None;
+            }
+            cursor += 1;
+            continue;
+        }
+        match bytes[cursor] {
+            b'\'' | b'"' => quote = Some(bytes[cursor]),
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(cursor);
+                }
+            }
+            _ => {}
+        }
+        cursor += 1;
+    }
+    None
+}
+
+fn markdown_image_destination(source: &str) -> Option<String> {
+    let source = source.trim();
+    if source.is_empty() {
+        return None;
+    }
+    if let Some(angle) = source.strip_prefix('<') {
+        let end = angle.find('>')?;
+        return Some(markdown_unescape(&angle[..end]));
+    }
+    let mut escaped = false;
+    let end = source
+        .char_indices()
+        .find_map(|(index, character)| {
+            if escaped {
+                escaped = false;
+                return None;
+            }
+            if character == '\\' {
+                escaped = true;
+                return None;
+            }
+            character.is_whitespace().then_some(index)
+        })
+        .unwrap_or(source.len());
+    (end > 0).then(|| markdown_unescape(&source[..end]))
+}
+
+fn markdown_unescape(source: &str) -> String {
+    let mut result = String::with_capacity(source.len());
+    let mut escaped = false;
+    for character in source.chars() {
+        if escaped {
+            result.push(character);
+            escaped = false;
+        } else if character == '\\' {
+            escaped = true;
+        } else {
+            result.push(character);
+        }
+    }
+    if escaped {
+        result.push('\\');
+    }
+    result
+}
+
 pub fn task_preview_line(line: &SourceLine) -> SourceLine {
     let Some(task) = line.presentation.task_item.as_ref() else {
         return line.clone();
@@ -1425,6 +1598,8 @@ fn hidden_source_presentation(source: &str) -> MarkdownLinePresentation {
         callout_line: None,
         footnote_definition: None,
         inline_footnotes: Vec::new(),
+        image_block: None,
+        inline_images: Vec::new(),
         source_to_display: vec![0; source.chars().count() + 1],
         display_to_source: vec![0],
     }
@@ -2185,7 +2360,45 @@ mod tests {
         assert!(link.runs.iter().any(|run| run.underline));
         assert_eq!(task.kind, MarkdownBlockKind::Task(true));
         assert_eq!(ordered.kind, MarkdownBlockKind::Ordered);
-        assert_eq!(image.display, "🖼 diagram");
+        assert!(image.display.is_empty());
+        assert_eq!(
+            image.image_block.as_ref().map(|image| image.alt.as_str()),
+            Some("diagram")
+        );
+        assert_eq!(
+            image.image_block.as_ref().map(|image| image.url.as_str()),
+            Some("diagram.png")
+        );
+    }
+
+    #[test]
+    fn markdown_images_preserve_standalone_inline_and_encoded_destinations() {
+        let lines = source_lines(
+            concat!(
+                "cursor\n",
+                "![本地图片](../assets/My%20Image.png \"标题\")\n",
+                "before ![badge](badge.svg) after `![code](ignored.png)`"
+            ),
+            0,
+            false,
+        );
+        let block = lines[1]
+            .presentation
+            .image_block
+            .as_ref()
+            .expect("standalone image metadata");
+        let inline = &lines[2].presentation.inline_images;
+
+        assert_eq!(block.alt, "本地图片");
+        assert_eq!(block.url, "../assets/My%20Image.png");
+        assert_eq!(inline.len(), 1);
+        assert_eq!(inline[0].alt, "badge");
+        assert_eq!(inline[0].url, "badge.svg");
+        assert!(inline[0].display_start_char <= inline[0].display_end_char);
+
+        let active_source = "before ![badge](badge.svg) after";
+        let active = source_lines(active_source, 2, false);
+        assert_eq!(active[0].presentation.display, active_source);
     }
 
     #[test]
@@ -2467,6 +2680,8 @@ mod tests {
                 && line.presentation.callout_line.is_none()
                 && line.presentation.footnote_definition.is_none()
                 && line.presentation.inline_footnotes.is_empty()
+                && line.presentation.image_block.is_none()
+                && line.presentation.inline_images.is_empty()
         }));
         assert_eq!(lines[0].presentation.display_char_for_source(3), 3);
         assert_eq!(lines[1].presentation.source_char_for_display(4), 4);

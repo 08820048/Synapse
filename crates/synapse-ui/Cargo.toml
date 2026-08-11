@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+futures.workspace = true
 gpui.workspace = true
 gpui-animation.workspace = true
 gpui-component.workspace = true
@@ -15,7 +16,9 @@ ratex-parser.workspace = true
 ratex-svg.workspace = true
 ratex-types.workspace = true
 rusty-mermaid.workspace = true
+reqwest.workspace = true
 synapse-core.workspace = true
+tokio.workspace = true
 writ.workspace = true
 
 [dev-dependencies]
