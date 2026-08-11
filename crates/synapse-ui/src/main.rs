@@ -14,8 +14,8 @@ use gpui::{
     AnyElement, App, Application, Bounds, ClickEvent, ClipboardItem, Context, CursorStyle, Entity,
     FocusHandle, Focusable, FontWeight, Hsla, KeyBinding, ListAlignment, ListState, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathPromptOptions, Pixels, Point, SharedString,
-    Size, TitlebarOptions, Window, WindowBounds, WindowOptions, actions, div, hsla, list, point,
-    prelude::*, px, relative, rgb, rgba, size,
+    Size, TitlebarOptions, Window, WindowBounds, WindowControlArea, WindowOptions, actions, div,
+    hsla, list, point, prelude::*, px, relative, rgb, rgba, size,
 };
 use gpui_animation::{
     animation::TransitionExt,
@@ -45,13 +45,18 @@ use inline_rename::{InlineRenameEvent, InlineRenameInput};
 
 const WINDOW_MIN_WIDTH: f32 = 900.0;
 const WINDOW_MIN_HEIGHT: f32 = 560.0;
-const BOTTOM_BAR_HEIGHT: f32 = 40.0;
+const SIDEBAR_FOOTER_HEIGHT: f32 = 40.0;
 const QUICK_TRANSITION: Duration = Duration::from_millis(140);
 const PANEL_TRANSITION: Duration = Duration::from_millis(180);
 const EDITOR_CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(530);
-const EDITOR_CONTENT_WIDTH_RATIO: f32 = 0.92;
-const EDITOR_CONTENT_MAX_WIDTH: f32 = 1100.0;
-const EDITOR_HORIZONTAL_GUTTER: f32 = 24.0;
+const TITLEBAR_HEIGHT: f32 = 44.0;
+const SIDEBAR_WIDTH: f32 = 248.0;
+const EDITOR_PAGE_MAX_WIDTH: f32 = 1120.0;
+const EDITOR_COMPACT_BREAKPOINT: f32 = 720.0;
+const EDITOR_WIDE_BREAKPOINT: f32 = 1120.0;
+const EDITOR_COMPACT_GUTTER: f32 = 16.0;
+const EDITOR_REGULAR_GUTTER: f32 = 24.0;
+const EDITOR_WIDE_GUTTER: f32 = 32.0;
 const EDITOR_TOP_PADDING: f32 = 24.0;
 const EDITOR_BODY_FONT_SIZE: f32 = 16.0;
 const EDITOR_BODY_LINE_HEIGHT: f32 = 26.4;
@@ -435,8 +440,6 @@ struct SynapseApp {
     theme_settings_generation: u64,
     theme_persistence_error: Option<String>,
     left_sidebar_open: bool,
-    left_sidebar_mounted: bool,
-    left_sidebar_generation: u64,
     command_palette_open: bool,
     command_palette_closing: bool,
     command_palette_generation: u64,
@@ -511,25 +514,7 @@ fn editor_line_layout_matches(old: &SourceLine, new: &SourceLine) -> bool {
 
 impl SynapseApp {
     fn toggle_left_sidebar(&mut self, cx: &mut Context<Self>) {
-        self.left_sidebar_generation = self.left_sidebar_generation.wrapping_add(1);
-        let generation = self.left_sidebar_generation;
-        if self.left_sidebar_open {
-            self.left_sidebar_open = false;
-            let timer = cx.background_executor().timer(PANEL_TRANSITION);
-            cx.spawn(async move |this, cx| {
-                timer.await;
-                let _ = this.update(cx, |this, cx| {
-                    if this.left_sidebar_generation == generation && !this.left_sidebar_open {
-                        this.left_sidebar_mounted = false;
-                        cx.notify();
-                    }
-                });
-            })
-            .detach();
-        } else {
-            self.left_sidebar_mounted = true;
-            self.left_sidebar_open = true;
-        }
+        self.left_sidebar_open = !self.left_sidebar_open;
         self.dismiss_context_menus(cx);
         cx.notify();
     }
@@ -1177,6 +1162,7 @@ struct EditorRowContext {
     cursor: usize,
     selection: Range<usize>,
     cursor_visible: bool,
+    horizontal_gutter: f32,
 }
 
 fn render_editor_row(
@@ -1186,6 +1172,7 @@ fn render_editor_row(
     cx: &mut App,
 ) -> AnyElement {
     let theme = cx.theme();
+    let list_marker_color = synapse_theme_palette(theme.is_dark()).faint;
     let active =
         (line.start_char..=line.start_char + line.source_len_chars).contains(&row_context.cursor);
     let kind = line.presentation.kind;
@@ -1198,11 +1185,11 @@ fn render_editor_row(
         })
         .child(
             div()
-                .w(relative(EDITOR_CONTENT_WIDTH_RATIO))
-                .max_w(px(EDITOR_CONTENT_MAX_WIDTH))
+                .w_full()
+                .max_w(px(EDITOR_PAGE_MAX_WIDTH))
                 .min_w(px(0.0))
                 .mx_auto()
-                .px(px(EDITOR_HORIZONTAL_GUTTER))
+                .px(px(row_context.horizontal_gutter))
                 .child(
                     div()
                         .flex()
@@ -1259,6 +1246,7 @@ fn render_editor_row(
                             selection: row_context.selection.clone(),
                             cursor_visible: row_context.cursor_visible,
                             marker_color: theme.muted_foreground,
+                            list_marker_color,
                             cursor_color: theme.caret,
                             selection_color: theme.selection,
                         }),
@@ -1276,18 +1264,14 @@ impl Render for SynapseApp {
             .state
             .active_document()
             .map(|document| document.relative_path().to_path_buf());
-        let status_message = self.state.status_message().to_owned();
-        let status_color = if status_message == "Modified" {
-            theme.warning
-        } else if status_message == "Saved" || status_message == "Ready" {
-            theme.success
-        } else {
-            theme.danger
-        };
         let file_rows = build_file_tree_rows(&self.state.entries, &self.collapsed_directories);
         let tabs = self.state.tabs();
         let active_tab = self.state.active_tab_index();
         let no_vault_open = self.state.vault_name.is_none();
+        let editor_horizontal_gutter = editor_horizontal_gutter(
+            f32::from(window.viewport_size().width),
+            self.left_sidebar_open,
+        );
 
         let editor_body =
             if let Some(document) = self.state.active_document() {
@@ -1397,6 +1381,7 @@ impl Render for SynapseApp {
                                 cursor,
                                 selection,
                                 cursor_visible: self.editor_blink.visible(),
+                                horizontal_gutter: editor_horizontal_gutter,
                             };
                             move |index, _, cx| {
                                 render_editor_row(index, lines[index].clone(), &row_context, cx)
@@ -1461,15 +1446,49 @@ impl Render for SynapseApp {
         let tab_muted = theme.muted_foreground;
         let tab_hover = theme.secondary_hover;
         let tab_warning = theme.warning;
+        let titlebar_left_inset = titlebar_left_inset(self.left_sidebar_open);
+        let sidebar_toggle_app = app_entity.clone();
         let tab_bar = div()
             .id("document-tabs")
-            .h(px(38.0))
+            .h(px(TITLEBAR_HEIGHT))
             .flex_none()
             .flex()
             .overflow_x_scroll()
             .border_b_1()
             .border_color(tab_border)
             .bg(tab_background)
+            .child(
+                div()
+                    .h_full()
+                    .w(titlebar_left_inset)
+                    .flex_none()
+                    .window_control_area(WindowControlArea::Drag),
+            )
+            .child(
+                Button::new("toggle-left-sidebar")
+                    .ghost()
+                    .size(px(40.0))
+                    .flex_none()
+                    .tooltip(if self.left_sidebar_open {
+                        "Hide sidebar"
+                    } else {
+                        "Show sidebar"
+                    })
+                    .child(
+                        if self.left_sidebar_open {
+                            Icon::PanelLeft
+                        } else {
+                            Icon::PanelRight
+                        }
+                        .render(17.0)
+                        .text_color(tab_muted),
+                    )
+                    .on_click(move |_, _, cx| {
+                        sidebar_toggle_app.update(cx, |this, cx| {
+                            this.toggle_left_sidebar(cx);
+                        });
+                    }),
+            )
             .children(tabs.into_iter().enumerate().map(|(index, tab)| {
                 let tab_id = SharedString::from(format!("tab-{index}"));
                 let close_id = SharedString::from(format!("close-tab-{index}"));
@@ -1490,7 +1509,15 @@ impl Render for SynapseApp {
                     .cursor_pointer()
                     .text_color(tab_muted)
                     .hover(move |style| style.bg(tab_hover))
-                    .child(div().flex_1().min_w(px(0.0)).truncate().child(tab.title))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
+                            .child(tab.title),
+                    )
                     .when(tab.is_dirty, |view| {
                         view.child(
                             div()
@@ -1504,7 +1531,7 @@ impl Render for SynapseApp {
                         Button::new(close_id)
                             .ghost()
                             .xsmall()
-                            .size(px(28.0))
+                            .size(px(40.0))
                             .tooltip("Close tab")
                             .child(Icon::Close.render(14.0).text_color(tab_muted))
                             .on_click(move |event: &ClickEvent, _, cx| {
@@ -1547,13 +1574,20 @@ impl Render for SynapseApp {
                         move |style| style.bg(tab_active).text_color(tab_active_foreground),
                         move |style| style.bg(tab_inactive).text_color(tab_inactive_foreground),
                     )
-            }));
+            }))
+            .child(
+                div()
+                    .h_full()
+                    .min_w(px(24.0))
+                    .flex_1()
+                    .window_control_area(WindowControlArea::Drag),
+            );
 
         let sidebar_hover = theme.sidebar_accent;
         let left_sidebar = div()
             .id("left-sidebar")
-            .w(if self.left_sidebar_mounted {
-                px(248.0)
+            .w(if self.left_sidebar_open {
+                px(SIDEBAR_WIDTH)
             } else {
                 px(0.0)
             })
@@ -1565,6 +1599,14 @@ impl Render for SynapseApp {
             .border_r_1()
             .border_color(theme.sidebar_border)
             .bg(theme.sidebar)
+            .when(cfg!(target_os = "macos"), |sidebar| {
+                sidebar.child(
+                    div()
+                        .h(px(TITLEBAR_HEIGHT))
+                        .flex_none()
+                        .window_control_area(WindowControlArea::Drag),
+                )
+            })
             .child(div().flex_none().p_2().child({
                 let app = app_entity.clone();
                 Button::new("sidebar-search-launcher")
@@ -1615,9 +1657,19 @@ impl Render for SynapseApp {
                             .flex()
                             .items_center()
                             .gap_2()
-                            .child(Icon::Todo.render(16.0))
+                            .child(
+                                Icon::Todo
+                                    .render(16.0)
+                                    .flex_none()
+                                    .text_color(theme.muted_foreground),
+                            )
                             .child(div().flex_1().text_left().child("Todo"))
-                            .child(Icon::Plus.render(14.0)),
+                            .child(
+                                Icon::Plus
+                                    .render(14.0)
+                                    .flex_none()
+                                    .text_color(theme.muted_foreground),
+                            ),
                     )
                     .on_click(move |_, window, cx| {
                         app.update(cx, |this, cx| {
@@ -1638,9 +1690,19 @@ impl Render for SynapseApp {
                             .flex()
                             .items_center()
                             .gap_2()
-                            .child(Icon::Bookmark.render(16.0))
+                            .child(
+                                Icon::Bookmark
+                                    .render(16.0)
+                                    .flex_none()
+                                    .text_color(theme.muted_foreground),
+                            )
                             .child(div().flex_1().text_left().child("Bookmarks"))
-                            .child(Icon::Plus.render(14.0)),
+                            .child(
+                                Icon::Plus
+                                    .render(14.0)
+                                    .flex_none()
+                                    .text_color(theme.muted_foreground),
+                            ),
                     )
                     .on_click(move |_, window, cx| {
                         app.update(cx, |this, cx| {
@@ -1972,7 +2034,7 @@ impl Render for SynapseApp {
             )
             .child(
                 div()
-                    .h(px(BOTTOM_BAR_HEIGHT))
+                    .h(px(SIDEBAR_FOOTER_HEIGHT))
                     .flex_none()
                     .border_t_1()
                     .border_color(theme.sidebar_border)
@@ -1991,14 +2053,6 @@ impl Render for SynapseApp {
                                 });
                             })
                     }),
-            )
-            .with_transition("left-sidebar-transition")
-            .transition_when_else(
-                self.left_sidebar_open,
-                PANEL_TRANSITION,
-                EaseInOutCubic,
-                |style| style.opacity(1.0),
-                |style| style.opacity(0.0),
             );
 
         let context_backdrop =
@@ -2557,116 +2611,28 @@ impl Render for SynapseApp {
                 .into_any_element()
         });
 
-        let toolbar_app = app_entity.clone();
-        let sidebar_toggle_app = app_entity;
         div()
             .size_full()
             .relative()
             .flex()
-            .flex_col()
             .overflow_hidden()
             .bg(theme.background)
             .text_color(theme.foreground)
             .on_action(cx.listener(Self::open_command_palette_action))
+            .child(left_sidebar)
             .child(
                 div()
-                    .id("workspace-toolbar")
-                    .h(px(40.0))
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .pl(toolbar_left_padding())
-                    .pr_3()
-                    .border_b_1()
-                    .border_color(theme.border)
-                    .bg(theme.tab_bar)
-                    .child(div().flex_1())
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(status_color)
-                            .child(status_message),
-                    )
-                    .child(
-                        Button::new("open-vault-toolbar")
-                            .ghost()
-                            .small()
-                            .label("Open Vault")
-                            .on_click(move |_, _, cx| {
-                                toolbar_app.update(cx, |this, cx| {
-                                    this.prompt_for_vault(cx);
-                                });
-                            }),
-                    ),
-            )
-            .child(
-                div()
+                    .id("editor-workspace")
+                    .h_full()
                     .flex_1()
                     .min_h(px(0.0))
+                    .min_w(px(0.0))
+                    .overflow_hidden()
                     .flex()
-                    .child(left_sidebar)
-                    .child(
-                        div()
-                            .id("editor-workspace")
-                            .h_full()
-                            .flex_1()
-                            .min_w(px(0.0))
-                            .overflow_hidden()
-                            .flex()
-                            .flex_col()
-                            .bg(theme.background)
-                            .child(tab_bar)
-                            .child(editor_body)
-                            .child(
-                                div()
-                                    .h(px(BOTTOM_BAR_HEIGHT))
-                                    .flex_none()
-                                    .flex()
-                                    .items_center()
-                                    .justify_between()
-                                    .pr_3()
-                                    .border_t_1()
-                                    .border_color(theme.border)
-                                    .text_xs()
-                                    .text_color(theme.muted_foreground)
-                                    .child(
-                                        div()
-                                            .h_full()
-                                            .flex()
-                                            .items_center()
-                                            .child(
-                                                Button::new("toggle-left-sidebar")
-                                                    .ghost()
-                                                    .size(px(BOTTOM_BAR_HEIGHT))
-                                                    .tooltip(if self.left_sidebar_open {
-                                                        "Hide sidebar"
-                                                    } else {
-                                                        "Show sidebar"
-                                                    })
-                                                    .child(
-                                                        if self.left_sidebar_open {
-                                                            Icon::PanelLeft
-                                                        } else {
-                                                            Icon::PanelRight
-                                                        }
-                                                        .render(17.0)
-                                                        .text_color(theme.muted_foreground),
-                                                    )
-                                                    .on_click(move |_, _, cx| {
-                                                        sidebar_toggle_app.update(
-                                                            cx,
-                                                            |this, cx| {
-                                                                this.toggle_left_sidebar(cx);
-                                                            },
-                                                        );
-                                                    }),
-                                            )
-                                            .child(div().pl_2().child("LOCAL  •  MARKDOWN")),
-                                    )
-                                    .child("Cmd/Ctrl + S to save"),
-                            ),
-                    ),
+                    .flex_col()
+                    .bg(theme.background)
+                    .child(tab_bar)
+                    .child(editor_body),
             )
             .children(context_backdrop)
             .children(context_menu)
@@ -2676,11 +2642,23 @@ impl Render for SynapseApp {
     }
 }
 
-fn toolbar_left_padding() -> Pixels {
-    if cfg!(target_os = "macos") {
+fn titlebar_left_inset(sidebar_open: bool) -> Pixels {
+    if cfg!(target_os = "macos") && !sidebar_open {
         px(84.0)
     } else {
-        px(12.0)
+        px(10.0)
+    }
+}
+
+fn editor_horizontal_gutter(viewport_width: f32, sidebar_open: bool) -> f32 {
+    let available_width =
+        (viewport_width - if sidebar_open { SIDEBAR_WIDTH } else { 0.0 }).max(0.0);
+    if available_width < EDITOR_COMPACT_BREAKPOINT {
+        EDITOR_COMPACT_GUTTER
+    } else if available_width < EDITOR_WIDE_BREAKPOINT {
+        EDITOR_REGULAR_GUTTER
+    } else {
+        EDITOR_WIDE_GUTTER
     }
 }
 
@@ -2831,8 +2809,6 @@ fn main() {
                         theme_settings_generation: 0,
                         theme_persistence_error: None,
                         left_sidebar_open: true,
-                        left_sidebar_mounted: true,
-                        left_sidebar_generation: 0,
                         command_palette_open: false,
                         command_palette_closing: false,
                         command_palette_generation: 0,
@@ -2879,19 +2855,24 @@ mod tests {
     use synapse_core::{VaultEntry, VaultEntryKind};
 
     use super::{
-        BOTTOM_BAR_HEIGHT, EDITOR_BODY_FONT_SIZE, EDITOR_BODY_LINE_HEIGHT,
-        EDITOR_CONTENT_MAX_WIDTH, EDITOR_CONTENT_WIDTH_RATIO, EDITOR_HORIZONTAL_GUTTER,
-        EDITOR_TOP_PADDING, FileTreeRow, ThemePreference, build_file_tree_rows, changed_line_span,
-        command_palette_key_bindings, context_menu_position, file_manager_reveal_command,
-        is_tab_context_trigger, normalize_clipboard_text, source_lines, synapse_theme_palette,
-        synapse_titlebar_options, toolbar_left_padding,
+        EDITOR_BODY_FONT_SIZE, EDITOR_BODY_LINE_HEIGHT, EDITOR_COMPACT_GUTTER,
+        EDITOR_PAGE_MAX_WIDTH, EDITOR_REGULAR_GUTTER, EDITOR_TOP_PADDING, EDITOR_WIDE_GUTTER,
+        FileTreeRow, SIDEBAR_FOOTER_HEIGHT, TITLEBAR_HEIGHT, ThemePreference, build_file_tree_rows,
+        changed_line_span, command_palette_key_bindings, context_menu_position,
+        editor_horizontal_gutter, file_manager_reveal_command, is_tab_context_trigger,
+        normalize_clipboard_text, source_lines, synapse_theme_palette, synapse_titlebar_options,
+        titlebar_left_inset,
     };
 
     #[test]
     fn editor_typography_matches_the_centered_writing_layout() {
-        assert_eq!(EDITOR_CONTENT_WIDTH_RATIO, 0.92);
-        assert_eq!(EDITOR_CONTENT_MAX_WIDTH, 1100.0);
-        assert_eq!(EDITOR_HORIZONTAL_GUTTER, 24.0);
+        assert_eq!(EDITOR_PAGE_MAX_WIDTH, 1120.0);
+        assert_eq!(editor_horizontal_gutter(900.0, true), EDITOR_COMPACT_GUTTER);
+        assert_eq!(
+            editor_horizontal_gutter(900.0, false),
+            EDITOR_REGULAR_GUTTER
+        );
+        assert_eq!(editor_horizontal_gutter(1400.0, true), EDITOR_WIDE_GUTTER);
         assert_eq!(EDITOR_TOP_PADDING, 24.0);
         assert_eq!(EDITOR_BODY_FONT_SIZE, 16.0);
         assert_eq!(EDITOR_BODY_LINE_HEIGHT, 26.4);
@@ -2956,12 +2937,13 @@ mod tests {
         let titlebar = synapse_titlebar_options();
 
         assert_eq!(titlebar.appears_transparent, cfg!(target_os = "macos"));
+        assert_eq!(titlebar_left_inset(true), gpui::px(10.0));
         assert_eq!(
-            toolbar_left_padding(),
+            titlebar_left_inset(false),
             if cfg!(target_os = "macos") {
                 gpui::px(84.0)
             } else {
-                gpui::px(12.0)
+                gpui::px(10.0)
             }
         );
     }
@@ -2989,8 +2971,9 @@ mod tests {
     }
 
     #[test]
-    fn p1_sidebar_settings_and_editor_status_share_the_same_bottom_bar_height() {
-        assert_eq!(BOTTOM_BAR_HEIGHT, 40.0);
+    fn sidebar_footer_and_titlebar_control_keep_minimum_hit_area() {
+        assert_eq!(SIDEBAR_FOOTER_HEIGHT, 40.0);
+        assert_eq!(TITLEBAR_HEIGHT, 44.0);
     }
 
     #[test]

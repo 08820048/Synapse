@@ -16,6 +16,9 @@ use writ::{
 
 use super::SynapseApp;
 
+const LIST_BULLET_DIAMETER: f32 = 5.0;
+const LIST_BULLET_OPTICAL_Y_OFFSET: f32 = -0.5;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MarkdownBlockKind {
     Heading(u8),
@@ -104,6 +107,8 @@ pub struct MarkdownStyleRun {
     pub italic: bool,
     pub mono: bool,
     pub muted: bool,
+    pub list_marker: bool,
+    pub hidden_bullet_marker: bool,
     pub underline: bool,
     pub strikethrough: bool,
 }
@@ -115,6 +120,13 @@ pub struct MarkdownLinePresentation {
     pub runs: Vec<MarkdownStyleRun>,
     source_to_display: Vec<usize>,
     display_to_source: Vec<usize>,
+}
+
+#[derive(Clone, Copy)]
+struct MarkdownRunRanges<'a> {
+    muted: &'a [Range<usize>],
+    list_marker: Option<&'a Range<usize>>,
+    hidden_bullet_marker: Option<&'a Range<usize>>,
 }
 
 impl MarkdownLinePresentation {
@@ -172,12 +184,20 @@ pub fn source_lines(text: &str, cursor: usize, dark_mode: bool) -> Vec<SourceLin
                 &[],
                 None,
             );
+            let kind = markdown_block_kind(&markers, &snapshot, line_index, &source);
             let mut muted_ranges: Vec<_> = render
                 .runs
                 .iter()
                 .filter(|run| run.color == theme.comment)
                 .map(|run| run.range.clone())
                 .collect();
+            let list_marker_range = list_marker_range(&render.text, kind);
+            if let Some(marker_range) = list_marker_range.as_ref() {
+                muted_ranges.push(marker_range.clone());
+            }
+            let hidden_bullet_marker = matches!(kind, MarkdownBlockKind::Bullet)
+                .then_some(list_marker_range.as_ref())
+                .flatten();
             if cursor_on_line {
                 for marker in &markers.markers {
                     let display = render.map.buffer_range_to_display(marker.range.clone());
@@ -200,14 +220,18 @@ pub fn source_lines(text: &str, cursor: usize, dark_mode: bool) -> Vec<SourceLin
                     }
                 }
             }
-            let kind = markdown_block_kind(&markers, &snapshot, line_index, &source);
+            let run_ranges = MarkdownRunRanges {
+                muted: &muted_ranges,
+                list_marker: list_marker_range.as_ref(),
+                hidden_bullet_marker,
+            };
             let presentation = presentation_from_writ(
                 source.as_str(),
                 byte_range.start,
                 render,
                 kind,
                 cursor_on_line,
-                &muted_ranges,
+                run_ranges,
             );
             let line = SourceLine {
                 start_char,
@@ -236,6 +260,30 @@ pub fn source_lines(text: &str, cursor: usize, dark_mode: bool) -> Vec<SourceLin
         }
     }
     lines
+}
+
+fn list_marker_range(text: &str, kind: MarkdownBlockKind) -> Option<Range<usize>> {
+    let start = text.find(|character: char| !character.is_whitespace())?;
+    let rest = &text[start..];
+
+    match kind {
+        MarkdownBlockKind::Bullet => {
+            let marker = rest.chars().next()?;
+            matches!(marker, '-' | '*' | '+' | '•' | '◦' | '‣')
+                .then_some(start..start + marker.len_utf8())
+        }
+        MarkdownBlockKind::Ordered => {
+            let digit_bytes = rest
+                .chars()
+                .take_while(|character| character.is_ascii_digit())
+                .map(char::len_utf8)
+                .sum::<usize>();
+            let punctuation = rest[digit_bytes..].chars().next()?;
+            matches!(punctuation, '.' | ')')
+                .then_some(start..start + digit_bytes + punctuation.len_utf8())
+        }
+        _ => None,
+    }
 }
 
 fn setext_heading_level(source: &str) -> Option<u8> {
@@ -331,7 +379,7 @@ fn presentation_from_writ(
     render: writ::render::LineRender,
     kind: MarkdownBlockKind,
     cursor_on_line: bool,
-    muted_ranges: &[Range<usize>],
+    run_ranges: MarkdownRunRanges<'_>,
 ) -> MarkdownLinePresentation {
     let (display, map, runs) = if matches!(kind, MarkdownBlockKind::Table) && !cursor_on_line {
         let display = table_row_preview(source);
@@ -374,7 +422,7 @@ fn presentation_from_writ(
         let len = display.len();
         (display, map, vec![plain_style_run(len)])
     } else {
-        let runs = flatten_writ_runs(render.text.len(), &render.runs, muted_ranges);
+        let runs = flatten_writ_runs(render.text.len(), &render.runs, run_ranges);
         (render.text, render.map, runs)
     };
 
@@ -473,7 +521,7 @@ fn hidden_source_presentation(source: &str) -> MarkdownLinePresentation {
 fn flatten_writ_runs(
     text_len: usize,
     overlay_runs: &[writ::text_engine::StyleRun],
-    muted_ranges: &[Range<usize>],
+    run_ranges: MarkdownRunRanges<'_>,
 ) -> Vec<MarkdownStyleRun> {
     if text_len == 0 {
         return Vec::new();
@@ -483,7 +531,14 @@ fn flatten_writ_runs(
         boundaries.push(run.range.start.min(text_len));
         boundaries.push(run.range.end.min(text_len));
     }
-    for range in muted_ranges {
+    for range in run_ranges.muted {
+        boundaries.push(range.start.min(text_len));
+        boundaries.push(range.end.min(text_len));
+    }
+    for range in [run_ranges.list_marker, run_ranges.hidden_bullet_marker]
+        .into_iter()
+        .flatten()
+    {
         boundaries.push(range.start.min(text_len));
         boundaries.push(range.end.min(text_len));
     }
@@ -506,9 +561,16 @@ fn flatten_writ_runs(
             bold: active.iter().any(|run| run.bold),
             italic: active.iter().any(|run| run.italic),
             mono: active.iter().any(|run| run.mono),
-            muted: muted_ranges
+            muted: run_ranges
+                .muted
                 .iter()
                 .any(|range| range.start <= start && range.end >= end),
+            list_marker: run_ranges
+                .list_marker
+                .is_some_and(|range| range.start <= start && range.end >= end),
+            hidden_bullet_marker: run_ranges
+                .hidden_bullet_marker
+                .is_some_and(|range| range.start <= start && range.end >= end),
             underline: active.iter().any(|run| run.underline),
             strikethrough: active.iter().any(|run| run.strikethrough),
         };
@@ -528,6 +590,8 @@ fn same_markdown_style(left: &MarkdownStyleRun, right: &MarkdownStyleRun) -> boo
         && left.italic == right.italic
         && left.mono == right.mono
         && left.muted == right.muted
+        && left.list_marker == right.list_marker
+        && left.hidden_bullet_marker == right.hidden_bullet_marker
         && left.underline == right.underline
         && left.strikethrough == right.strikethrough
 }
@@ -539,6 +603,8 @@ fn plain_style_run(len: usize) -> MarkdownStyleRun {
         italic: false,
         mono: false,
         muted: false,
+        list_marker: false,
+        hidden_bullet_marker: false,
         underline: false,
         strikethrough: false,
     }
@@ -597,6 +663,7 @@ pub struct MarkdownLineElement {
     pub selection: Range<usize>,
     pub cursor_visible: bool,
     pub marker_color: gpui::Hsla,
+    pub list_marker_color: gpui::Hsla,
     pub cursor_color: gpui::Hsla,
     pub selection_color: gpui::Hsla,
 }
@@ -610,6 +677,7 @@ pub struct WrappedLayoutState {
 pub struct PrepaintState {
     line: Option<WrappedLine>,
     line_height: Pixels,
+    bullet_marker: Option<PaintQuad>,
     cursor: Option<PaintQuad>,
     selections: Vec<PaintQuad>,
 }
@@ -667,7 +735,15 @@ impl Element for MarkdownLineElement {
                 .presentation
                 .runs
                 .iter()
-                .map(|run| text_run_from_markdown(run, &base_font, base_color, self.marker_color))
+                .map(|run| {
+                    text_run_from_markdown(
+                        run,
+                        &base_font,
+                        base_color,
+                        self.marker_color,
+                        self.list_marker_color,
+                    )
+                })
                 .collect()
         };
         let state = WrappedLayoutState {
@@ -712,6 +788,21 @@ impl Element for MarkdownLineElement {
             .clone()
             .expect("editor line must be measured before prepaint");
         let line_height = layout_state.line_height;
+        let bullet_marker = hidden_bullet_marker_range(&self.source_line.presentation.runs)
+            .and_then(|range| {
+                let start = line.position_for_index(range.start, line_height)?;
+                let end = line.position_for_index(range.end, line_height)?;
+                let diameter = px(LIST_BULLET_DIAMETER);
+                let x = (start.x + end.x - diameter) / 2.0;
+                let y = start.y + (line_height - diameter) / 2.0 + px(LIST_BULLET_OPTICAL_Y_OFFSET);
+                Some(
+                    fill(
+                        Bounds::new(bounds.origin + point(x, y), size(diameter, diameter)),
+                        self.list_marker_color,
+                    )
+                    .corner_radii(diameter / 2.0),
+                )
+            });
         let cursor = (self.active && self.selection.is_empty() && self.cursor_visible).then(|| {
             let local_source = self.cursor.saturating_sub(self.source_line.start_char);
             let display_char = self
@@ -759,6 +850,7 @@ impl Element for MarkdownLineElement {
         PrepaintState {
             line: Some(line),
             line_height,
+            bullet_marker,
             cursor,
             selections,
         }
@@ -795,6 +887,9 @@ impl Element for MarkdownLineElement {
             cx,
         )
         .expect("editor line should paint");
+        if let Some(marker) = prepaint.bullet_marker.take() {
+            window.paint_quad(marker);
+        }
         if self.app.read(cx).editor_focus.is_focused(window)
             && let Some(cursor) = prepaint.cursor.take()
         {
@@ -817,6 +912,7 @@ fn text_run_from_markdown(
     base_font: &Font,
     base_color: gpui::Hsla,
     marker_color: gpui::Hsla,
+    list_marker_color: gpui::Hsla,
 ) -> TextRun {
     let mut font = base_font.clone();
     if run.bold {
@@ -825,7 +921,15 @@ fn text_run_from_markdown(
     if run.italic {
         font = font.italic();
     }
-    let color = if run.muted { marker_color } else { base_color };
+    let color = if run.hidden_bullet_marker {
+        base_color.alpha(0.0)
+    } else if run.list_marker {
+        list_marker_color
+    } else if run.muted {
+        marker_color
+    } else {
+        base_color
+    };
     TextRun {
         len: run.len,
         font,
@@ -841,6 +945,18 @@ fn text_run_from_markdown(
             thickness: px(1.0),
         }),
     }
+}
+
+fn hidden_bullet_marker_range(runs: &[MarkdownStyleRun]) -> Option<Range<usize>> {
+    let mut start = 0;
+    for run in runs {
+        let end = start + run.len;
+        if run.hidden_bullet_marker {
+            return Some(start..end);
+        }
+        start = end;
+    }
+    None
 }
 
 fn visual_row_byte_ranges(text_len: usize, wrap_boundaries: &[usize]) -> Vec<Range<usize>> {
@@ -1077,8 +1193,8 @@ mod tests {
     use std::{hint::black_box, time::Instant};
 
     use super::{
-        EditorSelection, MarkdownBlockKind, char_byte_boundaries, char_to_byte, source_lines,
-        visual_row_byte_ranges,
+        EditorSelection, LIST_BULLET_DIAMETER, MarkdownBlockKind, char_byte_boundaries,
+        char_to_byte, hidden_bullet_marker_range, source_lines, visual_row_byte_ranges,
     };
 
     fn present_markdown_line(source: &str) -> super::MarkdownLinePresentation {
@@ -1193,6 +1309,54 @@ mod tests {
         assert!(line.runs.first().is_some_and(|run| run.muted));
         assert!(line.runs.last().is_some_and(|run| run.muted));
         assert!(line.runs.iter().any(|run| run.bold && !run.muted));
+    }
+
+    #[test]
+    fn list_preview_markers_use_an_independent_marker_run_and_faint_color_slot() {
+        let bullet = present_markdown_line("- item");
+        let ordered = present_markdown_line("12. item");
+
+        assert_eq!(bullet.display, "• item");
+        assert!(
+            bullet
+                .runs
+                .first()
+                .is_some_and(|run| run.list_marker && run.hidden_bullet_marker)
+        );
+        assert_eq!(hidden_bullet_marker_range(&bullet.runs), Some(0..3));
+        assert!(
+            ordered
+                .runs
+                .first()
+                .is_some_and(|run| run.list_marker && !run.hidden_bullet_marker)
+        );
+        assert_eq!(LIST_BULLET_DIAMETER, 5.0);
+    }
+
+    #[test]
+    fn all_unordered_source_markers_share_the_custom_preview_disc() {
+        for (source, expected_display) in [
+            ("- item", "• item"),
+            ("* item", "◦ item"),
+            ("+ item", "‣ item"),
+        ] {
+            let preview = present_markdown_line(source);
+            assert_eq!(preview.display, expected_display);
+            assert!(
+                preview.runs.first().is_some_and(|run| {
+                    run.list_marker && run.hidden_bullet_marker && run.muted
+                })
+            );
+        }
+
+        let active = source_lines("- item", 1, true).remove(0).presentation;
+        assert_eq!(active.display, "• item");
+        assert!(
+            active
+                .runs
+                .first()
+                .is_some_and(|run| run.list_marker && run.hidden_bullet_marker)
+        );
     }
 
     #[test]

@@ -1,8 +1,8 @@
-# P1 inline rename, bottom bar, context menu, and motion specification
+# P1 inline rename, titlebar control, context menu, and motion specification
 
 ## Scope
 
-This P1 slice replaces modal file-tree renaming with an inline IME-capable editor, relocates the sidebar toggle to the persistent bottom bar, anchors tab context menus to the pointer, and applies the repository motion standard to existing interactive surfaces.
+This P1 slice replaces modal file-tree renaming with an inline IME-capable editor, keeps the sidebar toggle beside the titlebar tabs, anchors tab context menus to the pointer, and applies the repository motion standard to existing interactive surfaces.
 
 ## Functional requirements
 
@@ -10,8 +10,8 @@ This P1 slice replaces modal file-tree renaming with an inline IME-capable edito
 - FR-2: Enter MUST submit the trimmed name; Escape MUST cancel without touching the filesystem.
 - FR-3: A failed or empty rename MUST keep the inline input active and expose an error without losing the typed value.
 - FR-4: The inline input MUST use GPUI `EntityInputHandler` so committed and marked IME text, including Chinese, is handled through UTF-16/UTF-8-safe ranges.
-- FR-5: The top-left sidebar control MUST be removed. A persistent bottom editor bar MUST expose Lucide `panel-left` while the left panel is visible and `panel-right` while it is hidden.
-- FR-6: The sidebar Settings row and editor bottom bar MUST use the same 40px height.
+- FR-5: The titlebar MUST expose Lucide `panel-left` while the left panel is visible and `panel-right` while it is hidden, immediately before the first document tab.
+- FR-6: The sidebar toggle MUST keep a 40px hit area inside the 44px titlebar; the editor MUST NOT render a persistent bottom toolbar.
 - FR-7: A tab context menu MUST open at the right-click pointer position and clamp to an 8px viewport margin instead of using a fixed right offset.
 - FR-8: Folder state, command palette visibility, tab activation, sidebar visibility, and all current context menus MUST use `gpui-animation` with the durations and easing defined in `docs/过渡和交互动画规约.md`.
 
@@ -26,5 +26,5 @@ This P1 slice replaces modal file-tree renaming with an inline IME-capable edito
 
 - AC-1: Tests cover Chinese UTF-16/UTF-8 boundary conversion.
 - AC-2: Tests cover pointer-anchored and viewport-clamped tab menu positions.
-- AC-3: Tests lock the shared bottom-bar height.
+- AC-3: Tests lock the 40px sidebar footer and 44px titlebar dimensions.
 - AC-4: Format, Clippy, workspace tests, and development build pass without launching the application or running screenshot automation.
