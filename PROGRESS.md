@@ -422,6 +422,7 @@
 - 新增 `ShellState::vault_root()`，避免切换到具有相同相对路径和 revision 的另一个 Vault 时错误复用旧 Markdown 缓存。
 - 非视觉验证全部通过：格式化、workspace/all-targets 严格 Clippy、94 个自动化测试、开发构建和 `git diff --check`；另单独通过 release 性能探针。
 - 按产品要求没有启动应用、没有截图、没有运行自动 UI 操作；因此滚动帧率和侧栏体感仍明确留给产品手动验收，不以纯函数基准冒充整机帧率。
+- 本批 gpui-component 界面重构、主题/排版和性能整改已提交为 `ef7bc53`（`feat: modernize and optimize GPUI editor`），并成功推送至 `origin/main`。
 
 ## 下一步
 
