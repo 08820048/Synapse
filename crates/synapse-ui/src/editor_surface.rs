@@ -3,8 +3,8 @@ use std::{cell::RefCell, ops::Range, rc::Rc};
 use gpui::{
     App, Bounds, Context, Element, ElementId, ElementInputHandler, Entity, EntityInputHandler,
     Font, GlobalElementId, InspectorElementId, IntoElement, LayoutId, PaintQuad, Pixels,
-    StrikethroughStyle, Style, TextRun, UTF16Selection, UnderlineStyle, Window, WrappedLine, fill,
-    point, px, relative, size,
+    SharedString, StrikethroughStyle, Style, TextRun, UTF16Selection, UnderlineStyle, Window,
+    WrappedLine, fill, point, px, relative, rgba, size,
 };
 use writ::{
     buffer::Buffer,
@@ -31,6 +31,7 @@ pub enum MarkdownBlockKind {
     Table,
     Math,
     Html,
+    Source,
     Paragraph,
 }
 
@@ -111,6 +112,7 @@ pub struct MarkdownStyleRun {
     pub hidden_bullet_marker: bool,
     pub underline: bool,
     pub strikethrough: bool,
+    pub syntax_rgba: Option<u32>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -118,8 +120,36 @@ pub struct MarkdownLinePresentation {
     pub display: String,
     pub kind: MarkdownBlockKind,
     pub runs: Vec<MarkdownStyleRun>,
+    pub table_row: Option<MarkdownTableRow>,
+    pub quote_line: Option<MarkdownQuoteLine>,
+    pub code_line: Option<MarkdownCodeLine>,
     source_to_display: Vec<usize>,
     display_to_source: Vec<usize>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MarkdownQuoteLine {
+    pub is_first: bool,
+    pub is_last: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MarkdownCodeLine {
+    pub is_fence: bool,
+    pub is_opening_fence: bool,
+    pub is_closing_fence: bool,
+    pub is_first_content: bool,
+    pub is_last_content: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MarkdownTableRow {
+    pub cells: Vec<String>,
+    pub column_count: usize,
+    pub is_header: bool,
+    pub is_delimiter: bool,
+    pub is_first: bool,
+    pub is_last: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -147,6 +177,18 @@ pub struct SourceLine {
 }
 
 pub fn source_lines(text: &str, cursor: usize, dark_mode: bool) -> Vec<SourceLine> {
+    source_lines_with_mode(text, cursor, dark_mode, false)
+}
+
+pub fn source_lines_with_mode(
+    text: &str,
+    cursor: usize,
+    dark_mode: bool,
+    source_mode: bool,
+) -> Vec<SourceLine> {
+    if source_mode {
+        return raw_source_lines(text);
+    }
     let mut buffer: Buffer = text.parse().expect("writ buffer parsing is infallible");
     let snapshot = buffer.render_snapshot();
     let styles_by_line = snapshot.inline_styles_by_line();
@@ -259,7 +301,38 @@ pub fn source_lines(text: &str, cursor: usize, dark_mode: bool) -> Vec<SourceLin
             lines[index].presentation = hidden_source_presentation(raw_lines[index]);
         }
     }
+    annotate_table_rows(&mut lines, &raw_lines);
+    annotate_quote_lines(&mut lines);
+    annotate_code_lines(&mut lines, &raw_lines);
     lines
+}
+
+fn raw_source_lines(text: &str) -> Vec<SourceLine> {
+    let mut start_char = 0;
+    text.split('\n')
+        .map(|source| {
+            let len = source.chars().count();
+            let line = SourceLine {
+                start_char,
+                source_len_chars: len,
+                presentation: MarkdownLinePresentation {
+                    display: source.to_owned(),
+                    kind: MarkdownBlockKind::Source,
+                    runs: (!source.is_empty())
+                        .then(|| plain_style_run(source.len()))
+                        .into_iter()
+                        .collect(),
+                    table_row: None,
+                    quote_line: None,
+                    code_line: None,
+                    source_to_display: (0..=len).collect(),
+                    display_to_source: (0..=len).collect(),
+                },
+            };
+            start_char += len + 1;
+            line
+        })
+        .collect()
 }
 
 fn list_marker_range(text: &str, kind: MarkdownBlockKind) -> Option<Range<usize>> {
@@ -422,7 +495,7 @@ fn presentation_from_writ(
         let len = display.len();
         (display, map, vec![plain_style_run(len)])
     } else {
-        let runs = flatten_writ_runs(render.text.len(), &render.runs, run_ranges);
+        let runs = flatten_writ_runs(render.text.len(), &render.runs, run_ranges, kind);
         (render.text, render.map, runs)
     };
 
@@ -448,20 +521,82 @@ fn presentation_from_writ(
         display,
         kind,
         runs,
+        table_row: None,
+        quote_line: None,
+        code_line: None,
         source_to_display,
         display_to_source,
     }
 }
 
+fn annotate_quote_lines(lines: &mut [SourceLine]) {
+    let mut start = 0;
+    while start < lines.len() {
+        if !matches!(lines[start].presentation.kind, MarkdownBlockKind::Quote) {
+            start += 1;
+            continue;
+        }
+        let mut end = start + 1;
+        while end < lines.len() && matches!(lines[end].presentation.kind, MarkdownBlockKind::Quote)
+        {
+            end += 1;
+        }
+        for (offset, line) in lines[start..end].iter_mut().enumerate() {
+            line.presentation.quote_line = Some(MarkdownQuoteLine {
+                is_first: offset == 0,
+                is_last: start + offset + 1 == end,
+            });
+        }
+        start = end;
+    }
+}
+
+fn annotate_code_lines(lines: &mut [SourceLine], raw_lines: &[&str]) {
+    let limit = lines.len().min(raw_lines.len());
+    let mut start = 0;
+    while start < limit {
+        if !matches!(lines[start].presentation.kind, MarkdownBlockKind::Code) {
+            start += 1;
+            continue;
+        }
+        let mut end = start + 1;
+        while end < limit && matches!(lines[end].presentation.kind, MarkdownBlockKind::Code) {
+            end += 1;
+        }
+
+        let fences: Vec<bool> = raw_lines[start..end]
+            .iter()
+            .map(|source| is_code_fence(source))
+            .collect();
+        let first_content = fences.iter().position(|is_fence| !is_fence);
+        let last_content = fences.iter().rposition(|is_fence| !is_fence);
+        let first_fence = fences.iter().position(|is_fence| *is_fence);
+        let last_fence = fences.iter().rposition(|is_fence| *is_fence);
+
+        for (offset, is_fence) in fences.into_iter().enumerate() {
+            lines[start + offset].presentation.code_line = Some(MarkdownCodeLine {
+                is_fence,
+                is_opening_fence: is_fence && first_fence == Some(offset),
+                is_closing_fence: is_fence
+                    && last_fence == Some(offset)
+                    && last_fence != first_fence,
+                is_first_content: first_content == Some(offset),
+                is_last_content: last_content == Some(offset),
+            });
+        }
+        start = end;
+    }
+}
+
+fn is_code_fence(source: &str) -> bool {
+    let trimmed = source.trim_start();
+    trimmed.starts_with("```") || trimmed.starts_with("~~~")
+}
+
 fn table_row_preview(source: &str) -> String {
     let trimmed = source.trim().trim_start_matches('|').trim_end_matches('|');
     let cells = split_table_cells(trimmed);
-    let is_delimiter = !cells.is_empty()
-        && cells.iter().all(|cell| {
-            let cell = cell.trim_matches(':').trim();
-            cell.len() >= 3 && cell.chars().all(|character| character == '-')
-        });
-    if is_delimiter {
+    if is_table_delimiter(&cells) {
         format!(
             "├{}┤",
             cells
@@ -473,6 +608,61 @@ fn table_row_preview(source: &str) -> String {
     } else {
         format!("│ {} │", cells.join(" │ "))
     }
+}
+
+fn annotate_table_rows(lines: &mut [SourceLine], raw_lines: &[&str]) {
+    let limit = lines.len().min(raw_lines.len());
+    let mut start = 0;
+    while start < limit {
+        if !matches!(lines[start].presentation.kind, MarkdownBlockKind::Table) {
+            start += 1;
+            continue;
+        }
+
+        let mut end = start + 1;
+        while end < limit && matches!(lines[end].presentation.kind, MarkdownBlockKind::Table) {
+            end += 1;
+        }
+
+        let mut rows: Vec<_> = raw_lines[start..end]
+            .iter()
+            .map(|source| {
+                let trimmed = source.trim().trim_start_matches('|').trim_end_matches('|');
+                split_table_cells(trimmed)
+            })
+            .collect();
+        let delimiter = rows.iter().position(|cells| is_table_delimiter(cells));
+        let column_count = rows.iter().map(Vec::len).max().unwrap_or(1).max(1);
+        let first_visible = rows
+            .iter()
+            .position(|cells| !is_table_delimiter(cells))
+            .unwrap_or(0);
+        let last_visible = rows
+            .iter()
+            .rposition(|cells| !is_table_delimiter(cells))
+            .unwrap_or(rows.len().saturating_sub(1));
+
+        for (offset, cells) in rows.iter_mut().enumerate() {
+            cells.resize(column_count, String::new());
+            lines[start + offset].presentation.table_row = Some(MarkdownTableRow {
+                cells: cells.clone(),
+                column_count,
+                is_header: delimiter.is_some_and(|index| offset + 1 == index),
+                is_delimiter: delimiter == Some(offset),
+                is_first: offset == first_visible,
+                is_last: offset == last_visible,
+            });
+        }
+        start = end;
+    }
+}
+
+fn is_table_delimiter(cells: &[String]) -> bool {
+    !cells.is_empty()
+        && cells.iter().all(|cell| {
+            let cell = cell.trim_matches(':').trim();
+            cell.len() >= 3 && cell.chars().all(|character| character == '-')
+        })
 }
 
 fn split_table_cells(source: &str) -> Vec<String> {
@@ -513,6 +703,9 @@ fn hidden_source_presentation(source: &str) -> MarkdownLinePresentation {
         display: String::new(),
         kind: MarkdownBlockKind::Paragraph,
         runs: Vec::new(),
+        table_row: None,
+        quote_line: None,
+        code_line: None,
         source_to_display: vec![0; source.chars().count() + 1],
         display_to_source: vec![0],
     }
@@ -522,6 +715,7 @@ fn flatten_writ_runs(
     text_len: usize,
     overlay_runs: &[writ::text_engine::StyleRun],
     run_ranges: MarkdownRunRanges<'_>,
+    kind: MarkdownBlockKind,
 ) -> Vec<MarkdownStyleRun> {
     if text_len == 0 {
         return Vec::new();
@@ -558,7 +752,8 @@ fn flatten_writ_runs(
             .collect();
         let next = MarkdownStyleRun {
             len: end - start,
-            bold: active.iter().any(|run| run.bold),
+            bold: !matches!(kind, MarkdownBlockKind::Heading(_))
+                && active.iter().any(|run| run.bold),
             italic: active.iter().any(|run| run.italic),
             mono: active.iter().any(|run| run.mono),
             muted: run_ranges
@@ -573,6 +768,14 @@ fn flatten_writ_runs(
                 .is_some_and(|range| range.start <= start && range.end >= end),
             underline: active.iter().any(|run| run.underline),
             strikethrough: active.iter().any(|run| run.strikethrough),
+            syntax_rgba: matches!(kind, MarkdownBlockKind::Code)
+                .then(|| {
+                    active.last().map(|run| {
+                        let color = run.color.to_rgba8();
+                        u32::from_be_bytes([color.r, color.g, color.b, color.a])
+                    })
+                })
+                .flatten(),
         };
         if let Some(previous) = result.last_mut()
             && same_markdown_style(previous, &next)
@@ -594,6 +797,7 @@ fn same_markdown_style(left: &MarkdownStyleRun, right: &MarkdownStyleRun) -> boo
         && left.hidden_bullet_marker == right.hidden_bullet_marker
         && left.underline == right.underline
         && left.strikethrough == right.strikethrough
+        && left.syntax_rgba == right.syntax_rgba
 }
 
 fn plain_style_run(len: usize) -> MarkdownStyleRun {
@@ -607,26 +811,32 @@ fn plain_style_run(len: usize) -> MarkdownStyleRun {
         hidden_bullet_marker: false,
         underline: false,
         strikethrough: false,
+        syntax_rgba: None,
     }
 }
 
 #[derive(Clone, Debug)]
 pub struct EditorLineLayout {
     pub bounds: Bounds<Pixels>,
-    pub wrapped_line: WrappedLine,
+    pub wrapped_line: Option<WrappedLine>,
     pub line_height: Pixels,
     pub source_line: Rc<SourceLine>,
 }
 
 impl EditorLineLayout {
     pub fn source_char_for_position(&self, position: gpui::Point<Pixels>) -> usize {
+        let Some(wrapped_line) = self.wrapped_line.as_ref() else {
+            let width = f32::from(self.bounds.size.width).max(1.0);
+            let x = f32::from(position.x - self.bounds.origin.x).clamp(0.0, width);
+            let local = ((x / width) * self.source_line.source_len_chars as f32).round() as usize;
+            return self.source_line.start_char + local.min(self.source_line.source_len_chars);
+        };
         let local_position = position - self.bounds.origin;
-        let byte = self
-            .wrapped_line
+        let byte = wrapped_line
             .closest_index_for_position(local_position, self.line_height)
             .unwrap_or_else(|index| index)
-            .min(self.wrapped_line.text.len());
-        let display_char = self.wrapped_line.text[..byte].chars().count();
+            .min(wrapped_line.text.len());
+        let display_char = wrapped_line.text[..byte].chars().count();
         self.source_line.start_char
             + self
                 .source_line
@@ -642,12 +852,20 @@ impl EditorLineLayout {
 
     fn point_for_source_char(&self, char_index: usize) -> gpui::Point<Pixels> {
         let local_source = char_index.saturating_sub(self.source_line.start_char);
+        let Some(wrapped_line) = self.wrapped_line.as_ref() else {
+            let fraction = local_source.min(self.source_line.source_len_chars) as f32
+                / self.source_line.source_len_chars.max(1) as f32;
+            return point(
+                self.bounds.origin.x + self.bounds.size.width * fraction,
+                self.bounds.origin.y,
+            );
+        };
         let display_char = self
             .source_line
             .presentation
             .display_char_for_source(local_source.min(self.source_line.source_len_chars));
-        let byte = char_to_byte(&self.wrapped_line.text, display_char);
-        self.wrapped_line
+        let byte = char_to_byte(&wrapped_line.text, display_char);
+        wrapped_line
             .position_for_index(byte, self.line_height)
             .map_or(self.bounds.origin, |position| self.bounds.origin + position)
     }
@@ -664,6 +882,7 @@ pub struct MarkdownLineElement {
     pub cursor_visible: bool,
     pub marker_color: gpui::Hsla,
     pub list_marker_color: gpui::Hsla,
+    pub mono_font_family: SharedString,
     pub cursor_color: gpui::Hsla,
     pub selection_color: gpui::Hsla,
 }
@@ -742,6 +961,7 @@ impl Element for MarkdownLineElement {
                         base_color,
                         self.marker_color,
                         self.list_marker_color,
+                        &self.mono_font_family,
                     )
                 })
                 .collect()
@@ -897,7 +1117,7 @@ impl Element for MarkdownLineElement {
         }
         let layout = EditorLineLayout {
             bounds,
-            wrapped_line: line,
+            wrapped_line: Some(line),
             line_height: prepaint.line_height,
             source_line: self.source_line.clone(),
         };
@@ -913,8 +1133,12 @@ fn text_run_from_markdown(
     base_color: gpui::Hsla,
     marker_color: gpui::Hsla,
     list_marker_color: gpui::Hsla,
+    mono_font_family: &SharedString,
 ) -> TextRun {
     let mut font = base_font.clone();
+    if run.mono {
+        font.family = mono_font_family.clone();
+    }
     if run.bold {
         font = font.bold();
     }
@@ -927,6 +1151,8 @@ fn text_run_from_markdown(
         list_marker_color
     } else if run.muted {
         marker_color
+    } else if let Some(syntax_rgba) = run.syntax_rgba {
+        rgba(syntax_rgba).into()
     } else {
         base_color
     };
@@ -1194,7 +1420,8 @@ mod tests {
 
     use super::{
         EditorSelection, LIST_BULLET_DIAMETER, MarkdownBlockKind, char_byte_boundaries,
-        char_to_byte, hidden_bullet_marker_range, source_lines, visual_row_byte_ranges,
+        char_to_byte, hidden_bullet_marker_range, source_lines, source_lines_with_mode,
+        visual_row_byte_ranges,
     };
 
     fn present_markdown_line(source: &str) -> super::MarkdownLinePresentation {
@@ -1212,6 +1439,7 @@ mod tests {
         assert_eq!(line.display_char_for_source(0), 0);
         assert_eq!(line.display_char_for_source(3), 0);
         assert_eq!(line.source_char_for_display(0), 0);
+        assert!(line.runs.iter().all(|run| !run.bold));
     }
 
     #[test]
@@ -1260,8 +1488,81 @@ mod tests {
                 .iter()
                 .all(|line| line.presentation.kind == MarkdownBlockKind::Code)
         );
-        assert!(lines[4].presentation.display.contains('│'));
-        assert!(!lines[4].presentation.display.contains('|'));
+        let header = lines[4]
+            .presentation
+            .table_row
+            .as_ref()
+            .expect("table header metadata");
+        let delimiter = lines[5]
+            .presentation
+            .table_row
+            .as_ref()
+            .expect("table delimiter metadata");
+        let body = lines[6]
+            .presentation
+            .table_row
+            .as_ref()
+            .expect("table body metadata");
+        assert_eq!(header.cells, ["A", "B"]);
+        assert_eq!(header.column_count, 2);
+        assert!(header.is_header && header.is_first);
+        assert!(delimiter.is_delimiter);
+        assert!(body.is_last && !body.is_header);
+        let opening = lines[8]
+            .presentation
+            .code_line
+            .expect("opening fence metadata");
+        let content = lines[9]
+            .presentation
+            .code_line
+            .expect("code content metadata");
+        let closing = lines[10]
+            .presentation
+            .code_line
+            .expect("closing fence metadata");
+        assert!(opening.is_fence && opening.is_opening_fence);
+        assert!(content.is_first_content && content.is_last_content);
+        assert!(closing.is_fence && closing.is_closing_fence);
+        assert!(lines[9].presentation.runs.iter().all(|run| run.mono));
+        assert!(
+            lines[9]
+                .presentation
+                .runs
+                .iter()
+                .any(|run| run.syntax_rgba.is_some())
+        );
+    }
+
+    #[test]
+    fn p3_quote_groups_expose_continuous_bar_boundaries() {
+        let lines = source_lines("cursor\n\n> first\n> second\n\nplain", 0, false);
+        let first = lines[2]
+            .presentation
+            .quote_line
+            .expect("first quote metadata");
+        let second = lines[3]
+            .presentation
+            .quote_line
+            .expect("second quote metadata");
+
+        assert!(first.is_first && !first.is_last);
+        assert!(!second.is_first && second.is_last);
+    }
+
+    #[test]
+    fn p3_source_mode_preserves_raw_markdown_and_identity_mapping() {
+        let lines = source_lines_with_mode("# 标题\n> quote\n```rust", 0, true, true);
+
+        assert_eq!(lines[0].presentation.display, "# 标题");
+        assert_eq!(lines[1].presentation.display, "> quote");
+        assert_eq!(lines[2].presentation.display, "```rust");
+        assert!(lines.iter().all(|line| {
+            line.presentation.kind == MarkdownBlockKind::Source
+                && line.presentation.table_row.is_none()
+                && line.presentation.code_line.is_none()
+        }));
+        assert_eq!(lines[0].presentation.display_char_for_source(3), 3);
+        assert_eq!(lines[1].presentation.source_char_for_display(4), 4);
     }
 
     #[test]
@@ -1281,7 +1582,12 @@ mod tests {
             true,
         );
 
-        assert_eq!(lines[4].presentation.display, "│ a | b │ ok │");
+        let row = lines[4]
+            .presentation
+            .table_row
+            .as_ref()
+            .expect("escaped table row metadata");
+        assert_eq!(row.cells, ["a | b", "ok"]);
     }
 
     #[test]

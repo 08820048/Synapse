@@ -21,10 +21,17 @@ pub enum Icon {
     Rename,
     Reveal,
     Trash,
+    ChevronRight,
+    Code,
+    RichText,
+    MoreVertical,
+    Download,
+    Copy,
+    CloseAll,
 }
 
 impl Icon {
-    const ALL: [Self; 16] = [
+    const ALL: [Self; 23] = [
         Self::Search,
         Self::Todo,
         Self::Bookmark,
@@ -41,6 +48,13 @@ impl Icon {
         Self::Rename,
         Self::Reveal,
         Self::Trash,
+        Self::ChevronRight,
+        Self::Code,
+        Self::RichText,
+        Self::MoreVertical,
+        Self::Download,
+        Self::Copy,
+        Self::CloseAll,
     ];
 
     pub fn path(self) -> &'static str {
@@ -61,6 +75,13 @@ impl Icon {
             Self::Rename => "lucide/pencil.svg",
             Self::Reveal => "lucide/folder-search.svg",
             Self::Trash => "lucide/trash-2.svg",
+            Self::ChevronRight => "lucide/chevron-right.svg",
+            Self::Code => "lucide/code-2.svg",
+            Self::RichText => "lucide/pilcrow.svg",
+            Self::MoreVertical => "lucide/ellipsis-vertical.svg",
+            Self::Download => "lucide/download.svg",
+            Self::Copy => "lucide/copy.svg",
+            Self::CloseAll => "lucide/circle-x.svg",
         }
     }
 
@@ -111,6 +132,23 @@ impl AssetSource for SynapseAssets {
             )),
             "lucide/trash-2.svg" => {
                 Some(include_bytes!("../../../assets/icons/lucide/trash-2.svg"))
+            }
+            "lucide/chevron-right.svg" => Some(include_bytes!(
+                "../../../assets/icons/lucide/chevron-right.svg"
+            )),
+            "lucide/code-2.svg" => Some(include_bytes!("../../../assets/icons/lucide/code-2.svg")),
+            "lucide/pilcrow.svg" => {
+                Some(include_bytes!("../../../assets/icons/lucide/pilcrow.svg"))
+            }
+            "lucide/ellipsis-vertical.svg" => Some(include_bytes!(
+                "../../../assets/icons/lucide/ellipsis-vertical.svg"
+            )),
+            "lucide/download.svg" => {
+                Some(include_bytes!("../../../assets/icons/lucide/download.svg"))
+            }
+            "lucide/copy.svg" => Some(include_bytes!("../../../assets/icons/lucide/copy.svg")),
+            "lucide/circle-x.svg" => {
+                Some(include_bytes!("../../../assets/icons/lucide/circle-x.svg"))
             }
             _ => None,
         };

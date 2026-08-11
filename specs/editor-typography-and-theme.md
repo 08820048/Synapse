@@ -21,8 +21,14 @@ Reference implementation: <https://github.com/starc007/markd>
 - Markdown source markers revealed on the active line MUST use the theme's muted foreground while semantic content remains the primary foreground; structural unordered-list markers remain WYSIWYG markers while editing.
 - Ordered and unordered list markers MUST use the theme's faint foreground in both source-edit and preview states.
 - Unordered-list glyphs emitted by writ MUST remain in the layout only as transparent mapping slots; GPUI MUST paint a separate 5px circular marker, optically shifted 0.5px upward, for `-`, `*`, and `+` source forms.
+- Thematic breaks MUST be painted as a full writing-column-width 1px divider using the theme line token, with 2em vertical margins, rather than a fixed-length text glyph sequence.
+- Inactive GFM table rows MUST render as equal-width cells with collapsed 1px theme borders, 6px vertical/10px horizontal padding, 0.95em text, and a panel-backed semibold header row; the delimiter source row MUST stay hidden.
+- Blockquotes MUST use a continuous, square-ended 2px `ink` left rule, 1em content inset, 0.8em vertical block margin, and muted quote text in both themes.
+- Heading text MUST inherit the theme `ink`; parser-provided bold runs MUST NOT override the editor's heading weight. H1-H4 MUST use Markd's 1.6/1.3/1.1/1.0em scale with weights 620/580/560/550, while H5-H6 inherit the 1em body size and normal weight.
+- Inactive fenced-code delimiters MUST be hidden. Code content MUST use the panel surface, 1px line-soft border, 8px outer radius, 14px vertical/16px horizontal padding, 0.86em monospace text, and writ/tree-sitter syntax colors.
 - Cursor and selection colors MUST come from the active component theme rather than fixed dark-mode colors.
-- The writing canvas and sidebar MUST use distinct surfaces in both light and dark modes.
+- The writing canvas and sidebar MUST use distinct surfaces in both light and dark modes. In light mode the sidebar MUST be `#f4f4f2`, the writing canvas MUST be `#fbfbfa`, inactive document tabs MUST be `#e9e9e6`, and the active document tab MUST merge into the `#fbfbfa` writing canvas. In dark mode the corresponding surfaces MUST be `#151515`, `#1a1a1a`, `#0f0f0f`, and `#1a1a1a`.
+- Destructive context-menu rows MUST use the same borderless ghost structure as ordinary menu rows; danger color is limited to their icon and label, with no outlined button treatment.
 - Appearance settings MUST offer System, Light, and Dark modes.
 - System mode MUST react to GPUI window appearance changes while the application is running.
 - The selected preference MUST persist in the operating system's user configuration directory and be restored on the next launch.
@@ -33,6 +39,8 @@ Reference implementation: <https://github.com/starc007/markd>
 |---|---|---|
 | Writing canvas | `#fbfbfa` | `#1a1a1a` |
 | Sidebar/panel | `#f4f4f2` | `#151515` |
+| Inactive document tab | `#e9e9e6` | `#0f0f0f` |
+| Active document tab | `#fbfbfa` | `#1a1a1a` |
 | Sunken surface | `#e9e9e6` | `#0f0f0f` |
 | Primary text | `#191919` | `#ebebe8` |
 | Muted text | `#6e6e6a` | `#8f8f8a` |
@@ -49,8 +57,16 @@ Reference implementation: <https://github.com/starc007/markd>
 - No numeric gutter is visible to the left of note content.
 - Moving the caret into a Markdown-formatted line reveals its source markers in muted gray without dimming the content itself, except for structural unordered-list markers that stay in WYSIWYG form.
 - Ordered and unordered list markers remain faint in all editor states; every unordered source form uses the same independently painted 5px disc instead of a font-dependent Unicode bullet.
+- Thematic breaks span the same inner width as surrounding note content at every editor width and use the light/dark theme divider color.
+- GFM table headers, bodies, escaped pipes, column completion, and active-row source fallback render without changing the saved Markdown.
+- Consecutive quote lines share an unbroken 2px rule whose color is dark in light mode and bright in dark mode; the rule has no rounded ends.
+- H1-H6 all use the same theme ink while retaining the specified size/weight hierarchy; no heading TextRun is promoted to 700 by writ.
+- Rust and other supported fenced languages render inside one visually continuous code surface, hide inactive fences, preserve raw code, and show more than one syntax color where the highlighter provides captures.
 - Settings opens an Appearance dialog; each of System, Light, and Dark changes the complete component theme immediately.
 - Sidebar and editor surfaces remain visibly distinct in all theme modes.
+- In light mode, inactive tabs use `#e9e9e6`; selecting a tab changes it to the editor canvas color `#fbfbfa` while the sidebar remains `#f4f4f2`.
+- In dark mode, inactive tabs use `#0f0f0f`; selecting a tab changes it to the editor canvas color `#1a1a1a` while the sidebar remains `#151515`.
+- Delete Folder, Move to Trash, and Delete Note remain danger-colored but have no visible button border in their menus.
 - Existing IME, mouse positioning, selection, clipboard, soft wrap, and save tests continue to pass.
 
 ## Validation boundary
