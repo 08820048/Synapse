@@ -15,7 +15,7 @@ use std::{
 use gpui::{
     AnyElement, App, Application, Bounds, ClickEvent, ClipboardEntry, ClipboardItem, Context,
     Corner, CursorStyle, ElementInputHandler, Entity, FocusHandle, Focusable, FontWeight, Hsla,
-    Image, ImageFormat, ImageSource, KeyBinding, ListAlignment, ListState, MouseButton,
+    Image, ImageFormat, ImageSource, KeyBinding, ListAlignment, ListOffset, ListState, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, PathPromptOptions, Pixels, Point,
     SharedString, StyledImage as _, TitlebarOptions, Window, WindowBounds, WindowControlArea,
     WindowOptions, actions, anchored, canvas, deferred, div, hsla, img, list, point, prelude::*,
@@ -34,6 +34,7 @@ use gpui_component::{
 use synapse::ShellState;
 use synapse_core::{VaultEntry, VaultEntryKind};
 
+mod document_outline;
 mod editor_blink;
 mod editor_surface;
 mod http_client;
@@ -41,6 +42,11 @@ mod icons;
 mod inline_rename;
 mod math_renderer;
 
+use document_outline::{
+    DocumentOutlineEntry, active_document_outline_index, build_document_outline,
+    document_outline_horizontal_layout, document_outline_is_visible, document_outline_layout,
+    render_document_outline,
+};
 use editor_blink::CursorBlinkState;
 use editor_surface::{
     EditorLineLayout, EditorSelection, MarkdownBlockKind, MarkdownCalloutKind, MarkdownImage,
@@ -494,6 +500,8 @@ struct SynapseApp {
     editor_selection: EditorSelection,
     editor_line_layouts: Rc<RefCell<Vec<Option<EditorLineLayout>>>>,
     editor_list_state: ListState,
+    editor_visible_range: Range<usize>,
+    editor_outline_hovered_index: Option<usize>,
     editor_render_cache: Option<EditorRenderCache>,
     editor_blink: CursorBlinkState,
     markdown_source_mode: bool,
@@ -507,6 +515,7 @@ struct EditorRenderCache {
     dark_mode: bool,
     source_mode: bool,
     lines: Rc<Vec<Rc<SourceLine>>>,
+    outline: Rc<Vec<DocumentOutlineEntry>>,
     mermaid_previews: Rc<BTreeMap<usize, MermaidPreview>>,
     math_previews: Rc<BTreeMap<usize, MathPreview>>,
     image_previews: Rc<BTreeMap<usize, MarkdownImagePreview>>,
@@ -561,6 +570,12 @@ impl EditorRenderCache {
             && self.relative_path == relative_path
             && self.revision == revision
             && self.dark_mode == dark_mode
+    }
+
+    fn can_reuse_outline(&self, vault_root: &Path, relative_path: &Path, revision: u64) -> bool {
+        self.vault_root == vault_root
+            && self.relative_path == relative_path
+            && self.revision == revision
     }
 
     fn can_reuse_math_previews(
@@ -1604,6 +1619,22 @@ impl SynapseApp {
 
     fn editor_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, _: &mut Context<Self>) {
         self.editor_selection.finish_drag();
+    }
+
+    fn set_editor_outline_hovered(&mut self, hovered_index: Option<usize>, cx: &mut Context<Self>) {
+        if self.editor_outline_hovered_index != hovered_index {
+            self.editor_outline_hovered_index = hovered_index;
+            cx.notify();
+        }
+    }
+
+    fn jump_to_editor_outline(&mut self, line_index: usize, cx: &mut Context<Self>) {
+        self.editor_list_state.scroll_to(ListOffset {
+            item_ix: line_index,
+            offset_in_item: px(0.0),
+        });
+        self.editor_visible_range = line_index..line_index.saturating_add(1);
+        cx.notify();
     }
 
     fn restart_editor_cursor_blink(&mut self, cx: &mut Context<Self>) {
@@ -2876,6 +2907,16 @@ impl Render for SynapseApp {
         let active_tab = self.state.active_tab_index();
         let no_vault_open = self.state.vault_name.is_none();
         let viewport_width = f32::from(window.viewport_size().width);
+        let viewport_height = f32::from(window.viewport_size().height);
+        let editor_viewport_height =
+            (viewport_height - TITLEBAR_HEIGHT - EDITOR_TOOLBAR_HEIGHT).max(0.0);
+        let editor_viewport_width = (viewport_width
+            - if self.left_sidebar_open {
+                SIDEBAR_WIDTH
+            } else {
+                0.0
+            })
+        .max(0.0);
         let editor_horizontal_gutter =
             editor_horizontal_gutter(viewport_width, self.left_sidebar_open);
         let editor_page_content_width = editor_page_content_width(
@@ -2884,247 +2925,291 @@ impl Render for SynapseApp {
             editor_horizontal_gutter,
         );
 
-        let editor_body =
-            if let Some(document) = self.state.active_document() {
-                let cursor = self.state.cursor();
-                let vault_root = self
-                    .state
-                    .vault_root()
-                    .map_or_else(PathBuf::new, Path::to_path_buf);
-                let relative_path = document.relative_path().to_path_buf();
-                let revision = document.revision();
-                let document_len = document.len_chars();
-                let dark_mode = theme.is_dark();
-                let source_mode = self.markdown_source_mode;
-                let cache_hit = self.editor_render_cache.as_ref().is_some_and(|cache| {
-                    cache.matches(
-                        &vault_root,
-                        &relative_path,
-                        revision,
-                        cursor,
-                        dark_mode,
-                        source_mode,
-                    )
-                });
-                let (lines, mermaid_previews, math_previews, image_previews) = if cache_hit {
-                    let cache = self
-                        .editor_render_cache
-                        .as_ref()
-                        .expect("cache hit requires an editor render cache");
-                    (
-                        cache.lines.clone(),
-                        cache.mermaid_previews.clone(),
-                        cache.math_previews.clone(),
-                        cache.image_previews.clone(),
-                    )
-                } else {
-                    let previous_lines = self
-                        .editor_render_cache
-                        .as_ref()
-                        .filter(|cache| {
-                            cache.vault_root == vault_root && cache.relative_path == relative_path
-                        })
-                        .map(|cache| cache.lines.clone());
-                    let previous_mermaid_previews = self
-                        .editor_render_cache
-                        .as_ref()
-                        .filter(|cache| {
-                            cache.can_reuse_mermaid_previews(
-                                &vault_root,
-                                &relative_path,
-                                revision,
-                                dark_mode,
-                                source_mode,
-                            )
-                        })
-                        .map(|cache| cache.mermaid_previews.clone());
-                    let previous_math_previews = self
-                        .editor_render_cache
-                        .as_ref()
-                        .filter(|cache| {
-                            cache.can_reuse_math_previews(
-                                &vault_root,
-                                &relative_path,
-                                revision,
-                                dark_mode,
-                                source_mode,
-                            )
-                        })
-                        .map(|cache| cache.math_previews.clone());
-                    let previous_image_previews = self
-                        .editor_render_cache
-                        .as_ref()
-                        .filter(|cache| {
-                            cache.can_reuse_image_previews(
-                                &vault_root,
-                                &relative_path,
-                                revision,
-                                source_mode,
-                            )
-                        })
-                        .map(|cache| cache.image_previews.clone());
-                    let text = document.text();
-                    let parsed_lines = if source_mode {
-                        source_lines_with_mode(&text, cursor, dark_mode, true)
-                    } else {
-                        source_lines(&text, cursor, dark_mode)
-                    };
-                    let parsed = Rc::new(parsed_lines.into_iter().map(Rc::new).collect::<Vec<_>>());
-                    if let Some(previous_lines) = previous_lines {
-                        if let Some((old_range, new_count)) =
-                            changed_line_span(&previous_lines, &parsed)
-                        {
-                            self.editor_list_state.splice(old_range.clone(), new_count);
-                            self.editor_line_layouts
-                                .borrow_mut()
-                                .splice(old_range, (0..new_count).map(|_| None));
-                        }
-                    } else {
-                        self.editor_list_state.reset(parsed.len());
-                        *self.editor_line_layouts.borrow_mut() =
-                            (0..parsed.len()).map(|_| None).collect();
-                    }
-                    let mermaid_previews = if source_mode {
-                        Rc::new(BTreeMap::new())
-                    } else {
-                        previous_mermaid_previews
-                            .unwrap_or_else(|| build_mermaid_previews(&parsed, dark_mode))
-                    };
-                    let math_previews = if source_mode {
-                        Rc::new(BTreeMap::new())
-                    } else {
-                        previous_math_previews
-                            .unwrap_or_else(|| build_math_previews(&parsed, dark_mode))
-                    };
-                    let image_previews = if source_mode {
-                        Rc::new(BTreeMap::new())
-                    } else {
-                        previous_image_previews.unwrap_or_else(|| {
-                            build_image_previews(&parsed, &vault_root, &relative_path)
-                        })
-                    };
-                    self.editor_render_cache = Some(EditorRenderCache {
-                        vault_root,
-                        relative_path,
-                        revision,
-                        cursor,
-                        dark_mode,
-                        source_mode,
-                        lines: parsed.clone(),
-                        mermaid_previews: mermaid_previews.clone(),
-                        math_previews: math_previews.clone(),
-                        image_previews: image_previews.clone(),
-                    });
-                    (parsed, mermaid_previews, math_previews, image_previews)
-                };
-                self.editor_selection.clamp(document_len);
-                let selection = self.editor_selection.range();
-                if self.editor_line_layouts.borrow().len() != lines.len() {
-                    self.editor_line_layouts
-                        .borrow_mut()
-                        .resize_with(lines.len(), || None);
-                }
-                let app = cx.entity();
-                let line_layouts = self.editor_line_layouts.clone();
-                div()
-                    .id("editor-content")
-                    .flex_1()
-                    .min_w(px(0.0))
-                    .track_focus(&self.editor_focus)
-                    .key_context("SynapseEditor")
-                    .on_action(cx.listener(Self::save))
-                    .on_action(cx.listener(Self::backspace))
-                    .on_action(cx.listener(Self::delete_forward))
-                    .on_action(cx.listener(Self::move_left))
-                    .on_action(cx.listener(Self::move_right))
-                    .on_action(cx.listener(Self::move_up))
-                    .on_action(cx.listener(Self::move_down))
-                    .on_action(cx.listener(Self::move_home))
-                    .on_action(cx.listener(Self::move_end))
-                    .on_action(cx.listener(Self::select_left))
-                    .on_action(cx.listener(Self::select_right))
-                    .on_action(cx.listener(Self::select_up))
-                    .on_action(cx.listener(Self::select_down))
-                    .on_action(cx.listener(Self::select_home))
-                    .on_action(cx.listener(Self::select_end))
-                    .on_action(cx.listener(Self::select_all))
-                    .on_action(cx.listener(Self::copy))
-                    .on_action(cx.listener(Self::cut))
-                    .on_action(cx.listener(Self::paste))
-                    .on_action(cx.listener(Self::insert_newline))
-                    .on_action(cx.listener(Self::insert_raw_newline))
-                    .on_mouse_down(MouseButton::Left, cx.listener(Self::editor_mouse_down))
-                    .on_mouse_move(cx.listener(Self::editor_mouse_move))
-                    .on_mouse_up(MouseButton::Left, cx.listener(Self::editor_mouse_up))
-                    .on_mouse_up_out(MouseButton::Left, cx.listener(Self::editor_mouse_up))
-                    .child(
-                        list(self.editor_list_state.clone(), {
-                            let lines = lines.clone();
-                            let row_context = EditorRowContext {
-                                line_count: lines.len(),
-                                app,
-                                line_layouts,
-                                cursor,
-                                selection,
-                                cursor_visible: self.editor_blink.visible(),
-                                horizontal_gutter: editor_horizontal_gutter,
-                                page_content_width: editor_page_content_width,
-                                mermaid_previews,
-                                math_previews,
-                                image_previews,
-                            };
-                            move |index, _, cx| {
-                                render_editor_row(index, lines[index].clone(), &row_context, cx)
-                            }
-                        })
-                        .size_full(),
-                    )
-                    .into_any_element()
+        let editor_body = if let Some(document) = self.state.active_document() {
+            let cursor = self.state.cursor();
+            let vault_root = self
+                .state
+                .vault_root()
+                .map_or_else(PathBuf::new, Path::to_path_buf);
+            let relative_path = document.relative_path().to_path_buf();
+            let revision = document.revision();
+            let document_len = document.len_chars();
+            let dark_mode = theme.is_dark();
+            let source_mode = self.markdown_source_mode;
+            let cache_hit = self.editor_render_cache.as_ref().is_some_and(|cache| {
+                cache.matches(
+                    &vault_root,
+                    &relative_path,
+                    revision,
+                    cursor,
+                    dark_mode,
+                    source_mode,
+                )
+            });
+            let (lines, outline, mermaid_previews, math_previews, image_previews) = if cache_hit {
+                let cache = self
+                    .editor_render_cache
+                    .as_ref()
+                    .expect("cache hit requires an editor render cache");
+                (
+                    cache.lines.clone(),
+                    cache.outline.clone(),
+                    cache.mermaid_previews.clone(),
+                    cache.math_previews.clone(),
+                    cache.image_previews.clone(),
+                )
             } else {
-                let center_message = self.state.vault_error.as_deref().unwrap_or(
-                    if self.state.vault_name.is_some() {
+                let previous_lines = self
+                    .editor_render_cache
+                    .as_ref()
+                    .filter(|cache| {
+                        cache.vault_root == vault_root && cache.relative_path == relative_path
+                    })
+                    .map(|cache| cache.lines.clone());
+                let previous_mermaid_previews = self
+                    .editor_render_cache
+                    .as_ref()
+                    .filter(|cache| {
+                        cache.can_reuse_mermaid_previews(
+                            &vault_root,
+                            &relative_path,
+                            revision,
+                            dark_mode,
+                            source_mode,
+                        )
+                    })
+                    .map(|cache| cache.mermaid_previews.clone());
+                let previous_outline = self
+                    .editor_render_cache
+                    .as_ref()
+                    .filter(|cache| cache.can_reuse_outline(&vault_root, &relative_path, revision))
+                    .map(|cache| cache.outline.clone());
+                let previous_math_previews = self
+                    .editor_render_cache
+                    .as_ref()
+                    .filter(|cache| {
+                        cache.can_reuse_math_previews(
+                            &vault_root,
+                            &relative_path,
+                            revision,
+                            dark_mode,
+                            source_mode,
+                        )
+                    })
+                    .map(|cache| cache.math_previews.clone());
+                let previous_image_previews = self
+                    .editor_render_cache
+                    .as_ref()
+                    .filter(|cache| {
+                        cache.can_reuse_image_previews(
+                            &vault_root,
+                            &relative_path,
+                            revision,
+                            source_mode,
+                        )
+                    })
+                    .map(|cache| cache.image_previews.clone());
+                let text = document.text();
+                let parsed_lines = if source_mode {
+                    source_lines_with_mode(&text, cursor, dark_mode, true)
+                } else {
+                    source_lines(&text, cursor, dark_mode)
+                };
+                let parsed = Rc::new(parsed_lines.into_iter().map(Rc::new).collect::<Vec<_>>());
+                if let Some(previous_lines) = previous_lines {
+                    if let Some((old_range, new_count)) =
+                        changed_line_span(&previous_lines, &parsed)
+                    {
+                        self.editor_list_state.splice(old_range.clone(), new_count);
+                        self.editor_line_layouts
+                            .borrow_mut()
+                            .splice(old_range, (0..new_count).map(|_| None));
+                    }
+                } else {
+                    self.editor_list_state.reset(parsed.len());
+                    *self.editor_line_layouts.borrow_mut() =
+                        (0..parsed.len()).map(|_| None).collect();
+                    self.editor_visible_range = 0..0;
+                    self.editor_outline_hovered_index = None;
+                }
+                let outline = previous_outline
+                    .unwrap_or_else(|| Rc::new(build_document_outline(&text, dark_mode)));
+                let mermaid_previews = if source_mode {
+                    Rc::new(BTreeMap::new())
+                } else {
+                    previous_mermaid_previews
+                        .unwrap_or_else(|| build_mermaid_previews(&parsed, dark_mode))
+                };
+                let math_previews = if source_mode {
+                    Rc::new(BTreeMap::new())
+                } else {
+                    previous_math_previews
+                        .unwrap_or_else(|| build_math_previews(&parsed, dark_mode))
+                };
+                let image_previews = if source_mode {
+                    Rc::new(BTreeMap::new())
+                } else {
+                    previous_image_previews.unwrap_or_else(|| {
+                        build_image_previews(&parsed, &vault_root, &relative_path)
+                    })
+                };
+                self.editor_render_cache = Some(EditorRenderCache {
+                    vault_root,
+                    relative_path,
+                    revision,
+                    cursor,
+                    dark_mode,
+                    source_mode,
+                    lines: parsed.clone(),
+                    outline: outline.clone(),
+                    mermaid_previews: mermaid_previews.clone(),
+                    math_previews: math_previews.clone(),
+                    image_previews: image_previews.clone(),
+                });
+                (
+                    parsed,
+                    outline,
+                    mermaid_previews,
+                    math_previews,
+                    image_previews,
+                )
+            };
+            self.editor_selection.clamp(document_len);
+            let selection = self.editor_selection.range();
+            if self.editor_line_layouts.borrow().len() != lines.len() {
+                self.editor_line_layouts
+                    .borrow_mut()
+                    .resize_with(lines.len(), || None);
+            }
+            let app = cx.entity();
+            let line_layouts = self.editor_line_layouts.clone();
+            let outline_horizontal_layout = document_outline_horizontal_layout(
+                editor_viewport_width,
+                editor_page_content_width,
+            );
+            let outline_visible =
+                document_outline_is_visible(outline.len(), outline_horizontal_layout);
+            let outline_layout = document_outline_layout(editor_viewport_height, outline.len());
+            let active_outline_index =
+                active_document_outline_index(&outline, self.editor_visible_range.start);
+            let hovered_outline_index = self
+                .editor_outline_hovered_index
+                .filter(|index| *index < outline.len());
+            let outline_element = outline_visible.then(|| {
+                render_document_outline(
+                    outline.clone(),
+                    active_outline_index,
+                    hovered_outline_index,
+                    outline_layout,
+                    outline_horizontal_layout
+                        .expect("visible document outline requires horizontal layout"),
+                    synapse_theme_palette(dark_mode),
+                    cx,
+                )
+            });
+            div()
+                .id("editor-content")
+                .relative()
+                .flex_1()
+                .min_w(px(0.0))
+                .track_focus(&self.editor_focus)
+                .key_context("SynapseEditor")
+                .on_action(cx.listener(Self::save))
+                .on_action(cx.listener(Self::backspace))
+                .on_action(cx.listener(Self::delete_forward))
+                .on_action(cx.listener(Self::move_left))
+                .on_action(cx.listener(Self::move_right))
+                .on_action(cx.listener(Self::move_up))
+                .on_action(cx.listener(Self::move_down))
+                .on_action(cx.listener(Self::move_home))
+                .on_action(cx.listener(Self::move_end))
+                .on_action(cx.listener(Self::select_left))
+                .on_action(cx.listener(Self::select_right))
+                .on_action(cx.listener(Self::select_up))
+                .on_action(cx.listener(Self::select_down))
+                .on_action(cx.listener(Self::select_home))
+                .on_action(cx.listener(Self::select_end))
+                .on_action(cx.listener(Self::select_all))
+                .on_action(cx.listener(Self::copy))
+                .on_action(cx.listener(Self::cut))
+                .on_action(cx.listener(Self::paste))
+                .on_action(cx.listener(Self::insert_newline))
+                .on_action(cx.listener(Self::insert_raw_newline))
+                .on_mouse_down(MouseButton::Left, cx.listener(Self::editor_mouse_down))
+                .on_mouse_move(cx.listener(Self::editor_mouse_move))
+                .on_mouse_up(MouseButton::Left, cx.listener(Self::editor_mouse_up))
+                .on_mouse_up_out(MouseButton::Left, cx.listener(Self::editor_mouse_up))
+                .child(
+                    list(self.editor_list_state.clone(), {
+                        let lines = lines.clone();
+                        let row_context = EditorRowContext {
+                            line_count: lines.len(),
+                            app,
+                            line_layouts,
+                            cursor,
+                            selection,
+                            cursor_visible: self.editor_blink.visible(),
+                            horizontal_gutter: editor_horizontal_gutter,
+                            page_content_width: editor_page_content_width,
+                            mermaid_previews,
+                            math_previews,
+                            image_previews,
+                        };
+                        move |index, _, cx| {
+                            render_editor_row(index, lines[index].clone(), &row_context, cx)
+                        }
+                    })
+                    .size_full(),
+                )
+                .when_some(outline_element, |editor, outline| editor.child(outline))
+                .into_any_element()
+        } else {
+            let center_message =
+                self.state
+                    .vault_error
+                    .as_deref()
+                    .unwrap_or(if self.state.vault_name.is_some() {
                         "Select a note from the file tree"
                     } else {
                         "Choose a local folder to start writing"
-                    },
-                );
-                div()
-                    .flex_1()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .items_center()
-                            .gap_3()
-                            .px_6()
-                            .py_4()
-                            .text_sm()
-                            .text_color(if self.state.vault_error.is_some() {
-                                theme.danger
-                            } else {
-                                theme.muted_foreground
-                            })
-                            .child(center_message.to_owned())
-                            .when(no_vault_open, |view| {
-                                let app = app_entity.clone();
-                                view.child(
-                                    Button::new("open-vault-empty-state")
-                                        .primary()
-                                        .large()
-                                        .label("Open Vault")
-                                        .on_click(move |_, _, cx| {
-                                            app.update(cx, |this, cx| {
-                                                this.prompt_for_vault(cx);
-                                            });
-                                        }),
-                                )
-                            }),
-                    )
-                    .into_any_element()
-            };
+                    });
+            div()
+                .flex_1()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .gap_3()
+                        .px_6()
+                        .py_4()
+                        .text_sm()
+                        .text_color(if self.state.vault_error.is_some() {
+                            theme.danger
+                        } else {
+                            theme.muted_foreground
+                        })
+                        .child(center_message.to_owned())
+                        .when(no_vault_open, |view| {
+                            let app = app_entity.clone();
+                            view.child(
+                                Button::new("open-vault-empty-state")
+                                    .primary()
+                                    .large()
+                                    .label("Open Vault")
+                                    .on_click(move |_, _, cx| {
+                                        app.update(cx, |this, cx| {
+                                            this.prompt_for_vault(cx);
+                                        });
+                                    }),
+                            )
+                        }),
+                )
+                .into_any_element()
+        };
 
         let tab_app = app_entity.clone();
         let tab_border = theme.border;
@@ -4814,18 +4899,6 @@ fn main() {
                     });
                     let editor_line_layouts = Rc::new(RefCell::new(Vec::new()));
                     let editor_list_state = ListState::new(0, ListAlignment::Top, px(320.0));
-                    editor_list_state.set_scroll_handler({
-                        let editor_line_layouts = editor_line_layouts.clone();
-                        move |event, _, _| {
-                            for (index, layout) in
-                                editor_line_layouts.borrow_mut().iter_mut().enumerate()
-                            {
-                                if !event.visible_range.contains(&index) {
-                                    *layout = None;
-                                }
-                            }
-                        }
-                    });
                     let app = cx.new(|cx| SynapseApp {
                         state,
                         editor_focus: cx.focus_handle(),
@@ -4848,11 +4921,33 @@ fn main() {
                         collapsed_directories: BTreeSet::new(),
                         editor_marked_range: None,
                         editor_selection: EditorSelection::collapsed(0),
-                        editor_line_layouts,
-                        editor_list_state,
+                        editor_line_layouts: editor_line_layouts.clone(),
+                        editor_list_state: editor_list_state.clone(),
+                        editor_visible_range: 0..0,
+                        editor_outline_hovered_index: None,
                         editor_render_cache: None,
                         editor_blink: CursorBlinkState::default(),
                         markdown_source_mode: false,
+                    });
+                    editor_list_state.set_scroll_handler({
+                        let editor_line_layouts = editor_line_layouts.clone();
+                        let app = app.downgrade();
+                        move |event, _, cx| {
+                            for (index, layout) in
+                                editor_line_layouts.borrow_mut().iter_mut().enumerate()
+                            {
+                                if !event.visible_range.contains(&index) {
+                                    *layout = None;
+                                }
+                            }
+                            let visible_range = event.visible_range.clone();
+                            let _ = app.update(cx, |this, cx| {
+                                if this.editor_visible_range != visible_range {
+                                    this.editor_visible_range = visible_range;
+                                    cx.notify();
+                                }
+                            });
+                        }
                     });
                     app.update(cx, |app, cx| {
                         app.restart_editor_cursor_blink(cx);
@@ -4885,20 +4980,23 @@ mod tests {
     use synapse_core::{VaultEntry, VaultEntryKind};
     use tempfile::tempdir;
 
+    use super::document_outline::{css_cubic_bezier_0201, document_outline_tick_style};
+
     use super::{
         EDITOR_BODY_FONT_SIZE, EDITOR_BODY_LINE_HEIGHT, EDITOR_COMPACT_GUTTER,
         EDITOR_PAGE_MAX_WIDTH, EDITOR_REGULAR_GUTTER, EDITOR_RULE_BLOCK_HEIGHT,
         EDITOR_RULE_THICKNESS, EDITOR_TOP_PADDING, EDITOR_WIDE_GUTTER, FileTreeRow,
         MENU_ITEM_ICON_SIZE, MENU_ITEM_ICON_SLOT_SIZE, MarkdownImagePreview, SIDEBAR_FOOTER_HEIGHT,
         TABLE_CELL_HORIZONTAL_PADDING, TABLE_CELL_VERTICAL_PADDING, TABLE_FONT_SIZE,
-        TABLE_ROW_MIN_HEIGHT, TITLEBAR_HEIGHT, ThemePreference, build_file_tree_rows,
-        build_image_previews, build_math_previews, build_mermaid_previews, changed_line_span,
-        clipboard_image_extension, code_block_edges, command_palette_key_bindings,
-        default_window_size, editor_horizontal_gutter, editor_page_content_width,
-        file_manager_reveal_command, is_tab_context_trigger, normalize_clipboard_text,
-        note_breadcrumb_parts, persist_clipboard_image, resolve_markdown_image, source_lines,
-        synapse_mermaid_theme, synapse_theme_palette, synapse_titlebar_options,
-        titlebar_left_inset,
+        TABLE_ROW_MIN_HEIGHT, TITLEBAR_HEIGHT, ThemePreference, active_document_outline_index,
+        build_document_outline, build_file_tree_rows, build_image_previews, build_math_previews,
+        build_mermaid_previews, changed_line_span, clipboard_image_extension, code_block_edges,
+        command_palette_key_bindings, default_window_size, document_outline_horizontal_layout,
+        document_outline_is_visible, document_outline_layout, editor_horizontal_gutter,
+        editor_page_content_width, file_manager_reveal_command, is_tab_context_trigger,
+        normalize_clipboard_text, note_breadcrumb_parts, persist_clipboard_image,
+        resolve_markdown_image, source_lines, synapse_mermaid_theme, synapse_theme_palette,
+        synapse_titlebar_options, titlebar_left_inset,
     };
 
     #[test]
@@ -4914,6 +5012,100 @@ mod tests {
         assert_eq!(EDITOR_BODY_FONT_SIZE, 16.0);
         assert_eq!(EDITOR_BODY_LINE_HEIGHT, 26.4);
         assert_eq!(editor_page_content_width(900.0, true, 16.0), 620.0);
+    }
+
+    #[test]
+    fn document_outline_extracts_only_rendered_h1_through_h3() {
+        let outline = build_document_outline(
+            concat!(
+                "# 总览\n",
+                "正文\n",
+                "## **架构**\n",
+                "### [导航](https://example.com)\n",
+                "#### 忽略四级标题\n",
+                "```md\n",
+                "# 代码块标题\n",
+                "```\n",
+                "Setext 小节\n",
+                "---",
+            ),
+            false,
+        );
+
+        assert_eq!(
+            outline
+                .iter()
+                .map(|entry| (entry.line_index, entry.level, entry.title.as_ref()))
+                .collect::<Vec<_>>(),
+            vec![
+                (0, 1, "总览"),
+                (2, 2, "架构"),
+                (3, 3, "导航"),
+                (8, 2, "Setext 小节"),
+            ]
+        );
+    }
+
+    #[test]
+    fn document_outline_active_section_tracks_the_last_passed_heading() {
+        let outline = build_document_outline("# A\ntext\n## B\ntext\n### C", false);
+
+        assert_eq!(active_document_outline_index(&outline, 0), Some(0));
+        assert_eq!(active_document_outline_index(&outline, 1), Some(0));
+        assert_eq!(active_document_outline_index(&outline, 2), Some(1));
+        assert_eq!(active_document_outline_index(&outline, usize::MAX), Some(2));
+        assert_eq!(active_document_outline_index(&[], 0), None);
+    }
+
+    #[test]
+    fn document_outline_ticks_follow_the_reference_magnetic_decay() {
+        assert_eq!(
+            document_outline_tick_style(Some(4), 4, Some(0)),
+            (27.52, 2.0, 1.0, true)
+        );
+        assert_eq!(
+            document_outline_tick_style(Some(4), 3, Some(0)),
+            (18.88, 1.5, 0.72, false)
+        );
+        assert_eq!(
+            document_outline_tick_style(Some(4), 2, Some(0)),
+            (12.16, 1.5, 0.52, false)
+        );
+        assert_eq!(
+            document_outline_tick_style(Some(4), 1, Some(0)),
+            (6.08, 1.5, 0.36, false)
+        );
+        assert_eq!(
+            document_outline_tick_style(None, 1, Some(1)),
+            (6.08, 1.5, 1.0, true)
+        );
+    }
+
+    #[test]
+    fn document_outline_layout_and_easing_stay_bounded_and_interruptible() {
+        let compact = document_outline_layout(800.0, 8);
+        let dense = document_outline_layout(800.0, 100);
+
+        assert!(compact.top > 0.0);
+        assert_eq!(compact.item_height, 8.8);
+        assert!(dense.height <= 576.0);
+        assert!(dense.item_height >= 4.0);
+        let default_layout = document_outline_horizontal_layout(1561.0, 1056.0)
+            .expect("default editor has a usable right-side gutter");
+        assert_eq!(default_layout.left, 1324.5);
+        assert_eq!(default_layout.tooltip_left, 48.0);
+        assert_eq!(default_layout.tooltip_width, 180.5);
+        assert!(default_layout.left > (1561.0 + 1056.0) * 0.5);
+        assert!(document_outline_is_visible(2, Some(default_layout)));
+        assert!(!document_outline_is_visible(1, Some(default_layout)));
+        assert_eq!(document_outline_horizontal_layout(1280.0, 1056.0), None);
+        let wide_layout = document_outline_horizontal_layout(1809.0, 1056.0)
+            .expect("wide editor fits the full title card outside the content");
+        assert_eq!(wide_layout.left, 1448.5);
+        assert_eq!(wide_layout.tooltip_width, 224.0);
+        assert_eq!(css_cubic_bezier_0201(0.0), 0.0);
+        assert_eq!(css_cubic_bezier_0201(1.0), 1.0);
+        assert!(css_cubic_bezier_0201(0.5) > 0.5);
     }
 
     #[test]
@@ -5183,6 +5375,7 @@ mod tests {
             dark_mode: true,
             source_mode: false,
             lines: Rc::new(Vec::new()),
+            outline: Rc::new(Vec::new()),
             mermaid_previews: Rc::new(Default::default()),
             math_previews: Rc::new(Default::default()),
             image_previews: Rc::new(Default::default()),
@@ -5195,6 +5388,8 @@ mod tests {
             true,
             false,
         ));
+        assert!(cache.can_reuse_outline(Path::new("/vault"), Path::new("diagram.md"), 7));
+        assert!(!cache.can_reuse_outline(Path::new("/vault"), Path::new("diagram.md"), 8));
         assert!(!cache.can_reuse_mermaid_previews(
             Path::new("/vault"),
             Path::new("diagram.md"),
