@@ -15,6 +15,11 @@ gpui-animation = "=0.2.63"
 gpui-component = { path = "vendor/gpui-component" }
 gpui-component-assets = "=0.5.1"
 ropey = "=1.6.1"
+ratex-layout = "=0.1.14"
+ratex-parser = "=0.1.14"
+ratex-svg = { version = "=0.1.14", features = ["embed-fonts"] }
+ratex-types = "=0.1.14"
+rusty-mermaid = { version = "=0.2.0", features = ["svg"] }
 synapse-core = { path = "crates/synapse-core" }
 trash = "=5.2.6"
 writ = { version = "=0.18.1", default-features = false }

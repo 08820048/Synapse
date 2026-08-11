@@ -1,22 +1,23 @@
 use std::{
     cell::RefCell,
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     ffi::OsString,
     fs, io,
     ops::Range,
     path::{Path, PathBuf},
     process::Command,
     rc::Rc,
+    sync::Arc,
     time::Duration,
 };
 
 use gpui::{
-    AnyElement, App, Application, Bounds, ClickEvent, ClipboardItem, Context, CursorStyle,
-    ElementInputHandler, Entity, FocusHandle, Focusable, FontWeight, Hsla, KeyBinding,
-    ListAlignment, ListState, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    PathPromptOptions, Pixels, Point, SharedString, Size, TitlebarOptions, Window, WindowBounds,
-    WindowControlArea, WindowOptions, actions, canvas, div, hsla, list, point, prelude::*, px,
-    relative, rgb, rgba, size,
+    AnyElement, App, Application, Bounds, ClickEvent, ClipboardItem, Context, Corner, CursorStyle,
+    ElementInputHandler, Entity, FocusHandle, Focusable, FontWeight, Hsla, Image, ImageFormat,
+    KeyBinding, ListAlignment, ListState, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, ObjectFit, PathPromptOptions, Pixels, Point, SharedString, StyledImage as _,
+    TitlebarOptions, Window, WindowBounds, WindowControlArea, WindowOptions, actions, anchored,
+    canvas, deferred, div, hsla, img, list, point, prelude::*, px, relative, rgb, rgba, size,
 };
 use gpui_animation::{
     animation::TransitionExt,
@@ -35,15 +36,19 @@ mod editor_blink;
 mod editor_surface;
 mod icons;
 mod inline_rename;
+mod math_renderer;
 
 use editor_blink::CursorBlinkState;
 use editor_surface::{
-    EditorLineLayout, EditorSelection, MarkdownBlockKind, MarkdownLineElement, MarkdownTableRow,
-    SourceLine, source_lines, source_lines_with_mode,
+    EditorLineLayout, EditorSelection, MarkdownBlockKind, MarkdownInlineMath, MarkdownLineElement,
+    MarkdownTableRow, SourceLine, source_lines, source_lines_with_mode,
 };
 use icons::{Icon, SynapseAssets};
 use inline_rename::{InlineRenameEvent, InlineRenameInput};
+use math_renderer::{MathPreview, render_math_preview};
 
+const WINDOW_DEFAULT_WIDTH: f32 = 1809.0;
+const WINDOW_DEFAULT_HEIGHT: f32 = 1332.0;
 const WINDOW_MIN_WIDTH: f32 = 900.0;
 const WINDOW_MIN_HEIGHT: f32 = 560.0;
 const SIDEBAR_FOOTER_HEIGHT: f32 = 40.0;
@@ -72,6 +77,16 @@ const TABLE_CELL_HORIZONTAL_PADDING: f32 = 10.0;
 const TABLE_CELL_VERTICAL_PADDING: f32 = 6.0;
 const MENU_ITEM_ICON_SLOT_SIZE: f32 = 18.0;
 const MENU_ITEM_ICON_SIZE: f32 = 15.0;
+const TAB_CONTEXT_MENU_WIDTH: f32 = 176.0;
+const TREE_CONTEXT_MENU_WIDTH: f32 = 218.0;
+const MERMAID_PREVIEW_MAX_HEIGHT: f32 = 520.0;
+const MERMAID_PREVIEW_VERTICAL_PADDING: f32 = 16.0;
+const MATH_BLOCK_MAX_HEIGHT: f32 = 420.0;
+const MATH_BLOCK_VERTICAL_PADDING: f32 = 20.0;
+
+fn default_window_size() -> gpui::Size<Pixels> {
+    size(px(WINDOW_DEFAULT_WIDTH), px(WINDOW_DEFAULT_HEIGHT))
+}
 
 fn command_palette_key_bindings() -> [&'static str; 2] {
     ["cmd-k", "ctrl-k"]
@@ -482,6 +497,18 @@ struct EditorRenderCache {
     dark_mode: bool,
     source_mode: bool,
     lines: Rc<Vec<Rc<SourceLine>>>,
+    mermaid_previews: Rc<BTreeMap<usize, MermaidPreview>>,
+    math_previews: Rc<BTreeMap<usize, MathPreview>>,
+}
+
+#[derive(Clone)]
+enum MermaidPreview {
+    Ready {
+        image: Arc<Image>,
+        natural_width: f32,
+        natural_height: f32,
+    },
+    Error(SharedString),
 }
 
 impl EditorRenderCache {
@@ -500,6 +527,38 @@ impl EditorRenderCache {
             && self.cursor == cursor
             && self.dark_mode == dark_mode
             && self.source_mode == source_mode
+    }
+
+    fn can_reuse_mermaid_previews(
+        &self,
+        vault_root: &Path,
+        relative_path: &Path,
+        revision: u64,
+        dark_mode: bool,
+        source_mode: bool,
+    ) -> bool {
+        !source_mode
+            && !self.source_mode
+            && self.vault_root == vault_root
+            && self.relative_path == relative_path
+            && self.revision == revision
+            && self.dark_mode == dark_mode
+    }
+
+    fn can_reuse_math_previews(
+        &self,
+        vault_root: &Path,
+        relative_path: &Path,
+        revision: u64,
+        dark_mode: bool,
+        source_mode: bool,
+    ) -> bool {
+        !source_mode
+            && !self.source_mode
+            && self.vault_root == vault_root
+            && self.relative_path == relative_path
+            && self.revision == revision
+            && self.dark_mode == dark_mode
     }
 }
 
@@ -530,6 +589,111 @@ fn changed_line_span(
 
 fn editor_line_layout_matches(old: &SourceLine, new: &SourceLine) -> bool {
     old.source_len_chars == new.source_len_chars && old.presentation == new.presentation
+}
+
+fn synapse_mermaid_theme(dark: bool) -> rusty_mermaid::Theme {
+    use rusty_mermaid::Color;
+
+    let mut theme = if dark {
+        rusty_mermaid::Theme::dark()
+    } else {
+        rusty_mermaid::Theme::light()
+    };
+    if dark {
+        theme.background = Color::rgb(0x1a, 0x1a, 0x1a);
+        theme.node_fill = Color::rgb(0x15, 0x15, 0x15);
+        theme.node_stroke = Color::rgb(0x8f, 0x8f, 0x8a);
+        theme.node_text = Color::rgb(0xeb, 0xeb, 0xe8);
+        theme.edge_stroke = Color::rgb(0x8f, 0x8f, 0x8a);
+        theme.edge_label_text = Color::rgb(0xeb, 0xeb, 0xe8);
+        theme.edge_label_bg = Color::rgba(0x1a, 0x1a, 0x1a, 224);
+        theme.composite_fill = Color::rgb(0x15, 0x15, 0x15);
+        theme.composite_stroke = Color::rgb(0x64, 0x64, 0x5f);
+        theme.composite_label = Color::rgb(0xeb, 0xeb, 0xe8);
+        theme.subgraph_fill = Color::rgba(0x15, 0x15, 0x15, 180);
+        theme.subgraph_stroke = Color::rgb(0x64, 0x64, 0x5f);
+        theme.subgraph_label = Color::rgb(0xeb, 0xeb, 0xe8);
+        theme.muted_text = Color::rgb(0x8f, 0x8f, 0x8a);
+    } else {
+        theme.background = Color::rgb(0xfb, 0xfb, 0xfa);
+        theme.node_fill = Color::rgb(0xf4, 0xf4, 0xf2);
+        theme.node_stroke = Color::rgb(0x6e, 0x6e, 0x6a);
+        theme.node_text = Color::rgb(0x19, 0x19, 0x19);
+        theme.edge_stroke = Color::rgb(0x6e, 0x6e, 0x6a);
+        theme.edge_label_text = Color::rgb(0x19, 0x19, 0x19);
+        theme.edge_label_bg = Color::rgba(0xfb, 0xfb, 0xfa, 224);
+        theme.composite_fill = Color::rgb(0xf4, 0xf4, 0xf2);
+        theme.composite_stroke = Color::rgb(0xa3, 0xa3, 0x9e);
+        theme.composite_label = Color::rgb(0x19, 0x19, 0x19);
+        theme.subgraph_fill = Color::rgba(0xf4, 0xf4, 0xf2, 180);
+        theme.subgraph_stroke = Color::rgb(0xa3, 0xa3, 0x9e);
+        theme.subgraph_label = Color::rgb(0x19, 0x19, 0x19);
+        theme.muted_text = Color::rgb(0x6e, 0x6e, 0x6a);
+    }
+    theme
+}
+
+fn build_mermaid_previews(
+    lines: &[Rc<SourceLine>],
+    dark_mode: bool,
+) -> Rc<BTreeMap<usize, MermaidPreview>> {
+    let theme = synapse_mermaid_theme(dark_mode);
+    let mut previews = BTreeMap::new();
+    for (index, line) in lines.iter().enumerate() {
+        let Some(source) = line
+            .presentation
+            .mermaid_block
+            .as_ref()
+            .filter(|block| block.is_anchor)
+            .and_then(|block| block.diagram_source.as_deref())
+        else {
+            continue;
+        };
+        let preview = match rusty_mermaid::render(source, &theme) {
+            Ok(scene) => {
+                let natural_width = (scene.width + theme.padding * 2.0).max(1.0) as f32;
+                let natural_height = (scene.height + theme.padding * 2.0).max(1.0) as f32;
+                let svg = rusty_mermaid::svg::SvgRenderer::with_theme(&theme)
+                    .render_themed(&scene, &theme);
+                MermaidPreview::Ready {
+                    image: Arc::new(Image::from_bytes(ImageFormat::Svg, svg.into_bytes())),
+                    natural_width,
+                    natural_height,
+                }
+            }
+            Err(error) => MermaidPreview::Error(error.to_string().into()),
+        };
+        previews.insert(index, preview);
+    }
+    Rc::new(previews)
+}
+
+fn build_math_previews(
+    lines: &[Rc<SourceLine>],
+    dark_mode: bool,
+) -> Rc<BTreeMap<usize, MathPreview>> {
+    let mut previews = BTreeMap::new();
+    for line in lines {
+        if let Some(block) = line
+            .presentation
+            .math_block
+            .as_ref()
+            .filter(|block| block.is_anchor)
+            && let Some(source) = block.formula_source.as_deref()
+        {
+            previews.insert(
+                block.source_start_char,
+                render_math_preview(source, true, dark_mode),
+            );
+        }
+        for inline in &line.presentation.inline_math {
+            previews.insert(
+                inline.source_start_char,
+                render_math_preview(&inline.formula_source, false, dark_mode),
+            );
+        }
+    }
+    Rc::new(previews)
 }
 
 impl SynapseApp {
@@ -1275,6 +1439,18 @@ struct EditorRowContext {
     selection: Range<usize>,
     cursor_visible: bool,
     horizontal_gutter: f32,
+    page_content_width: f32,
+    mermaid_previews: Rc<BTreeMap<usize, MermaidPreview>>,
+    math_previews: Rc<BTreeMap<usize, MathPreview>>,
+}
+
+#[derive(Clone, Copy)]
+struct MermaidPreviewStyle {
+    background: Hsla,
+    border: Hsla,
+    foreground: Hsla,
+    muted: Hsla,
+    danger: Hsla,
 }
 
 fn editor_block_layout_canvas(
@@ -1405,6 +1581,328 @@ fn render_table_row(
         .into_any_element()
 }
 
+fn render_mermaid_preview_row(
+    index: usize,
+    line: Rc<SourceLine>,
+    row_context: &EditorRowContext,
+    preview: Option<&MermaidPreview>,
+    style: MermaidPreviewStyle,
+) -> AnyElement {
+    let content = match preview {
+        Some(MermaidPreview::Ready {
+            image,
+            natural_width,
+            natural_height,
+        }) => {
+            let scale = (row_context.page_content_width / natural_width)
+                .min(MERMAID_PREVIEW_MAX_HEIGHT / natural_height)
+                .clamp(0.01, 1.0);
+            let display_width = natural_width * scale;
+            let display_height = natural_height * scale;
+            div()
+                .w_full()
+                .min_h(px(display_height + MERMAID_PREVIEW_VERTICAL_PADDING * 2.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    img(image.clone())
+                        .w(px(display_width))
+                        .h(px(display_height))
+                        .object_fit(ObjectFit::Contain),
+                )
+                .into_any_element()
+        }
+        Some(MermaidPreview::Error(message)) => div()
+            .w_full()
+            .min_h(px(88.0))
+            .flex()
+            .flex_col()
+            .justify_center()
+            .gap_1()
+            .px_4()
+            .text_size(px(13.0))
+            .text_color(style.danger)
+            .child("Unable to render Mermaid diagram")
+            .child(
+                div()
+                    .font_family(".SystemUIFont")
+                    .text_xs()
+                    .text_color(style.muted)
+                    .child(message.clone()),
+            )
+            .into_any_element(),
+        None => div()
+            .w_full()
+            .min_h(px(72.0))
+            .flex()
+            .items_center()
+            .px_4()
+            .text_size(px(13.0))
+            .text_color(style.muted)
+            .child("Mermaid preview unavailable")
+            .into_any_element(),
+    };
+
+    div()
+        .w_full()
+        .min_w(px(0.0))
+        .when(index == 0, |style| style.pt(px(EDITOR_TOP_PADDING)))
+        .py(px(16.0))
+        .child(
+            div()
+                .w_full()
+                .max_w(px(EDITOR_PAGE_MAX_WIDTH))
+                .min_w(px(0.0))
+                .mx_auto()
+                .px(px(row_context.horizontal_gutter))
+                .child(
+                    div()
+                        .relative()
+                        .w_full()
+                        .min_w(px(0.0))
+                        .overflow_hidden()
+                        .rounded_lg()
+                        .border_1()
+                        .border_color(style.border)
+                        .bg(style.background)
+                        .text_color(style.foreground)
+                        .cursor_pointer()
+                        .child(content)
+                        .child(editor_block_layout_canvas(index, line, row_context, false)),
+                ),
+        )
+        .into_any_element()
+}
+
+fn render_math_block_row(
+    index: usize,
+    line: Rc<SourceLine>,
+    row_context: &EditorRowContext,
+    preview: Option<&MathPreview>,
+    muted: Hsla,
+    danger: Hsla,
+) -> AnyElement {
+    let content = match preview {
+        Some(MathPreview::Ready {
+            image,
+            natural_width,
+            natural_height,
+            ..
+        }) => {
+            let scale = (row_context.page_content_width / natural_width)
+                .min(MATH_BLOCK_MAX_HEIGHT / natural_height)
+                .clamp(0.01, 1.0);
+            let display_width = natural_width * scale;
+            let display_height = natural_height * scale;
+            div()
+                .w_full()
+                .min_h(px(display_height + MATH_BLOCK_VERTICAL_PADDING * 2.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    img(image.clone())
+                        .w(px(display_width))
+                        .h(px(display_height))
+                        .object_fit(ObjectFit::Contain),
+                )
+                .into_any_element()
+        }
+        Some(MathPreview::Error(message)) => div()
+            .w_full()
+            .min_h(px(88.0))
+            .flex()
+            .flex_col()
+            .justify_center()
+            .gap_1()
+            .px_4()
+            .text_size(px(13.0))
+            .text_color(danger)
+            .child("Unable to render formula")
+            .child(div().text_xs().text_color(muted).child(message.clone()))
+            .into_any_element(),
+        None => div()
+            .w_full()
+            .min_h(px(72.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_size(px(13.0))
+            .text_color(muted)
+            .child("Formula preview unavailable")
+            .into_any_element(),
+    };
+
+    div()
+        .w_full()
+        .min_w(px(0.0))
+        .when(index == 0, |style| style.pt(px(EDITOR_TOP_PADDING)))
+        .child(
+            div()
+                .w_full()
+                .max_w(px(EDITOR_PAGE_MAX_WIDTH))
+                .min_w(px(0.0))
+                .mx_auto()
+                .px(px(row_context.horizontal_gutter))
+                .child(
+                    div()
+                        .relative()
+                        .w_full()
+                        .min_w(px(0.0))
+                        .cursor_pointer()
+                        .child(content)
+                        .child(editor_block_layout_canvas(index, line, row_context, false)),
+                ),
+        )
+        .into_any_element()
+}
+
+fn render_inline_math_item(
+    inline: &MarkdownInlineMath,
+    preview: Option<&MathPreview>,
+    muted: Hsla,
+    danger: Hsla,
+) -> AnyElement {
+    match preview {
+        Some(MathPreview::Ready {
+            image,
+            natural_width,
+            natural_height,
+            baseline,
+        }) => {
+            let baseline_adjustment = (natural_height - baseline).clamp(0.0, 6.0);
+            div()
+                .flex_none()
+                .h(px(*natural_height + baseline_adjustment))
+                .flex()
+                .items_start()
+                .pb(px(baseline_adjustment))
+                .child(
+                    img(image.clone())
+                        .w(px(*natural_width))
+                        .h(px(*natural_height))
+                        .object_fit(ObjectFit::Contain),
+                )
+                .into_any_element()
+        }
+        Some(MathPreview::Error(_)) => div()
+            .flex_none()
+            .px_1()
+            .rounded_sm()
+            .text_color(danger)
+            .child(format!("${}$", inline.formula_source))
+            .into_any_element(),
+        None => div()
+            .flex_none()
+            .px_1()
+            .text_color(muted)
+            .child(format!("${}$", inline.formula_source))
+            .into_any_element(),
+    }
+}
+
+fn render_inline_math_row(
+    index: usize,
+    line: Rc<SourceLine>,
+    row_context: &EditorRowContext,
+    muted: Hsla,
+    danger: Hsla,
+) -> AnyElement {
+    let display = &line.presentation.display;
+    let display_len = display.chars().count();
+    let mut elements = Vec::new();
+    let mut display_cursor = 0;
+    for inline in &line.presentation.inline_math {
+        let start = inline
+            .display_start_char
+            .min(display_len)
+            .max(display_cursor);
+        let end = inline.display_end_char.min(display_len).max(start);
+        if start > display_cursor {
+            elements.push(
+                div()
+                    .min_w(px(0.0))
+                    .max_w_full()
+                    .child(char_slice(display, display_cursor, start))
+                    .into_any_element(),
+            );
+        }
+        elements.push(render_inline_math_item(
+            inline,
+            row_context.math_previews.get(&inline.source_start_char),
+            muted,
+            danger,
+        ));
+        display_cursor = end;
+    }
+    if display_cursor < display_len {
+        elements.push(
+            div()
+                .min_w(px(0.0))
+                .max_w_full()
+                .child(char_slice(display, display_cursor, display_len))
+                .into_any_element(),
+        );
+    }
+
+    div()
+        .w_full()
+        .min_w(px(0.0))
+        .when(index == 0, |style| style.pt(px(EDITOR_TOP_PADDING)))
+        .when(index + 1 == row_context.line_count, |style| {
+            style.pb(px(180.0))
+        })
+        .child(
+            div()
+                .w_full()
+                .max_w(px(EDITOR_PAGE_MAX_WIDTH))
+                .min_w(px(0.0))
+                .mx_auto()
+                .px(px(row_context.horizontal_gutter))
+                .child(
+                    div()
+                        .relative()
+                        .w_full()
+                        .min_w(px(0.0))
+                        .min_h(px(EDITOR_BODY_LINE_HEIGHT))
+                        .flex()
+                        .flex_wrap()
+                        .items_center()
+                        .text_size(px(EDITOR_BODY_FONT_SIZE))
+                        .line_height(px(EDITOR_BODY_LINE_HEIGHT))
+                        .cursor_pointer()
+                        .children(elements)
+                        .child(editor_block_layout_canvas(index, line, row_context, false)),
+                ),
+        )
+        .into_any_element()
+}
+
+fn char_slice(text: &str, start: usize, end: usize) -> String {
+    text.chars()
+        .skip(start)
+        .take(end.saturating_sub(start))
+        .collect()
+}
+
+fn code_block_edges(
+    code_line: Option<editor_surface::MarkdownCodeLine>,
+    active: bool,
+    mermaid_block_active: bool,
+) -> (bool, bool) {
+    if mermaid_block_active {
+        return (
+            code_line.is_some_and(|code| code.is_opening_fence),
+            code_line.is_some_and(|code| code.is_closing_fence),
+        );
+    }
+    (
+        code_line.is_some_and(|code| code.is_first_content || (active && code.is_opening_fence)),
+        code_line.is_some_and(|code| code.is_last_content || (active && code.is_closing_fence)),
+    )
+}
+
 fn render_editor_row(
     index: usize,
     line: Rc<SourceLine>,
@@ -1416,6 +1914,50 @@ fn render_editor_row(
     let active =
         (line.start_char..=line.start_char + line.source_len_chars).contains(&row_context.cursor);
     let kind = line.presentation.kind;
+    let mermaid_block_active = line
+        .presentation
+        .mermaid_block
+        .as_ref()
+        .is_some_and(|block| {
+            (block.source_start_char..=block.source_end_char).contains(&row_context.cursor)
+        });
+    if let Some(block) = line.presentation.mermaid_block.as_ref()
+        && !mermaid_block_active
+    {
+        if !block.is_anchor {
+            return div().h(px(0.0)).overflow_hidden().into_any_element();
+        }
+        return render_mermaid_preview_row(
+            index,
+            line.clone(),
+            row_context,
+            row_context.mermaid_previews.get(&index),
+            MermaidPreviewStyle {
+                background: theme.background,
+                border: theme.border,
+                foreground: theme.foreground,
+                muted: theme.muted_foreground,
+                danger: theme.danger,
+            },
+        );
+    }
+    if let Some(block) = line.presentation.math_block.as_ref() {
+        let block_active =
+            (block.source_start_char..=block.source_end_char).contains(&row_context.cursor);
+        if !block_active {
+            if !block.is_anchor {
+                return div().h(px(0.0)).overflow_hidden().into_any_element();
+            }
+            return render_math_block_row(
+                index,
+                line.clone(),
+                row_context,
+                row_context.math_previews.get(&block.source_start_char),
+                theme.muted_foreground,
+                theme.danger,
+            );
+        }
+    }
     if matches!(kind, MarkdownBlockKind::ThematicBreak) {
         return render_thematic_break_row(index, line, row_context, active, theme.border);
     }
@@ -1430,6 +1972,15 @@ fn render_editor_row(
             theme.foreground,
         );
     }
+    if !active && !line.presentation.inline_math.is_empty() {
+        return render_inline_math_row(
+            index,
+            line.clone(),
+            row_context,
+            theme.muted_foreground,
+            theme.danger,
+        );
+    }
     let quote_first = line
         .presentation
         .quote_line
@@ -1439,13 +1990,10 @@ fn render_editor_row(
         .quote_line
         .is_some_and(|quote| quote.is_last);
     let code_line = line.presentation.code_line;
-    if !active && code_line.is_some_and(|code| code.is_fence) {
+    if !active && !mermaid_block_active && code_line.is_some_and(|code| code.is_fence) {
         return div().h(px(0.0)).overflow_hidden().into_any_element();
     }
-    let code_first =
-        code_line.is_some_and(|code| code.is_first_content || (active && code.is_opening_fence));
-    let code_last =
-        code_line.is_some_and(|code| code.is_last_content || (active && code.is_closing_fence));
+    let (code_first, code_last) = code_block_edges(code_line, active, mermaid_block_active);
     div()
         .w_full()
         .min_w(px(0.0))
@@ -1602,9 +2150,13 @@ impl Render for SynapseApp {
         let tabs = self.state.tabs();
         let active_tab = self.state.active_tab_index();
         let no_vault_open = self.state.vault_name.is_none();
-        let editor_horizontal_gutter = editor_horizontal_gutter(
-            f32::from(window.viewport_size().width),
+        let viewport_width = f32::from(window.viewport_size().width);
+        let editor_horizontal_gutter =
+            editor_horizontal_gutter(viewport_width, self.left_sidebar_open);
+        let editor_page_content_width = editor_page_content_width(
+            viewport_width,
             self.left_sidebar_open,
+            editor_horizontal_gutter,
         );
 
         let editor_body =
@@ -1629,12 +2181,16 @@ impl Render for SynapseApp {
                         source_mode,
                     )
                 });
-                let lines = if cache_hit {
-                    self.editor_render_cache
+                let (lines, mermaid_previews, math_previews) = if cache_hit {
+                    let cache = self
+                        .editor_render_cache
                         .as_ref()
-                        .expect("cache hit requires an editor render cache")
-                        .lines
-                        .clone()
+                        .expect("cache hit requires an editor render cache");
+                    (
+                        cache.lines.clone(),
+                        cache.mermaid_previews.clone(),
+                        cache.math_previews.clone(),
+                    )
                 } else {
                     let previous_lines = self
                         .editor_render_cache
@@ -1643,6 +2199,32 @@ impl Render for SynapseApp {
                             cache.vault_root == vault_root && cache.relative_path == relative_path
                         })
                         .map(|cache| cache.lines.clone());
+                    let previous_mermaid_previews = self
+                        .editor_render_cache
+                        .as_ref()
+                        .filter(|cache| {
+                            cache.can_reuse_mermaid_previews(
+                                &vault_root,
+                                &relative_path,
+                                revision,
+                                dark_mode,
+                                source_mode,
+                            )
+                        })
+                        .map(|cache| cache.mermaid_previews.clone());
+                    let previous_math_previews = self
+                        .editor_render_cache
+                        .as_ref()
+                        .filter(|cache| {
+                            cache.can_reuse_math_previews(
+                                &vault_root,
+                                &relative_path,
+                                revision,
+                                dark_mode,
+                                source_mode,
+                            )
+                        })
+                        .map(|cache| cache.math_previews.clone());
                     let text = document.text();
                     let parsed_lines = if source_mode {
                         source_lines_with_mode(&text, cursor, dark_mode, true)
@@ -1664,6 +2246,18 @@ impl Render for SynapseApp {
                         *self.editor_line_layouts.borrow_mut() =
                             (0..parsed.len()).map(|_| None).collect();
                     }
+                    let mermaid_previews = if source_mode {
+                        Rc::new(BTreeMap::new())
+                    } else {
+                        previous_mermaid_previews
+                            .unwrap_or_else(|| build_mermaid_previews(&parsed, dark_mode))
+                    };
+                    let math_previews = if source_mode {
+                        Rc::new(BTreeMap::new())
+                    } else {
+                        previous_math_previews
+                            .unwrap_or_else(|| build_math_previews(&parsed, dark_mode))
+                    };
                     self.editor_render_cache = Some(EditorRenderCache {
                         vault_root,
                         relative_path,
@@ -1672,8 +2266,10 @@ impl Render for SynapseApp {
                         dark_mode,
                         source_mode,
                         lines: parsed.clone(),
+                        mermaid_previews: mermaid_previews.clone(),
+                        math_previews: math_previews.clone(),
                     });
-                    parsed
+                    (parsed, mermaid_previews, math_previews)
                 };
                 self.editor_selection.clamp(document_len);
                 let selection = self.editor_selection.range();
@@ -1726,6 +2322,9 @@ impl Render for SynapseApp {
                                 selection,
                                 cursor_visible: self.editor_blink.visible(),
                                 horizontal_gutter: editor_horizontal_gutter,
+                                page_content_width: editor_page_content_width,
+                                mermaid_previews,
+                                math_previews,
                             };
                             move |index, _, cx| {
                                 render_editor_row(index, lines[index].clone(), &row_context, cx)
@@ -2294,7 +2893,7 @@ impl Render for SynapseApp {
                                     .pr_2()
                                     .text_sm()
                                     .text_color(theme.sidebar_foreground)
-                                    .cursor_move()
+                                    .cursor_pointer()
                                     .hover(move |style| style.bg(sidebar_hover))
                                     .child(
                                         if is_expanded {
@@ -2410,7 +3009,7 @@ impl Render for SynapseApp {
                                     .pr_2()
                                     .text_sm()
                                     .text_color(theme.sidebar_foreground)
-                                    .cursor_move()
+                                    .cursor_pointer()
                                     .hover(move |style| style.bg(sidebar_hover))
                                     .when(selected, |style| {
                                         style
@@ -2529,48 +3128,15 @@ impl Render for SynapseApp {
                     }),
             );
 
-        let context_backdrop = (self.tab_context_menu.is_some()
-            || self.tree_context_menu.is_some()
-            || self.note_actions_menu_open)
-            .then(|| {
-                div()
-                    .id("context-menu-backdrop")
-                    .absolute()
-                    .top(px(0.0))
-                    .right(px(0.0))
-                    .bottom(px(0.0))
-                    .left(px(0.0))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.dismiss_context_menus(cx);
-                    }))
-                    .with_transition("context-menu-backdrop-transition")
-                    .transition_when_else(
-                        !self.context_menu_closing,
-                        QUICK_TRANSITION,
-                        EaseOutQuad,
-                        |style| style.opacity(1.0),
-                        |style| style.opacity(0.0),
-                    )
-                    .into_any_element()
-            });
-
         let context_menu = self.tab_context_menu.clone().map(|menu| {
             let index = menu.index;
             let close_app = app_entity.clone();
             let close_left_app = app_entity.clone();
             let close_right_app = app_entity.clone();
             let close_all_app = app_entity.clone();
-            let position = context_menu_position(
-                menu.position,
-                window.viewport_size(),
-                size(px(176.0), px(148.0)),
-            );
-            div()
+            let panel = div()
                 .id("tab-context-menu")
-                .absolute()
-                .top(position.y)
-                .left(position.x)
-                .w(px(176.0))
+                .w(px(TAB_CONTEXT_MENU_WIDTH))
                 .p_1()
                 .rounded_md()
                 .border_1()
@@ -2629,7 +3195,6 @@ impl Render for SynapseApp {
                             });
                         }),
                 )
-                .child(div().h(px(1.0)).mx_2().my_1().bg(theme.border))
                 .child(
                     Button::new("context-close-all")
                         .ghost()
@@ -2657,22 +3222,25 @@ impl Render for SynapseApp {
                     EaseOutQuad,
                     |style| style.opacity(1.0),
                     |style| style.opacity(0.0),
-                )
-                .into_any_element()
+                );
+            deferred(
+                anchored()
+                    .snap_to_window_with_margin(px(8.0))
+                    .anchor(Corner::TopLeft)
+                    .position(menu.position)
+                    .child(panel),
+            )
+            .into_any_element()
         });
 
         let tree_context_menu = self.tree_context_menu.clone().map(|menu| {
-            let position = menu.position;
             let target = menu.target;
             let reveal_target = target.clone();
             let rename_target = target.clone();
             let trash_target = target.clone();
             let base = div()
                 .id("tree-context-menu")
-                .absolute()
-                .top(position.y)
-                .left(position.x)
-                .w(px(218.0))
+                .w(px(TREE_CONTEXT_MENU_WIDTH))
                 .p_1()
                 .rounded_lg()
                 .border_1()
@@ -2690,7 +3258,7 @@ impl Render for SynapseApp {
                     |style| style.opacity(0.0),
                 );
 
-            match target.kind {
+            let panel = match target.kind {
                 VaultEntryKind::Directory => {
                     let new_folder_parent = target.relative_path.clone();
                     let new_note_parent = target.relative_path.clone();
@@ -2753,7 +3321,6 @@ impl Render for SynapseApp {
                                 });
                             }),
                     )
-                    .child(div().h(px(1.0)).mx_2().my_1().bg(theme.border))
                     .child(
                         Button::new("folder-menu-rename")
                             .ghost()
@@ -2833,7 +3400,6 @@ impl Render for SynapseApp {
                                 });
                             }),
                     )
-                    .child(div().h(px(1.0)).mx_2().my_1().bg(theme.border))
                     .child(
                         Button::new("note-menu-trash")
                             .ghost()
@@ -2855,7 +3421,15 @@ impl Render for SynapseApp {
                     )
                     .into_any_element()
                 }
-            }
+            };
+            deferred(
+                anchored()
+                    .snap_to_window_with_margin(px(8.0))
+                    .anchor(Corner::TopLeft)
+                    .position(menu.position)
+                    .child(panel),
+            )
+            .into_any_element()
         });
 
         let note_actions_menu = self.note_actions_menu_open.then(|| {
@@ -2911,7 +3485,6 @@ impl Render for SynapseApp {
                             });
                         }),
                 )
-                .child(div().h(px(1.0)).mx_2().my_1().bg(theme.border))
                 .child(
                     Button::new("note-actions-delete")
                         .ghost()
@@ -3216,6 +3789,9 @@ impl Render for SynapseApp {
             .bg(theme.background)
             .text_color(theme.foreground)
             .on_action(cx.listener(Self::open_command_palette_action))
+            .capture_any_mouse_down(cx.listener(|this, _, _, cx| {
+                this.dismiss_context_menus(cx);
+            }))
             .child(left_sidebar)
             .child(
                 div()
@@ -3232,7 +3808,6 @@ impl Render for SynapseApp {
                     .children(editor_toolbar)
                     .child(editor_body),
             )
-            .children(context_backdrop)
             .children(context_menu)
             .children(tree_context_menu)
             .children(note_actions_menu)
@@ -3277,18 +3852,14 @@ fn editor_horizontal_gutter(viewport_width: f32, sidebar_open: bool) -> f32 {
     }
 }
 
-fn context_menu_position(
-    requested: Point<Pixels>,
-    viewport: Size<Pixels>,
-    menu: Size<Pixels>,
-) -> Point<Pixels> {
-    let margin = px(8.0);
-    let max_x = viewport.width - menu.width - margin;
-    let max_y = viewport.height - menu.height - margin;
-    point(
-        clamp_pixels(requested.x, margin, max_x),
-        clamp_pixels(requested.y, margin, max_y),
-    )
+fn editor_page_content_width(
+    viewport_width: f32,
+    sidebar_open: bool,
+    horizontal_gutter: f32,
+) -> f32 {
+    let available_width =
+        (viewport_width - if sidebar_open { SIDEBAR_WIDTH } else { 0.0 }).max(0.0);
+    (available_width.min(EDITOR_PAGE_MAX_WIDTH) - horizontal_gutter * 2.0).max(1.0)
 }
 
 fn menu_item_content(icon: Icon, label: &'static str, icon_color: Hsla) -> impl IntoElement {
@@ -3314,16 +3885,6 @@ fn menu_item_content(icon: Icon, label: &'static str, icon_color: Hsla) -> impl 
                 ),
         )
         .child(div().flex_1().min_w(px(0.0)).text_left().child(label))
-}
-
-fn clamp_pixels(value: Pixels, minimum: Pixels, maximum: Pixels) -> Pixels {
-    if maximum < minimum || value < minimum {
-        minimum
-    } else if value > maximum {
-        maximum
-    } else {
-        value
-    }
 }
 
 fn normalize_clipboard_text(text: &str) -> String {
@@ -3410,7 +3971,7 @@ fn main() {
                 KeyBinding::new("shift-enter", InsertRawNewline, Some("SynapseEditor")),
             ]);
 
-            let bounds = Bounds::centered(None, size(px(1180.0), px(760.0)), cx);
+            let bounds = Bounds::centered(None, default_window_size(), cx);
             cx.open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -3493,7 +4054,7 @@ mod tests {
         rc::Rc,
     };
 
-    use gpui::{MouseButton, point, px, rgb, size};
+    use gpui::{MouseButton, px, rgb};
     use synapse_core::{VaultEntry, VaultEntryKind};
 
     use super::{
@@ -3503,10 +4064,11 @@ mod tests {
         MENU_ITEM_ICON_SIZE, MENU_ITEM_ICON_SLOT_SIZE, SIDEBAR_FOOTER_HEIGHT,
         TABLE_CELL_HORIZONTAL_PADDING, TABLE_CELL_VERTICAL_PADDING, TABLE_FONT_SIZE,
         TABLE_ROW_MIN_HEIGHT, TITLEBAR_HEIGHT, ThemePreference, build_file_tree_rows,
-        changed_line_span, command_palette_key_bindings, context_menu_position,
-        editor_horizontal_gutter, file_manager_reveal_command, is_tab_context_trigger,
-        normalize_clipboard_text, note_breadcrumb_parts, source_lines, synapse_theme_palette,
-        synapse_titlebar_options, titlebar_left_inset,
+        build_math_previews, build_mermaid_previews, changed_line_span, code_block_edges,
+        command_palette_key_bindings, default_window_size, editor_horizontal_gutter,
+        editor_page_content_width, file_manager_reveal_command, is_tab_context_trigger,
+        normalize_clipboard_text, note_breadcrumb_parts, source_lines, synapse_mermaid_theme,
+        synapse_theme_palette, synapse_titlebar_options, titlebar_left_inset,
     };
 
     #[test]
@@ -3521,6 +4083,12 @@ mod tests {
         assert_eq!(EDITOR_TOP_PADDING, 24.0);
         assert_eq!(EDITOR_BODY_FONT_SIZE, 16.0);
         assert_eq!(EDITOR_BODY_LINE_HEIGHT, 26.4);
+        assert_eq!(editor_page_content_width(900.0, true, 16.0), 620.0);
+    }
+
+    #[test]
+    fn p5_default_window_uses_the_requested_desktop_size() {
+        assert_eq!(default_window_size(), gpui::size(px(1809.0), px(1332.0)));
     }
 
     #[test]
@@ -3624,17 +4192,128 @@ mod tests {
     }
 
     #[test]
-    fn p1_tab_context_menu_is_anchored_to_the_click_and_clamped_to_the_window() {
-        let menu = size(px(176.0), px(148.0));
-        let viewport = size(px(1000.0), px(700.0));
+    fn p4_mermaid_preview_is_cached_as_theme_aware_svg() {
+        let lines = source_lines(
+            "cursor\n```mermaid\nflowchart LR\nA[Start] --> B[Done]\n```",
+            0,
+            true,
+        )
+        .into_iter()
+        .map(Rc::new)
+        .collect::<Vec<_>>();
+        let previews = build_mermaid_previews(&lines, true);
+        let preview = previews.get(&1).expect("mermaid preview cache entry");
+
+        match preview {
+            super::MermaidPreview::Ready {
+                image,
+                natural_width,
+                natural_height,
+            } => {
+                assert_eq!(image.format, gpui::ImageFormat::Svg);
+                assert!(*natural_width > 0.0);
+                assert!(*natural_height > 0.0);
+            }
+            super::MermaidPreview::Error(error) => panic!("unexpected Mermaid error: {error}"),
+        }
+        assert_eq!(
+            synapse_mermaid_theme(true).background,
+            rusty_mermaid::Color::rgb(0x1a, 0x1a, 0x1a)
+        );
+    }
+
+    #[test]
+    fn p5_math_previews_cache_inline_and_block_svg() {
+        let source = "Inline $E = mc^2$.\n$$\n\\frac{1}{2}\n$$";
+        let lines = source_lines(source, source.chars().count(), false)
+            .into_iter()
+            .map(Rc::new)
+            .collect::<Vec<_>>();
+        let previews = build_math_previews(&lines, false);
+
+        assert_eq!(previews.len(), 2);
+        assert!(
+            previews
+                .values()
+                .all(|preview| matches!(preview, crate::math_renderer::MathPreview::Ready { .. }))
+        );
+    }
+
+    #[test]
+    fn p4_mermaid_cache_ignores_cursor_but_invalidates_content_theme_and_mode() {
+        let cache = super::EditorRenderCache {
+            vault_root: PathBuf::from("/vault"),
+            relative_path: PathBuf::from("diagram.md"),
+            revision: 7,
+            cursor: 1,
+            dark_mode: true,
+            source_mode: false,
+            lines: Rc::new(Vec::new()),
+            mermaid_previews: Rc::new(Default::default()),
+            math_previews: Rc::new(Default::default()),
+        };
+
+        assert!(cache.can_reuse_mermaid_previews(
+            Path::new("/vault"),
+            Path::new("diagram.md"),
+            7,
+            true,
+            false,
+        ));
+        assert!(!cache.can_reuse_mermaid_previews(
+            Path::new("/vault"),
+            Path::new("diagram.md"),
+            8,
+            true,
+            false,
+        ));
+        assert!(!cache.can_reuse_mermaid_previews(
+            Path::new("/vault"),
+            Path::new("diagram.md"),
+            7,
+            false,
+            false,
+        ));
+        assert!(!cache.can_reuse_mermaid_previews(
+            Path::new("/vault"),
+            Path::new("diagram.md"),
+            7,
+            true,
+            true,
+        ));
+        assert!(cache.can_reuse_math_previews(
+            Path::new("/vault"),
+            Path::new("diagram.md"),
+            7,
+            true,
+            false,
+        ));
+        assert!(!cache.can_reuse_math_previews(
+            Path::new("/vault"),
+            Path::new("diagram.md"),
+            8,
+            true,
+            false,
+        ));
+    }
+
+    #[test]
+    fn p4_active_mermaid_uses_one_continuous_code_block_boundary() {
+        let source = "before\n```mermaid\nflowchart LR\nA --> B\n```\nafter";
+        let cursor = source.find("A --> B").expect("diagram content byte");
+        let lines = source_lines(source, cursor, false);
 
         assert_eq!(
-            context_menu_position(point(px(120.0), px(70.0)), viewport, menu),
-            point(px(120.0), px(70.0))
+            code_block_edges(lines[1].presentation.code_line, false, true),
+            (true, false)
         );
         assert_eq!(
-            context_menu_position(point(px(990.0), px(690.0)), viewport, menu),
-            point(px(816.0), px(544.0))
+            code_block_edges(lines[2].presentation.code_line, false, true),
+            (false, false)
+        );
+        assert_eq!(
+            code_block_edges(lines[4].presentation.code_line, false, true),
+            (false, true)
         );
     }
 

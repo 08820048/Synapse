@@ -10,6 +10,11 @@ gpui.workspace = true
 gpui-animation.workspace = true
 gpui-component.workspace = true
 gpui-component-assets.workspace = true
+ratex-layout.workspace = true
+ratex-parser.workspace = true
+ratex-svg.workspace = true
+ratex-types.workspace = true
+rusty-mermaid.workspace = true
 synapse-core.workspace = true
 writ.workspace = true
 

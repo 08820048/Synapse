@@ -123,6 +123,9 @@ pub struct MarkdownLinePresentation {
     pub table_row: Option<MarkdownTableRow>,
     pub quote_line: Option<MarkdownQuoteLine>,
     pub code_line: Option<MarkdownCodeLine>,
+    pub mermaid_block: Option<MarkdownMermaidBlock>,
+    pub math_block: Option<MarkdownMathBlock>,
+    pub inline_math: Vec<MarkdownInlineMath>,
     source_to_display: Vec<usize>,
     display_to_source: Vec<usize>,
 }
@@ -140,6 +143,31 @@ pub struct MarkdownCodeLine {
     pub is_closing_fence: bool,
     pub is_first_content: bool,
     pub is_last_content: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MarkdownMermaidBlock {
+    pub is_anchor: bool,
+    pub source_start_char: usize,
+    pub source_end_char: usize,
+    pub diagram_source: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MarkdownMathBlock {
+    pub is_anchor: bool,
+    pub source_start_char: usize,
+    pub source_end_char: usize,
+    pub formula_source: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MarkdownInlineMath {
+    pub source_start_char: usize,
+    pub source_end_char: usize,
+    pub display_start_char: usize,
+    pub display_end_char: usize,
+    pub formula_source: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -304,6 +332,9 @@ pub fn source_lines_with_mode(
     annotate_table_rows(&mut lines, &raw_lines);
     annotate_quote_lines(&mut lines);
     annotate_code_lines(&mut lines, &raw_lines);
+    annotate_mermaid_blocks(&mut lines, &raw_lines);
+    reveal_active_mermaid_fences(&mut lines, &raw_lines, cursor);
+    annotate_math(&mut lines, &raw_lines);
     lines
 }
 
@@ -325,6 +356,9 @@ fn raw_source_lines(text: &str) -> Vec<SourceLine> {
                     table_row: None,
                     quote_line: None,
                     code_line: None,
+                    mermaid_block: None,
+                    math_block: None,
+                    inline_math: Vec::new(),
                     source_to_display: (0..=len).collect(),
                     display_to_source: (0..=len).collect(),
                 },
@@ -524,6 +558,9 @@ fn presentation_from_writ(
         table_row: None,
         quote_line: None,
         code_line: None,
+        mermaid_block: None,
+        math_block: None,
+        inline_math: Vec::new(),
         source_to_display,
         display_to_source,
     }
@@ -586,6 +623,251 @@ fn annotate_code_lines(lines: &mut [SourceLine], raw_lines: &[&str]) {
         }
         start = end;
     }
+}
+
+fn annotate_mermaid_blocks(lines: &mut [SourceLine], raw_lines: &[&str]) {
+    let limit = lines.len().min(raw_lines.len());
+    let mut start = 0;
+    while start < limit {
+        let opening = lines[start]
+            .presentation
+            .code_line
+            .is_some_and(|code| code.is_opening_fence);
+        if !opening || !is_mermaid_fence(raw_lines[start]) {
+            start += 1;
+            continue;
+        }
+
+        let Some(end) = (start + 1..limit).find(|index| {
+            lines[*index]
+                .presentation
+                .code_line
+                .is_some_and(|code| code.is_closing_fence)
+        }) else {
+            start += 1;
+            continue;
+        };
+
+        let diagram_source = raw_lines[start + 1..end].join("\n");
+        let source_start_char = lines[start].start_char;
+        let source_end_char = lines[end].start_char + lines[end].source_len_chars;
+        for (index, line) in lines.iter_mut().enumerate().take(end + 1).skip(start) {
+            line.presentation.mermaid_block = Some(MarkdownMermaidBlock {
+                is_anchor: index == start,
+                source_start_char,
+                source_end_char,
+                diagram_source: (index == start).then(|| diagram_source.clone()),
+            });
+        }
+        start = end + 1;
+    }
+}
+
+fn reveal_active_mermaid_fences(lines: &mut [SourceLine], raw_lines: &[&str], cursor: usize) {
+    for (line, source) in lines.iter_mut().zip(raw_lines) {
+        let block_active = line
+            .presentation
+            .mermaid_block
+            .as_ref()
+            .is_some_and(|block| {
+                (block.source_start_char..=block.source_end_char).contains(&cursor)
+            });
+        let is_fence = line
+            .presentation
+            .code_line
+            .is_some_and(|code| code.is_fence);
+        if !block_active || !is_fence || line.presentation.display == *source {
+            continue;
+        }
+
+        let len = source.chars().count();
+        let mut run = plain_style_run(source.len());
+        run.mono = true;
+        run.muted = true;
+        line.presentation.display = (*source).to_owned();
+        line.presentation.runs = (!source.is_empty()).then_some(run).into_iter().collect();
+        line.presentation.source_to_display = (0..=len).collect();
+        line.presentation.display_to_source = (0..=len).collect();
+    }
+}
+
+fn annotate_math(lines: &mut [SourceLine], raw_lines: &[&str]) {
+    annotate_math_blocks(lines, raw_lines);
+    for (line, source) in lines.iter_mut().zip(raw_lines) {
+        if line.presentation.code_line.is_some() || line.presentation.math_block.is_some() {
+            continue;
+        }
+        line.presentation.inline_math = detect_inline_math(source)
+            .into_iter()
+            .map(|(source_range, formula_source)| MarkdownInlineMath {
+                source_start_char: line.start_char + source_range.start,
+                source_end_char: line.start_char + source_range.end,
+                display_start_char: line
+                    .presentation
+                    .display_char_for_source(source_range.start),
+                display_end_char: line.presentation.display_char_for_source(source_range.end),
+                formula_source,
+            })
+            .collect();
+    }
+}
+
+fn annotate_math_blocks(lines: &mut [SourceLine], raw_lines: &[&str]) {
+    let limit = lines.len().min(raw_lines.len());
+    let mut start = 0;
+    while start < limit {
+        if lines[start].presentation.code_line.is_some() {
+            start += 1;
+            continue;
+        }
+        let opening = raw_lines[start].trim_start();
+        let Some(after_opening) = opening.strip_prefix("$$") else {
+            start += 1;
+            continue;
+        };
+
+        let (end, formula_source) = if let Some(close) = find_double_dollar(after_opening) {
+            (start, after_opening[..close].trim().to_owned())
+        } else {
+            let Some((end, close)) = (start + 1..limit).find_map(|index| {
+                (lines[index].presentation.code_line.is_none())
+                    .then(|| find_double_dollar(raw_lines[index]).map(|close| (index, close)))
+                    .flatten()
+            }) else {
+                start += 1;
+                continue;
+            };
+            let mut parts = Vec::new();
+            if !after_opening.trim().is_empty() {
+                parts.push(after_opening.trim());
+            }
+            parts.extend(raw_lines[start + 1..end].iter().map(|line| line.trim_end()));
+            if !raw_lines[end][..close].trim().is_empty() {
+                parts.push(raw_lines[end][..close].trim());
+            }
+            (end, parts.join("\n"))
+        };
+
+        let source_start_char = lines[start].start_char;
+        let source_end_char = lines[end].start_char + lines[end].source_len_chars;
+        for (index, line) in lines.iter_mut().enumerate().take(end + 1).skip(start) {
+            line.presentation.math_block = Some(MarkdownMathBlock {
+                is_anchor: index == start,
+                source_start_char,
+                source_end_char,
+                formula_source: (index == start).then(|| formula_source.clone()),
+            });
+        }
+        start = end + 1;
+    }
+}
+
+fn find_double_dollar(source: &str) -> Option<usize> {
+    let bytes = source.as_bytes();
+    (0..bytes.len().saturating_sub(1)).find(|index| {
+        bytes[*index] == b'$'
+            && bytes[*index + 1] == b'$'
+            && (*index == 0 || bytes[*index - 1] != b'\\')
+    })
+}
+
+fn detect_inline_math(source: &str) -> Vec<(Range<usize>, String)> {
+    let code_ranges = inline_code_ranges(source);
+    let bytes = source.as_bytes();
+    let char_boundaries = char_byte_boundaries(source);
+    let mut spans = Vec::new();
+    let mut start = 0;
+    while start < bytes.len() {
+        if bytes[start] != b'$'
+            || is_escaped(bytes, start)
+            || bytes.get(start + 1) == Some(&b'$')
+            || bytes.get(start + 1).is_none_or(u8::is_ascii_whitespace)
+            || code_ranges.iter().any(|range| range.contains(&start))
+        {
+            start += 1;
+            continue;
+        }
+        let mut end = start + 1;
+        while end < bytes.len() {
+            if bytes[end] == b'$'
+                && !is_escaped(bytes, end)
+                && bytes.get(end + 1) != Some(&b'$')
+                && !bytes[end - 1].is_ascii_whitespace()
+                && !code_ranges.iter().any(|range| range.contains(&end))
+            {
+                let start_char = char_index_for_byte(&char_boundaries, start);
+                let end_char = char_index_for_byte(&char_boundaries, end + 1);
+                spans.push((start_char..end_char, source[start + 1..end].to_owned()));
+                start = end + 1;
+                break;
+            }
+            end += 1;
+        }
+        if end >= bytes.len() {
+            start += 1;
+        }
+    }
+    spans
+}
+
+fn inline_code_ranges(source: &str) -> Vec<Range<usize>> {
+    let bytes = source.as_bytes();
+    let mut ranges = Vec::new();
+    let mut start = 0;
+    while start < bytes.len() {
+        if bytes[start] != b'`' || is_escaped(bytes, start) {
+            start += 1;
+            continue;
+        }
+        let ticks = bytes[start..]
+            .iter()
+            .take_while(|byte| **byte == b'`')
+            .count();
+        let mut end = start + ticks;
+        while end + ticks <= bytes.len() {
+            if bytes[end..end + ticks].iter().all(|byte| *byte == b'`') {
+                ranges.push(start..end + ticks);
+                start = end + ticks;
+                break;
+            }
+            end += 1;
+        }
+        if end + ticks > bytes.len() {
+            start += ticks;
+        }
+    }
+    ranges
+}
+
+fn is_escaped(bytes: &[u8], index: usize) -> bool {
+    let backslashes = bytes[..index]
+        .iter()
+        .rev()
+        .take_while(|byte| **byte == b'\\')
+        .count();
+    backslashes % 2 == 1
+}
+
+fn is_mermaid_fence(source: &str) -> bool {
+    let trimmed = source.trim_start();
+    let Some(marker) = trimmed
+        .chars()
+        .next()
+        .filter(|marker| matches!(marker, '`' | '~'))
+    else {
+        return false;
+    };
+    let marker_len = trimmed
+        .chars()
+        .take_while(|character| *character == marker)
+        .count();
+    if marker_len < 3 {
+        return false;
+    }
+    trimmed[marker.len_utf8() * marker_len..]
+        .split_whitespace()
+        .next()
+        .is_some_and(|language| language.eq_ignore_ascii_case("mermaid"))
 }
 
 fn is_code_fence(source: &str) -> bool {
@@ -706,6 +988,9 @@ fn hidden_source_presentation(source: &str) -> MarkdownLinePresentation {
         table_row: None,
         quote_line: None,
         code_line: None,
+        mermaid_block: None,
+        math_block: None,
+        inline_math: Vec::new(),
         source_to_display: vec![0; source.chars().count() + 1],
         display_to_source: vec![0],
     }
@@ -1550,6 +1835,92 @@ mod tests {
     }
 
     #[test]
+    fn p4_mermaid_fences_expose_one_render_anchor_and_preserve_source() {
+        let lines = source_lines(
+            "cursor\n\n```mermaid\nflowchart LR\nA[开始] --> B[结束]\n```\nafter",
+            0,
+            false,
+        );
+        let opening = lines[2]
+            .presentation
+            .mermaid_block
+            .as_ref()
+            .expect("mermaid opening metadata");
+        let content = lines[3]
+            .presentation
+            .mermaid_block
+            .as_ref()
+            .expect("mermaid content metadata");
+        let closing = lines[5]
+            .presentation
+            .mermaid_block
+            .as_ref()
+            .expect("mermaid closing metadata");
+
+        assert!(opening.is_anchor);
+        assert_eq!(
+            opening.diagram_source.as_deref(),
+            Some("flowchart LR\nA[开始] --> B[结束]")
+        );
+        assert!(!content.is_anchor && content.diagram_source.is_none());
+        assert_eq!(content.source_start_char, opening.source_start_char);
+        assert_eq!(closing.source_end_char, opening.source_end_char);
+        assert!(lines[6].presentation.mermaid_block.is_none());
+    }
+
+    #[test]
+    fn p4_active_mermaid_reveals_both_fences_with_identity_cursor_mapping() {
+        let source = "before\n```mermaid\nflowchart LR\nA --> B\n```\nafter";
+        let cursor = source.find("A --> B").expect("diagram content byte");
+        let lines = source_lines(source, cursor, false);
+
+        assert_eq!(lines[1].presentation.display, "```mermaid");
+        assert_eq!(lines[4].presentation.display, "```");
+        assert_eq!(lines[1].presentation.display_char_for_source(5), 5);
+        assert_eq!(lines[4].presentation.source_char_for_display(2), 2);
+        assert!(
+            lines[4]
+                .presentation
+                .runs
+                .iter()
+                .all(|run| run.mono && run.muted)
+        );
+    }
+
+    #[test]
+    fn p5_math_metadata_covers_inline_and_multiline_display_formulas() {
+        let source = concat!(
+            "Inline $E = mc^2$ and $\\alpha + \\beta$.\n",
+            "Currency $5 and $10 and `code $x$` stay literal.\n",
+            "$$\n",
+            "\\int_0^1 x^2 \\, dx\n",
+            "$$\n",
+            "after"
+        );
+        let lines = source_lines(source, source.chars().count(), false);
+
+        assert_eq!(lines[0].presentation.inline_math.len(), 2);
+        assert_eq!(
+            lines[0].presentation.inline_math[0].formula_source,
+            "E = mc^2"
+        );
+        assert!(lines[1].presentation.inline_math.is_empty());
+        let opening = lines[2]
+            .presentation
+            .math_block
+            .as_ref()
+            .expect("display math anchor");
+        assert!(opening.is_anchor);
+        assert_eq!(
+            opening.formula_source.as_deref(),
+            Some("\\int_0^1 x^2 \\, dx")
+        );
+        assert!(lines[3].presentation.math_block.is_some());
+        assert!(lines[4].presentation.math_block.is_some());
+        assert!(lines[5].presentation.math_block.is_none());
+    }
+
+    #[test]
     fn p3_source_mode_preserves_raw_markdown_and_identity_mapping() {
         let lines = source_lines_with_mode("# 标题\n> quote\n```rust", 0, true, true);
 
@@ -1560,6 +1931,9 @@ mod tests {
             line.presentation.kind == MarkdownBlockKind::Source
                 && line.presentation.table_row.is_none()
                 && line.presentation.code_line.is_none()
+                && line.presentation.mermaid_block.is_none()
+                && line.presentation.math_block.is_none()
+                && line.presentation.inline_math.is_empty()
         }));
         assert_eq!(lines[0].presentation.display_char_for_source(3), 3);
         assert_eq!(lines[1].presentation.source_char_for_display(4), 4);
