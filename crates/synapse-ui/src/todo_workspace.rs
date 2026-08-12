@@ -8,10 +8,13 @@ use gpui::{
     AnyElement, Context, Corner, Entity, Hsla, KeyDownEvent, MouseButton, Pixels, Point,
     SharedString, anchored, deferred, div, point, prelude::*, px, rgb,
 };
-use gpui_animation::{animation::TransitionExt, transition::Transition};
+use gpui_animation::{
+    animation::TransitionExt,
+    transition::{Transition, general::EaseOutQuad},
+};
+use gpui_component::InteractiveElementExt;
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputState};
-use gpui_component::InteractiveElementExt;
 
 use super::{Icon, SynapseApp, SynapseThemePalette};
 
@@ -169,6 +172,11 @@ impl TodoWorkspace {
             })
             .cloned()
             .collect()
+    }
+
+    /// 完整待办集合（不过滤标签或完成状态），用于侧边栏快捷列表。
+    pub(super) fn sidebar_todos(&self) -> Vec<TodoItem> {
+        self.todos.clone()
     }
 
     pub(super) fn tag_usage_count(&self, tag_id: u64) -> usize {
@@ -1231,13 +1239,120 @@ pub(super) fn render_todo_workspace(
         .into_any_element()
 }
 
+/// 侧边栏待办快捷操作区：在「待办」下方内联展开，展示全部待办，
+/// 完成项继续保留并支持直接切换回未完成。
+pub(super) fn render_todo_quick_picker(
+    workspace: &TodoWorkspace,
+    expanded: bool,
+    theme: SynapseThemePalette,
+    cx: &mut Context<SynapseApp>,
+) -> AnyElement {
+    let app = cx.entity();
+    let todos = workspace.sidebar_todos();
+    let content_height = (todos.len() as f32 * TODO_QUICK_ROW_HEIGHT + 10.0).min(144.0);
+    div()
+        .id("todo-quick-panel")
+        .w_full()
+        .h(px(0.0))
+        .opacity(0.0)
+        .overflow_hidden()
+        .child(
+            div()
+                .id("todo-quick-panel-inner")
+                .w_full()
+                .max_h(px(144.0))
+                .overflow_y_scroll()
+                .ml(px(15.0))
+                .border_l_1()
+                .border_color(theme.line_soft)
+                .pl(px(13.0))
+                .pr(px(2.0))
+                .pb(px(4.0))
+                .pt(px(2.0))
+                .when(todos.is_empty(), |panel| {
+                    panel.child(
+                        div()
+                            .px(px(6.0))
+                            .py_2()
+                            .text_size(px(11.5))
+                            .line_height(px(16.0))
+                            .text_color(theme.faint)
+                            .child("还没有待办"),
+                    )
+                })
+                .children(todos.into_iter().map(|todo| {
+                    let todo_id = todo.id;
+                    let toggle_app = app.clone();
+                    div()
+                        .id(SharedString::from(format!("quick-todo-{todo_id}")))
+                        .w_full()
+                        .min_h(px(TODO_QUICK_ROW_HEIGHT))
+                        .flex()
+                        .items_start()
+                        .gap_2()
+                        .px(px(6.0))
+                        .py(px(4.0))
+                        .cursor_pointer()
+                        .hover(move |style| style.bg(theme.hover).text_color(theme.foreground))
+                        .child(
+                            div()
+                                .mt(px(2.0))
+                                .size(px(12.0))
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded(px(4.0))
+                                .border_1()
+                                .when(todo.done, |checkbox| {
+                                    checkbox
+                                        .border_color(theme.foreground)
+                                        .bg(theme.foreground)
+                                        .child(Icon::Check.render(8.0).text_color(theme.background))
+                                })
+                                .when(!todo.done, |checkbox| checkbox.border_color(theme.border)),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_size(px(12.0))
+                                .text_color(if todo.done { theme.faint } else { theme.muted })
+                                .when(todo.done, |text| {
+                                    text.line_through().text_decoration_color(theme.faint)
+                                })
+                                .child(todo.text),
+                        )
+                        .on_click(move |_, _, cx| {
+                            cx.stop_propagation();
+                            toggle_app.update(cx, |this, cx| {
+                                this.toggle_todo_from_quick_picker(todo_id, cx);
+                            });
+                        })
+                })),
+        )
+        .with_transition("todo-quick-panel")
+        .transition_when_else(
+            expanded,
+            Duration::from_millis(150),
+            EaseOutQuad,
+            move |style| style.h(px(content_height)).opacity(1.0),
+            |style| style.h(px(0.0)).opacity(0.0),
+        )
+        .into_any_element()
+}
+
+const TODO_QUICK_ROW_HEIGHT: f32 = 28.0;
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
 
     use super::{
-        AddTodoError, AddTodoTagError, TAG_PILL_SPRING_DAMPING, TAG_PILL_SPRING_MASS,
-        TAG_PILL_SPRING_STIFFNESS, TAG_PILL_TRANSITION, TodoWorkspace, tag_pill_spring_progress,
+        AddTodoTagError, TAG_PILL_SPRING_DAMPING, TAG_PILL_SPRING_MASS, TAG_PILL_SPRING_STIFFNESS,
+        TAG_PILL_TRANSITION, TodoTextError, TodoWorkspace, tag_pill_spring_progress,
     };
 
     #[test]
@@ -1296,10 +1411,10 @@ mod tests {
         let mut workspace = TodoWorkspace::default();
         let work_tag = workspace.add_tag("工作").unwrap();
         assert_eq!(workspace.add_todo("  完成待办输入  "), Ok(1));
-        assert_eq!(workspace.add_todo("  "), Err(AddTodoError::Empty));
+        assert_eq!(workspace.add_todo("  "), Err(TodoTextError::Empty));
         assert_eq!(
             workspace.add_todo(&"长".repeat(501)),
-            Err(AddTodoError::TooLong)
+            Err(TodoTextError::TooLong)
         );
         assert_eq!(workspace.total_count(), 1);
         assert_eq!(workspace.tag_usage_count(work_tag), 1);
@@ -1308,6 +1423,21 @@ mod tests {
         assert!(workspace.toggle_todo(1));
         assert!(workspace.visible_todos()[0].done);
         assert!(!workspace.toggle_todo(99));
+    }
+
+    #[test]
+    fn sidebar_todos_keep_completed_items_visible_and_in_original_order() {
+        let mut workspace = TodoWorkspace::default();
+        let first_id = workspace.add_todo("第一项").unwrap();
+        let second_id = workspace.add_todo("第二项").unwrap();
+        assert!(workspace.toggle_todo(first_id));
+
+        let sidebar_todos = workspace.sidebar_todos();
+        assert_eq!(sidebar_todos.len(), 2);
+        assert_eq!(sidebar_todos[0].id, second_id);
+        assert!(!sidebar_todos[0].done);
+        assert_eq!(sidebar_todos[1].id, first_id);
+        assert!(sidebar_todos[1].done);
     }
 
     #[test]

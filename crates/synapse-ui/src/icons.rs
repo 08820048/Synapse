@@ -9,6 +9,7 @@ pub enum Icon {
     Todo,
     Bookmark,
     Plus,
+    Minus,
     FilePlus,
     FolderPlus,
     Folder,
@@ -33,11 +34,12 @@ pub enum Icon {
 }
 
 impl Icon {
-    const ALL: [Self; 25] = [
+    const ALL: [Self; 26] = [
         Self::Search,
         Self::Todo,
         Self::Bookmark,
         Self::Plus,
+        Self::Minus,
         Self::FilePlus,
         Self::FolderPlus,
         Self::Folder,
@@ -67,6 +69,7 @@ impl Icon {
             Self::Todo => "lucide/list-todo.svg",
             Self::Bookmark => "lucide/bookmark.svg",
             Self::Plus => "lucide/plus.svg",
+            Self::Minus => "lucide/minus.svg",
             Self::FilePlus => "lucide/file-plus.svg",
             Self::FolderPlus => "lucide/folder-plus.svg",
             Self::Folder => "lucide/folder.svg",
@@ -109,6 +112,7 @@ impl AssetSource for SynapseAssets {
                 Some(include_bytes!("../../../assets/icons/lucide/bookmark.svg"))
             }
             "lucide/plus.svg" => Some(include_bytes!("../../../assets/icons/lucide/plus.svg")),
+            "lucide/minus.svg" => Some(include_bytes!("../../../assets/icons/lucide/minus.svg")),
             "lucide/file-plus.svg" => {
                 Some(include_bytes!("../../../assets/icons/lucide/file-plus.svg"))
             }

@@ -12,4 +12,6 @@ sidebar control. P3 adds `chevron-right`, `code-2`, `pilcrow`, `ellipsis-vertica
 `download`, `copy`, and `circle-x` for the note breadcrumb, source toggle, note
 actions, and complete context-menu icon coverage. The Todo workspace adds `tag`
 for its new-label action. The artwork is unchanged; line wrapping was compacted
-without changing SVG attributes or paths.
+without changing SVG attributes or paths. The sidebar Todo collection adds
+`minus` so its collapsed and expanded controls use matching Lucide artwork
+instead of locally drawn strokes.
