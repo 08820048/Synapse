@@ -24,7 +24,7 @@ use gpui::{
 };
 use gpui_animation::{
     animation::TransitionExt,
-    transition::{Transition, general::EaseOutQuad},
+    transition::{Transition, general::EaseInOutCubic, general::EaseOutQuad},
 };
 use gpui_component::{
     ActiveTheme, IconName, Root, Sizable as _, Theme, ThemeMode,
@@ -108,6 +108,8 @@ const TABLE_CELL_HORIZONTAL_PADDING: f32 = 10.0;
 const TABLE_CELL_VERTICAL_PADDING: f32 = 6.0;
 const MENU_ITEM_ICON_SLOT_SIZE: f32 = 18.0;
 const MENU_ITEM_ICON_SIZE: f32 = 15.0;
+const TAG_EDITOR_COLLAPSED_WIDTH: f32 = 104.0;
+const TAG_EDITOR_EXPANDED_WIDTH: f32 = 240.0;
 
 #[derive(Clone, Copy, Debug, Default)]
 struct MarkdPanelSpring;
@@ -3644,224 +3646,272 @@ impl Render for SynapseApp {
                     .window_control_area(WindowControlArea::Drag),
             );
 
-        let editor_toolbar =
-            if todo_workspace_active {
-                let start_app = app_entity.clone();
-                let confirm_app = app_entity.clone();
-                let cancel_app = app_entity.clone();
-                let tag_action = if self.todo_tag_editor_open {
-                    div()
-                        .w(px(300.0))
-                        .h(px(40.0))
-                        .flex_none()
-                        .child(
-                            Input::new(&self.todo_tag_input).h(px(40.0)).suffix(
-                                div()
-                                    .h_full()
-                                    .flex()
-                                    .items_center()
-                                    .child(
-                                        Button::new("confirm-todo-tag")
-                                            .ghost()
-                                            .w(px(40.0))
-                                            .h_full()
-                                            .p_0()
-                                            .rounded(ButtonRounded::None)
-                                            .tooltip("完成新建标签")
-                                            .child(
-                                                Icon::Check
-                                                    .render(15.0)
-                                                    .text_color(theme.muted_foreground),
-                                            )
-                                            .on_click(move |_, window, cx| {
-                                                confirm_app.update(cx, |this, cx| {
-                                                    this.confirm_new_todo_tag(window, cx);
-                                                });
-                                            }),
-                                    )
-                                    .child(
-                                        Button::new("cancel-todo-tag")
-                                            .ghost()
-                                            .w(px(40.0))
-                                            .h_full()
-                                            .p_0()
-                                            .rounded(ButtonRounded::None)
-                                            .tooltip("取消新建标签")
-                                            .child(
-                                                Icon::Close
-                                                    .render(15.0)
-                                                    .text_color(theme.muted_foreground),
-                                            )
-                                            .on_click(move |_, window, cx| {
-                                                cancel_app.update(cx, |this, cx| {
-                                                    this.cancel_new_todo_tag(window, cx);
-                                                });
-                                            }),
-                                    ),
-                            ),
-                        )
-                        .into_any_element()
-                } else {
-                    Button::new("new-todo-tag")
-                        .ghost()
-                        .h(px(40.0))
-                        .px_3()
-                        .child(Icon::Tag.render(15.0).text_color(theme.muted_foreground))
-                        .child("新建标签")
-                        .on_click(move |_, window, cx| {
-                            start_app.update(cx, |this, cx| {
-                                this.begin_new_todo_tag(window, cx);
-                            });
-                        })
-                        .into_any_element()
-                };
-                Some(
-                    div()
-                        .id("todo-toolbar")
-                        .h(px(EDITOR_TOOLBAR_HEIGHT))
-                        .flex_none()
-                        .flex()
-                        .items_center()
-                        .px_3()
-                        .child(
-                            div()
-                                .flex_1()
-                                .text_size(px(13.5))
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .child("待办"),
-                        )
-                        .child(tag_action)
-                        .into_any_element(),
+        let editor_toolbar = if todo_workspace_active {
+            let start_app = app_entity.clone();
+            let confirm_app = app_entity.clone();
+            let cancel_app = app_entity.clone();
+            let tag_editor_open = self.todo_tag_editor_open;
+            let tag_action = div()
+                .id("todo-tag-action")
+                .relative()
+                .h(px(EDITOR_TOOLBAR_HEIGHT))
+                .flex_none()
+                .with_transition("todo-tag-action-width")
+                .transition_when_else(
+                    tag_editor_open,
+                    PANEL_TRANSITION,
+                    EaseInOutCubic,
+                    |style| style.w(px(TAG_EDITOR_EXPANDED_WIDTH)),
+                    |style| style.w(px(TAG_EDITOR_COLLAPSED_WIDTH)),
                 )
-            } else {
-                active_note_path.map(|path| {
-                    let parts = note_breadcrumb_parts(&path);
-                    let last_index = parts.len().saturating_sub(1);
-                    let source_mode = self.markdown_source_mode;
-                    let source_app = app_entity.clone();
-                    let menu_app = app_entity.clone();
+                .child(
                     div()
-                        .id("editor-note-toolbar")
-                        .h(px(EDITOR_TOOLBAR_HEIGHT))
-                        .flex_none()
-                        .flex()
-                        .items_center()
-                        .px_3()
+                        .id("todo-tag-editor")
+                        .w_full()
+                        .h_full()
+                        .with_transition("todo-tag-editor-fade")
+                        .transition_when_else(
+                            tag_editor_open,
+                            QUICK_TRANSITION,
+                            EaseOutQuad,
+                            |style| style.opacity(1.0),
+                            |style| style.opacity(0.0),
+                        )
                         .child(
-                            div()
-                                .flex_1()
-                                .min_w(px(0.0))
-                                .flex()
-                                .items_center()
-                                .overflow_hidden()
-                                .children(parts.into_iter().enumerate().map(|(index, part)| {
+                            Input::new(&self.todo_tag_input)
+                                .appearance(false)
+                                .focus_bordered(false)
+                                .h(px(40.0))
+                                .text_size(px(13.0))
+                                .suffix(
                                     div()
-                                        .min_w(px(0.0))
+                                        .h_full()
                                         .flex()
                                         .items_center()
                                         .gap_1()
-                                        .when(index > 0, |view| {
-                                            view.child(
-                                                Icon::ChevronRight
-                                                    .render(13.0)
-                                                    .flex_none()
-                                                    .text_color(theme.muted_foreground),
-                                            )
-                                        })
+                                        .pr_1()
                                         .child(
-                                            div()
-                                                .max_w(px(if index == last_index {
-                                                    260.0
-                                                } else {
-                                                    140.0
-                                                }))
-                                                .truncate()
-                                                .text_size(px(13.5))
-                                                .text_color(if index == last_index {
-                                                    theme.foreground
-                                                } else {
-                                                    theme.muted_foreground
-                                                })
-                                                .when(index == last_index, |text| {
-                                                    text.font_weight(FontWeight::SEMIBOLD)
-                                                })
-                                                .child(part),
+                                            Button::new("confirm-todo-tag")
+                                                .ghost()
+                                                .w(px(24.0))
+                                                .h(px(24.0))
+                                                .p_0()
+                                                .rounded_full()
+                                                .tooltip("完成新建标签")
+                                                .child(
+                                                    Icon::Check
+                                                        .render(13.0)
+                                                        .text_color(theme.muted_foreground),
+                                                )
+                                                .on_click(move |_, window, cx| {
+                                                    confirm_app.update(cx, |this, cx| {
+                                                        this.confirm_new_todo_tag(window, cx);
+                                                    });
+                                                }),
                                         )
-                                })),
-                        )
-                        .child(
-                            Button::new("toggle-markdown-source")
-                                .ghost()
-                                .size(px(40.0))
-                                .tooltip(if source_mode {
-                                    "Show rich editor"
-                                } else {
-                                    "Show Markdown source"
-                                })
-                                .child(
-                                    div()
-                                        .size(px(28.0))
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .rounded_md()
-                                        .border_1()
-                                        .border_color(theme.tab_bar_segmented)
-                                        .bg(if source_mode {
-                                            theme.foreground
-                                        } else {
-                                            theme.secondary_hover
-                                        })
                                         .child(
-                                            if source_mode {
-                                                Icon::RichText
+                                            Button::new("cancel-todo-tag")
+                                                .ghost()
+                                                .w(px(24.0))
+                                                .h(px(24.0))
+                                                .p_0()
+                                                .rounded_full()
+                                                .tooltip("取消新建标签")
+                                                .child(
+                                                    Icon::Close
+                                                        .render(13.0)
+                                                        .text_color(theme.muted_foreground),
+                                                )
+                                                .on_click(move |_, window, cx| {
+                                                    cancel_app.update(cx, |this, cx| {
+                                                        this.cancel_new_todo_tag(window, cx);
+                                                    });
+                                                }),
+                                        ),
+                                ),
+                        ),
+                )
+                .child(
+                    div()
+                        .id("new-todo-tag-animated")
+                        .absolute()
+                        .right_0()
+                        .w(px(TAG_EDITOR_COLLAPSED_WIDTH))
+                        .h(px(EDITOR_TOOLBAR_HEIGHT))
+                        .with_transition("todo-tag-button-fade")
+                        .transition_when_else(
+                            !tag_editor_open,
+                            QUICK_TRANSITION,
+                            EaseOutQuad,
+                            |style| style.opacity(1.0),
+                            |style| style.opacity(0.0),
+                        )
+                        .when(tag_editor_open, |wrapper| wrapper.invisible())
+                        .child(
+                            Button::new("new-todo-tag")
+                                .ghost()
+                                .w_full()
+                                .h_full()
+                                .px_3()
+                                .child(Icon::Tag.render(15.0).text_color(theme.muted_foreground))
+                                .child("新建标签")
+                                .on_click(move |_, window, cx| {
+                                    start_app.update(cx, |this, cx| {
+                                        this.begin_new_todo_tag(window, cx);
+                                    });
+                                }),
+                        ),
+                )
+                .into_any_element();
+            Some(
+                div()
+                    .id("todo-toolbar")
+                    .h(px(EDITOR_TOOLBAR_HEIGHT))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .px_3()
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_size(px(13.5))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("待办"),
+                    )
+                    .child(tag_action)
+                    .into_any_element(),
+            )
+        } else {
+            active_note_path.map(|path| {
+                let parts = note_breadcrumb_parts(&path);
+                let last_index = parts.len().saturating_sub(1);
+                let source_mode = self.markdown_source_mode;
+                let source_app = app_entity.clone();
+                let menu_app = app_entity.clone();
+                div()
+                    .id("editor-note-toolbar")
+                    .h(px(EDITOR_TOOLBAR_HEIGHT))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .px_3()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .flex()
+                            .items_center()
+                            .overflow_hidden()
+                            .children(parts.into_iter().enumerate().map(|(index, part)| {
+                                div()
+                                    .min_w(px(0.0))
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .when(index > 0, |view| {
+                                        view.child(
+                                            Icon::ChevronRight
+                                                .render(13.0)
+                                                .flex_none()
+                                                .text_color(theme.muted_foreground),
+                                        )
+                                    })
+                                    .child(
+                                        div()
+                                            .max_w(px(if index == last_index {
+                                                260.0
                                             } else {
-                                                Icon::Code
-                                            }
-                                            .render(15.0)
-                                            .text_color(if source_mode {
+                                                140.0
+                                            }))
+                                            .truncate()
+                                            .text_size(px(13.5))
+                                            .text_color(if index == last_index {
+                                                theme.foreground
+                                            } else {
+                                                theme.muted_foreground
+                                            })
+                                            .when(index == last_index, |text| {
+                                                text.font_weight(FontWeight::SEMIBOLD)
+                                            })
+                                            .child(part),
+                                    )
+                            })),
+                    )
+                    .child(
+                        Button::new("toggle-markdown-source")
+                            .ghost()
+                            .size(px(40.0))
+                            .tooltip(if source_mode {
+                                "Show rich editor"
+                            } else {
+                                "Show Markdown source"
+                            })
+                            .child(
+                                div()
+                                    .size(px(28.0))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded_md()
+                                    .border_1()
+                                    .border_color(theme.tab_bar_segmented)
+                                    .bg(if source_mode {
+                                        theme.foreground
+                                    } else {
+                                        theme.secondary_hover
+                                    })
+                                    .child(
+                                        if source_mode {
+                                            Icon::RichText
+                                        } else {
+                                            Icon::Code
+                                        }
+                                        .render(15.0)
+                                        .text_color(
+                                            if source_mode {
                                                 theme.background
                                             } else {
                                                 theme.muted_foreground
-                                            }),
+                                            },
                                         ),
-                                )
-                                .on_click(move |_, _, cx| {
-                                    source_app.update(cx, |this, cx| {
-                                        this.toggle_markdown_source_mode(cx);
-                                    });
-                                }),
-                        )
-                        .child(
-                            Button::new("open-note-actions")
-                                .ghost()
-                                .size(px(40.0))
-                                .tooltip("Note actions")
-                                .child(
-                                    div()
-                                        .size(px(28.0))
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .rounded_md()
-                                        .border_1()
-                                        .border_color(theme.tab_bar_segmented)
-                                        .bg(theme.secondary_hover)
-                                        .child(
-                                            Icon::MoreVertical
-                                                .render(15.0)
-                                                .text_color(theme.muted_foreground),
-                                        ),
-                                )
-                                .on_click(move |_, _, cx| {
-                                    menu_app.update(cx, |this, cx| {
-                                        this.toggle_note_actions_menu(cx);
-                                    });
-                                }),
-                        )
-                        .into_any_element()
-                })
-            };
+                                    ),
+                            )
+                            .on_click(move |_, _, cx| {
+                                source_app.update(cx, |this, cx| {
+                                    this.toggle_markdown_source_mode(cx);
+                                });
+                            }),
+                    )
+                    .child(
+                        Button::new("open-note-actions")
+                            .ghost()
+                            .size(px(40.0))
+                            .tooltip("Note actions")
+                            .child(
+                                div()
+                                    .size(px(28.0))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded_md()
+                                    .border_1()
+                                    .border_color(theme.tab_bar_segmented)
+                                    .bg(theme.secondary_hover)
+                                    .child(
+                                        Icon::MoreVertical
+                                            .render(15.0)
+                                            .text_color(theme.muted_foreground),
+                                    ),
+                            )
+                            .on_click(move |_, _, cx| {
+                                menu_app.update(cx, |this, cx| {
+                                    this.toggle_note_actions_menu(cx);
+                                });
+                            }),
+                    )
+                    .into_any_element()
+            })
+        };
 
         let sidebar_hover = theme.sidebar_accent;
         let sidebar_ink = theme.sidebar_foreground;
@@ -5327,11 +5377,8 @@ fn main() {
                             .placeholder("Search any...")
                             .clean_on_escape()
                     });
-                    let todo_tag_input = cx.new(|cx| {
-                        InputState::new(window, cx)
-                            .placeholder("标签名称")
-                            .clean_on_escape()
-                    });
+                    let todo_tag_input =
+                        cx.new(|cx| InputState::new(window, cx).placeholder("标签名称"));
                     let todo_item_input = cx.new(|cx| {
                         InputState::new(window, cx)
                             .placeholder("添加待办…")
@@ -5340,21 +5387,34 @@ fn main() {
                     let editor_line_layouts = Rc::new(RefCell::new(Vec::new()));
                     let editor_list_state = ListState::new(0, ListAlignment::Top, px(320.0));
                     let app = cx.new(|cx| {
-                        let input_subscriptions = vec![cx.subscribe_in(
-                            &todo_item_input,
-                            window,
-                            |this: &mut SynapseApp, _, event: &InputEvent, window, cx| match event {
-                                InputEvent::Change => {
-                                    if this.todo_item_error.take().is_some() {
-                                        cx.notify();
+                        let input_subscriptions = vec![
+                            cx.subscribe_in(
+                                &todo_tag_input,
+                                window,
+                                |this: &mut SynapseApp, _, event: &InputEvent, window, cx| {
+                                    if let InputEvent::PressEnter { secondary: false } = event {
+                                        this.confirm_new_todo_tag(window, cx);
                                     }
-                                }
-                                InputEvent::PressEnter { secondary: false } => {
-                                    this.confirm_new_todo(window, cx);
-                                }
-                                _ => {}
-                            },
-                        )];
+                                },
+                            ),
+                            cx.subscribe_in(
+                                &todo_item_input,
+                                window,
+                                |this: &mut SynapseApp, _, event: &InputEvent, window, cx| {
+                                    match event {
+                                        InputEvent::Change => {
+                                            if this.todo_item_error.take().is_some() {
+                                                cx.notify();
+                                            }
+                                        }
+                                        InputEvent::PressEnter { secondary: false } => {
+                                            this.confirm_new_todo(window, cx);
+                                        }
+                                        _ => {}
+                                    }
+                                },
+                            ),
+                        ];
                         SynapseApp {
                             state,
                             editor_focus: cx.focus_handle(),

@@ -1,12 +1,14 @@
 use std::{
     fs, io,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use gpui::{
-    AnyElement, Context, Corner, Entity, Hsla, MouseButton, Pixels, Point, SharedString, anchored,
-    deferred, div, point, prelude::*, px, rgb,
+    AnyElement, Context, Corner, Entity, Hsla, KeyDownEvent, MouseButton, Pixels, Point,
+    SharedString, anchored, deferred, div, point, prelude::*, px, rgb,
 };
+use gpui_animation::{animation::TransitionExt, transition::Transition};
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputState};
 
@@ -15,8 +17,47 @@ use super::{Icon, SynapseApp, SynapseThemePalette};
 const CONTENT_MAX_WIDTH: f32 = 900.0;
 const TAG_COLUMN_WIDTH: f32 = 168.0;
 const TAG_ROW_CONTENT_WIDTH: f32 = TAG_COLUMN_WIDTH - 16.0;
+const TAG_ROW_HEIGHT: f32 = 40.0;
+const TAG_ROW_GAP: f32 = 2.0;
+const TAG_PILL_TRANSITION: Duration = Duration::from_millis(180);
+const TAG_PILL_SPRING_STIFFNESS: f32 = 360.0;
+const TAG_PILL_SPRING_DAMPING: f32 = 32.0;
+const TAG_PILL_SPRING_MASS: f32 = 0.6;
 const TAG_NAME_MAX_CHARS: usize = 48;
 const TODO_TEXT_MAX_CHARS: usize = 500;
+
+/// Shared-layout glide used by the Markd `TagRail` active pill: it slides
+/// between tag rows instead of fading in place. Tokens mirror Markd's
+/// `SPRING_LAYOUT` (stiffness 360, damping 32, mass 0.6) normalized to the
+/// project animation convention's 180ms panel duration.
+#[derive(Clone, Copy, Debug, Default)]
+struct TagPillSpring;
+
+impl Transition for TagPillSpring {
+    fn calculate(&self, progress: f32) -> f32 {
+        tag_pill_spring_progress(progress)
+    }
+}
+
+fn tag_pill_spring_progress(progress: f32) -> f32 {
+    let progress = progress.clamp(0.0, 1.0);
+    if progress == 0.0 || progress == 1.0 {
+        return progress;
+    }
+
+    let discriminant = (TAG_PILL_SPRING_DAMPING * TAG_PILL_SPRING_DAMPING
+        - 4.0 * TAG_PILL_SPRING_MASS * TAG_PILL_SPRING_STIFFNESS)
+        .sqrt();
+    let denominator = 2.0 * TAG_PILL_SPRING_MASS;
+    let slow_root = (-TAG_PILL_SPRING_DAMPING + discriminant) / denominator;
+    let fast_root = (-TAG_PILL_SPRING_DAMPING - discriminant) / denominator;
+    let response = |seconds: f32| {
+        1.0 + (fast_root * (slow_root * seconds).exp() - slow_root * (fast_root * seconds).exp())
+            / (slow_root - fast_root)
+    };
+    let duration = TAG_PILL_TRANSITION.as_secs_f32();
+    (response(progress * duration) / response(duration)).clamp(0.0, 1.0)
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct TodoTag {
@@ -495,6 +536,15 @@ pub(super) fn render_todo_workspace(
     let selected_tag_id = workspace.selected_tag_id();
     let total_count = workspace.total_count();
     let completed_count = workspace.completed_count();
+    let active_pill_index = match selected_tag_id {
+        None => 0,
+        Some(tag_id) => workspace
+            .tags()
+            .iter()
+            .position(|tag| tag.id() == tag_id)
+            .map_or(0, |index| index + 1),
+    };
+    let tag_pill_top = active_pill_index as f32 * (TAG_ROW_HEIGHT + TAG_ROW_GAP);
     let sidebar_tags = workspace.tags().to_vec();
     let picker_tags = workspace.tags().to_vec();
     let visible_todos = workspace.visible_todos();
@@ -518,6 +568,12 @@ pub(super) fn render_todo_workspace(
             MouseButton::Left,
             cx.listener(|this, _, _, cx| this.dismiss_todo_tag_picker(cx)),
         )
+        .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+            if event.keystroke.key == "escape" && this.todo_tag_editor_open {
+                this.cancel_new_todo_tag(window, cx);
+                cx.stop_propagation();
+            }
+        }))
         .child(
             div()
                 .w_full()
@@ -542,94 +598,131 @@ pub(super) fn render_todo_workspace(
                                 .child("标签"),
                         )
                         .child(
-                            Button::new("todo-filter-all")
-                                .ghost()
-                                .w_full()
-                                .h(px(40.0))
-                                .px_2()
-                                .justify_start()
-                                .when(selected_tag_id.is_none(), |button| button.bg(theme.active))
+                            div()
+                                .relative()
+                                .flex()
+                                .flex_col()
+                                .gap(px(TAG_ROW_GAP))
                                 .child(
                                     div()
-                                        .w(px(TAG_ROW_CONTENT_WIDTH))
-                                        .flex()
-                                        .items_center()
-                                        .gap_2()
-                                        .child(
-                                            div()
-                                                .size(px(9.0))
-                                                .flex_none()
-                                                .rounded_full()
-                                                .border_1()
-                                                .border_color(theme.muted),
-                                        )
-                                        .child(div().flex_1().text_left().child("全部"))
-                                        .child(
-                                            div()
-                                                .w(px(28.0))
-                                                .text_right()
-                                                .text_size(px(11.5))
-                                                .text_color(theme.muted)
-                                                .child(total_count.to_string()),
+                                        .id("todo-tag-pill")
+                                        .absolute()
+                                        .left_0()
+                                        .right_0()
+                                        .top(px(0.0))
+                                        .h(px(TAG_ROW_HEIGHT))
+                                        .rounded(px(6.0))
+                                        .bg(theme.active)
+                                        .with_transition("todo-tag-pill-transition")
+                                        .transition_when_else(
+                                            true,
+                                            TAG_PILL_TRANSITION,
+                                            TagPillSpring,
+                                            move |style| style.top(px(tag_pill_top)),
+                                            |style| style.top(px(0.0)),
                                         ),
                                 )
-                                .on_click(move |_, _, cx| {
-                                    all_app.update(cx, |this, cx| {
-                                        this.select_todo_tag(None, cx);
-                                    });
-                                }),
+                                .child(
+                                    Button::new("todo-filter-all")
+                                        .ghost()
+                                        .w_full()
+                                        .h(px(TAG_ROW_HEIGHT))
+                                        .px_2()
+                                        .justify_start()
+                                        .when(selected_tag_id.is_none(), |button| {
+                                            button.text_color(theme.foreground)
+                                        })
+                                        .child(
+                                            div()
+                                                .w(px(TAG_ROW_CONTENT_WIDTH))
+                                                .flex()
+                                                .items_center()
+                                                .gap_2()
+                                                .child(
+                                                    div()
+                                                        .size(px(9.0))
+                                                        .flex_none()
+                                                        .rounded_full()
+                                                        .border_1()
+                                                        .border_color(theme.muted),
+                                                )
+                                                .child(div().flex_1().text_left().child("全部"))
+                                                .child(
+                                                    div()
+                                                        .w(px(28.0))
+                                                        .text_right()
+                                                        .text_size(px(11.5))
+                                                        .text_color(if selected_tag_id.is_none() {
+                                                            theme.muted
+                                                        } else {
+                                                            theme.faint
+                                                        })
+                                                        .child(total_count.to_string()),
+                                                ),
+                                        )
+                                        .on_click(move |_, _, cx| {
+                                            all_app.update(cx, |this, cx| {
+                                                this.select_todo_tag(None, cx);
+                                            });
+                                        }),
+                                )
+                                .children(sidebar_tags.into_iter().map(|tag| {
+                                    let tag_id = tag.id();
+                                    let tag_name = tag.name().to_owned();
+                                    let usage_count = workspace.tag_usage_count(tag_id);
+                                    let color = tag_color(tag.color_index);
+                                    let tag_app = app.clone();
+                                    Button::new(SharedString::from(format!("todo-tag-{tag_id}")))
+                                        .ghost()
+                                        .w_full()
+                                        .h(px(TAG_ROW_HEIGHT))
+                                        .px_2()
+                                        .justify_start()
+                                        .when(selected_tag_id == Some(tag_id), |button| {
+                                            button.text_color(theme.foreground)
+                                        })
+                                        .child(
+                                            div()
+                                                .w(px(TAG_ROW_CONTENT_WIDTH))
+                                                .flex()
+                                                .items_center()
+                                                .gap_2()
+                                                .child(
+                                                    div()
+                                                        .size(px(9.0))
+                                                        .flex_none()
+                                                        .rounded_full()
+                                                        .bg(color),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .flex_1()
+                                                        .min_w(px(0.0))
+                                                        .truncate()
+                                                        .text_left()
+                                                        .child(tag_name),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .w(px(28.0))
+                                                        .text_right()
+                                                        .text_size(px(11.5))
+                                                        .text_color(if selected_tag_id == Some(tag_id)
+                                                        {
+                                                            theme.muted
+                                                        } else {
+                                                            theme.faint
+                                                        })
+                                                        .child(usage_count.to_string()),
+                                                ),
+                                        )
+                                        .on_click(move |_, _, cx| {
+                                            tag_app.update(cx, |this, cx| {
+                                                this.select_todo_tag(Some(tag_id), cx);
+                                            });
+                                        })
+                                }))
                         )
-                        .children(sidebar_tags.into_iter().map(|tag| {
-                            let tag_id = tag.id();
-                            let tag_name = tag.name().to_owned();
-                            let usage_count = workspace.tag_usage_count(tag_id);
-                            let color = tag_color(tag.color_index);
-                            let tag_app = app.clone();
-                            Button::new(SharedString::from(format!("todo-tag-{tag_id}")))
-                                .ghost()
-                                .w_full()
-                                .h(px(40.0))
-                                .px_2()
-                                .justify_start()
-                                .when(selected_tag_id == Some(tag_id), |button| {
-                                    button.bg(theme.active)
-                                })
-                                .child(
-                                    div()
-                                        .w(px(TAG_ROW_CONTENT_WIDTH))
-                                        .flex()
-                                        .items_center()
-                                        .gap_2()
-                                        .child(
-                                            div()
-                                                .size(px(9.0))
-                                                .flex_none()
-                                                .rounded_full()
-                                                .bg(color),
-                                        )
-                                        .child(
-                                            div()
-                                                .flex_1()
-                                                .min_w(px(0.0))
-                                                .truncate()
-                                                .text_left()
-                                                .child(tag_name),
-                                        )
-                                        .child(
-                                            div()
-                                                .w(px(28.0))
-                                                .text_right()
-                                                .text_size(px(11.5))
-                                                .text_color(theme.muted)
-                                                .child(usage_count.to_string()),
-                                        ),
-                                )
-                                .on_click(move |_, _, cx| {
-                                    tag_app.update(cx, |this, cx| {
-                                        this.select_todo_tag(Some(tag_id), cx);
-                                    });
-                                })
-                        }))
                         .when(workspace.tags().is_empty(), |column| {
                             column.child(
                                 div()
@@ -1067,7 +1160,28 @@ pub(super) fn render_todo_workspace(
 
 #[cfg(test)]
 mod tests {
-    use super::{AddTodoError, AddTodoTagError, TodoWorkspace};
+    use std::time::Duration;
+
+    use super::{
+        AddTodoError, AddTodoTagError, TAG_PILL_SPRING_DAMPING, TAG_PILL_SPRING_MASS,
+        TAG_PILL_SPRING_STIFFNESS, TAG_PILL_TRANSITION, TodoWorkspace, tag_pill_spring_progress,
+    };
+
+    #[test]
+    fn tag_pill_spring_matches_markd_layout_tokens_and_stays_monotonic() {
+        assert_eq!(TAG_PILL_TRANSITION, Duration::from_millis(180));
+        assert_eq!(TAG_PILL_SPRING_STIFFNESS, 360.0);
+        assert_eq!(TAG_PILL_SPRING_DAMPING, 32.0);
+        assert_eq!(TAG_PILL_SPRING_MASS, 0.6);
+        assert_eq!(tag_pill_spring_progress(0.0), 0.0);
+        assert_eq!(tag_pill_spring_progress(1.0), 1.0);
+
+        let samples = (0..=20)
+            .map(|step| tag_pill_spring_progress(step as f32 / 20.0))
+            .collect::<Vec<_>>();
+        assert!(samples.windows(2).all(|pair| pair[0] <= pair[1]));
+        assert!(samples.iter().all(|value| (0.0..=1.0).contains(value)));
+    }
 
     #[test]
     fn tags_trim_validate_deduplicate_and_select_the_new_item() {
