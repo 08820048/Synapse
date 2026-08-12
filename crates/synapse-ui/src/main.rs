@@ -35,6 +35,7 @@ use gpui_component::{
 use synapse::ShellState;
 use synapse_core::{VaultEntry, VaultEntryKind};
 
+mod bookmark_workspace;
 mod document_outline;
 mod editor_blink;
 mod editor_surface;
@@ -44,6 +45,10 @@ mod inline_rename;
 mod math_renderer;
 mod todo_workspace;
 
+use bookmark_workspace::{
+    BookmarkTagPicker, BookmarkWorkspace, BookmarkWorkspaceRenderState, fetch_link_metadata,
+    is_bookmark_url_candidate, render_bookmark_quick_picker, render_bookmark_workspace,
+};
 use document_outline::{
     DocumentOutlineEntry, active_document_outline_index, build_document_outline,
     document_outline_horizontal_layout, document_outline_is_visible, document_outline_layout,
@@ -73,6 +78,7 @@ const SIDEBAR_SHORTCUT_ACTION_WIDTH: f32 = 40.0;
 const SIDEBAR_TREE_FONT_FAMILY: &str = "Inter";
 const SIDEBAR_TREE_FONT_SIZE: f32 = 13.0;
 const SIDEBAR_TREE_ROW_HEIGHT: f32 = 30.0;
+const SIDEBAR_TREE_ROOT_INSET: f32 = 12.0;
 const SIDEBAR_SEARCH_OUTER_MARGIN: f32 = 8.0;
 const SIDEBAR_SEARCH_INNER_PADDING: f32 = 12.0;
 const SIDEBAR_SEARCH_CONTENT_WIDTH: f32 =
@@ -536,6 +542,7 @@ enum WorkspaceView {
     #[default]
     Note,
     Todo,
+    Bookmark,
 }
 
 struct SynapseApp {
@@ -554,6 +561,18 @@ struct SynapseApp {
     todo_edit_error: Option<String>,
     todo_tag_picker: Option<TodoTagPicker>,
     todo_quick_open: bool,
+    bookmark_query_input: Entity<InputState>,
+    bookmark_tag_input: Entity<InputState>,
+    bookmark_edit_input: Entity<InputState>,
+    bookmark_workspace: BookmarkWorkspace,
+    bookmark_tag_editor_open: bool,
+    bookmark_query_error: Option<String>,
+    bookmark_tag_error: Option<String>,
+    bookmark_editing_id: Option<u64>,
+    bookmark_edit_error: Option<String>,
+    bookmark_tag_picker: Option<BookmarkTagPicker>,
+    bookmark_quick_open: bool,
+    bookmark_fetching_ids: BTreeSet<u64>,
     _input_subscriptions: Vec<Subscription>,
     theme_preference: ThemePreference,
     theme_settings_open: bool,
@@ -938,6 +957,320 @@ fn hex_value(byte: u8) -> Option<u8> {
 }
 
 impl SynapseApp {
+    fn open_bookmark_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.workspace_view = WorkspaceView::Bookmark;
+        self.dismiss_command_palette(cx);
+        self.dismiss_context_menus(cx);
+        window.focus(&self.bookmark_query_input.focus_handle(cx));
+        let pending = self
+            .bookmark_workspace
+            .bookmarks()
+            .iter()
+            .filter(|bookmark| !bookmark.meta_fetched())
+            .map(|bookmark| bookmark.id())
+            .collect::<Vec<_>>();
+        for bookmark_id in pending {
+            self.fetch_bookmark_metadata(bookmark_id, cx);
+        }
+        cx.notify();
+    }
+
+    fn select_bookmark_tag(&mut self, tag_id: Option<u64>, cx: &mut Context<Self>) {
+        self.bookmark_workspace.select_tag(tag_id);
+        self.bookmark_query_error = None;
+        self.bookmark_tag_picker = None;
+        cx.notify();
+    }
+
+    fn confirm_bookmark_query(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let input = self.bookmark_query_input.read(cx).value().to_string();
+        if !is_bookmark_url_candidate(&input) {
+            if input.contains("://") {
+                self.bookmark_query_error = Some("请输入有效的 HTTP 或 HTTPS 链接".to_owned());
+                cx.notify();
+            }
+            return;
+        }
+        match self.bookmark_workspace.add_bookmark(&input) {
+            Ok(bookmark_id) => {
+                self.bookmark_query_error = self
+                    .bookmark_workspace
+                    .save_default()
+                    .err()
+                    .map(|error| format!("书签已添加，但无法保存：{error}"));
+                self.bookmark_query_input.update(cx, |input, cx| {
+                    input.set_value("", window, cx);
+                });
+                self.fetch_bookmark_metadata(bookmark_id, cx);
+            }
+            Err(error) => self.bookmark_query_error = Some(error.message().to_owned()),
+        }
+        window.focus(&self.bookmark_query_input.focus_handle(cx));
+        cx.notify();
+    }
+
+    fn fetch_bookmark_metadata(&mut self, bookmark_id: u64, cx: &mut Context<Self>) {
+        if !self.bookmark_fetching_ids.insert(bookmark_id) {
+            return;
+        }
+        let Some(url) = self
+            .bookmark_workspace
+            .bookmark(bookmark_id)
+            .map(|bookmark| bookmark.url().to_owned())
+        else {
+            self.bookmark_fetching_ids.remove(&bookmark_id);
+            return;
+        };
+        let client = cx.http_client();
+        cx.spawn(async move |this, cx| {
+            let metadata = fetch_link_metadata(client, url).await;
+            let _ = this.update(cx, |this, cx| {
+                this.bookmark_fetching_ids.remove(&bookmark_id);
+                match metadata {
+                    Ok(metadata) => {
+                        this.bookmark_workspace
+                            .apply_metadata(bookmark_id, metadata);
+                    }
+                    Err(_) => {
+                        // A bookmark remains useful without metadata; avoid retry loops after a
+                        // permanent CORS/network/server failure.
+                        this.bookmark_workspace.mark_metadata_fetched(bookmark_id);
+                    }
+                }
+                if let Err(error) = this.bookmark_workspace.save_default() {
+                    this.bookmark_query_error = Some(format!("元数据已更新，但无法保存：{error}"));
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn begin_new_bookmark_tag(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.bookmark_tag_input.update(cx, |input, cx| {
+            input.set_value("", window, cx);
+        });
+        self.bookmark_tag_editor_open = true;
+        self.bookmark_tag_error = None;
+        window.focus(&self.bookmark_tag_input.focus_handle(cx));
+        cx.notify();
+    }
+
+    fn cancel_new_bookmark_tag(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.bookmark_tag_input.update(cx, |input, cx| {
+            input.set_value("", window, cx);
+        });
+        self.bookmark_tag_editor_open = false;
+        self.bookmark_tag_error = None;
+        cx.notify();
+    }
+
+    fn confirm_new_bookmark_tag(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let name = self.bookmark_tag_input.read(cx).value().to_string();
+        match self.bookmark_workspace.add_tag(&name) {
+            Ok(_) => {
+                self.bookmark_tag_editor_open = false;
+                self.bookmark_tag_error = self
+                    .bookmark_workspace
+                    .save_default()
+                    .err()
+                    .map(|error| format!("标签已添加，但无法保存：{error}"));
+                self.bookmark_tag_input.update(cx, |input, cx| {
+                    input.set_value("", window, cx);
+                });
+            }
+            Err(error) => {
+                self.bookmark_tag_error = Some(error.message().to_owned());
+                window.focus(&self.bookmark_tag_input.focus_handle(cx));
+            }
+        }
+        cx.notify();
+    }
+
+    fn begin_edit_bookmark(
+        &mut self,
+        bookmark_id: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(title) = self
+            .bookmark_workspace
+            .bookmark(bookmark_id)
+            .map(|bookmark| bookmark.title().to_owned())
+        else {
+            return;
+        };
+        self.bookmark_editing_id = Some(bookmark_id);
+        self.bookmark_edit_error = None;
+        self.bookmark_tag_picker = None;
+        self.bookmark_edit_input
+            .update(cx, |input, cx| input.set_value(title, window, cx));
+        window.focus(&self.bookmark_edit_input.focus_handle(cx));
+        cx.notify();
+    }
+
+    fn confirm_edit_bookmark(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(bookmark_id) = self.bookmark_editing_id else {
+            return;
+        };
+        let title = self.bookmark_edit_input.read(cx).value().to_string();
+        match self.bookmark_workspace.update_title(bookmark_id, &title) {
+            Ok(changed) => {
+                self.bookmark_editing_id = None;
+                if changed {
+                    self.bookmark_edit_error = self
+                        .bookmark_workspace
+                        .save_default()
+                        .err()
+                        .map(|error| format!("书签已更新，但无法保存：{error}"));
+                }
+            }
+            Err(error) => {
+                self.bookmark_edit_error = Some(error.message().to_owned());
+                window.focus(&self.bookmark_edit_input.focus_handle(cx));
+            }
+        }
+        cx.notify();
+    }
+
+    fn cancel_edit_bookmark(&mut self, cx: &mut Context<Self>) {
+        if self.bookmark_editing_id.take().is_some() {
+            self.bookmark_edit_error = None;
+            cx.notify();
+        }
+    }
+
+    fn toggle_bookmark_tag_picker(
+        &mut self,
+        bookmark_id: u64,
+        position: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        self.bookmark_tag_picker = if self
+            .bookmark_tag_picker
+            .is_some_and(|picker| picker.bookmark_id == bookmark_id)
+        {
+            None
+        } else {
+            Some(BookmarkTagPicker {
+                bookmark_id,
+                position,
+            })
+        };
+        cx.notify();
+    }
+
+    fn dismiss_bookmark_tag_picker(&mut self, cx: &mut Context<Self>) {
+        if self.bookmark_tag_picker.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    fn toggle_bookmark_tag(&mut self, bookmark_id: u64, tag_id: u64, cx: &mut Context<Self>) {
+        if self.bookmark_workspace.toggle_tag(bookmark_id, tag_id) {
+            self.bookmark_query_error = self
+                .bookmark_workspace
+                .save_default()
+                .err()
+                .map(|error| format!("标签分配已更新，但无法保存：{error}"));
+            cx.notify();
+        }
+    }
+
+    fn remove_bookmark_tag(&mut self, bookmark_id: u64, tag_id: u64, cx: &mut Context<Self>) {
+        if self.bookmark_workspace.remove_tag(bookmark_id, tag_id) {
+            self.bookmark_query_error = self
+                .bookmark_workspace
+                .save_default()
+                .err()
+                .map(|error| format!("标签已取消分配，但无法保存：{error}"));
+            cx.notify();
+        }
+    }
+
+    fn delete_bookmark_tag(&mut self, tag_id: u64, cx: &mut Context<Self>) {
+        if self.bookmark_workspace.delete_tag(tag_id) {
+            self.bookmark_tag_picker = None;
+            self.bookmark_tag_error = self
+                .bookmark_workspace
+                .save_default()
+                .err()
+                .map(|error| format!("标签已删除，但无法保存：{error}"));
+            cx.notify();
+        }
+    }
+
+    fn open_bookmark_url(&mut self, bookmark_id: u64, cx: &mut Context<Self>) {
+        if let Some(url) = self
+            .bookmark_workspace
+            .bookmark(bookmark_id)
+            .map(|bookmark| bookmark.url().to_owned())
+        {
+            cx.open_url(&url);
+        }
+    }
+
+    fn copy_bookmark_url(&mut self, url: String, cx: &mut Context<Self>) {
+        cx.write_to_clipboard(ClipboardItem::new_string(url));
+        self.bookmark_query_error = None;
+        cx.notify();
+    }
+
+    fn delete_bookmark(&mut self, bookmark_id: u64, cx: &mut Context<Self>) {
+        if self.bookmark_workspace.delete_bookmark(bookmark_id) {
+            self.bookmark_fetching_ids.remove(&bookmark_id);
+            if self
+                .bookmark_tag_picker
+                .is_some_and(|picker| picker.bookmark_id == bookmark_id)
+            {
+                self.bookmark_tag_picker = None;
+            }
+            self.bookmark_query_error = self
+                .bookmark_workspace
+                .save_default()
+                .err()
+                .map(|error| format!("书签已删除，但无法保存：{error}"));
+            cx.notify();
+        }
+    }
+
+    fn toggle_bookmark_quick_picker(&mut self, cx: &mut Context<Self>) {
+        self.bookmark_quick_open = !self.bookmark_quick_open;
+        self.dismiss_command_palette(cx);
+        self.dismiss_context_menus(cx);
+        cx.notify();
+    }
+
+    fn export_bookmarks(&mut self, cx: &mut Context<Self>) {
+        let markdown = self.bookmark_workspace.to_markdown();
+        let receiver = cx.prompt_for_new_path(Path::new(""), Some("bookmarks.md"));
+        cx.spawn(async move |this, cx| match receiver.await {
+            Ok(Ok(Some(path))) => {
+                if let Err(error) = fs::write(&path, markdown) {
+                    let _ = this.update(cx, |this, cx| {
+                        this.bookmark_query_error =
+                            Some(format!("无法导出书签到 {}：{error}", path.display()));
+                        cx.notify();
+                    });
+                }
+            }
+            Ok(Ok(None)) => {}
+            Ok(Err(error)) => {
+                let _ = this.update(cx, |this, cx| {
+                    this.bookmark_query_error = Some(format!("无法打开导出对话框：{error}"));
+                    cx.notify();
+                });
+            }
+            Err(error) => {
+                let _ = this.update(cx, |this, cx| {
+                    this.bookmark_query_error = Some(format!("导出对话框意外关闭：{error}"));
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
     fn open_todo_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.workspace_view = WorkspaceView::Todo;
         self.dismiss_command_palette(cx);
@@ -1094,6 +1427,17 @@ impl SynapseApp {
                 .save_default()
                 .err()
                 .map(|error| format!("标签已取消分配，但无法保存：{error}"));
+            cx.notify();
+        }
+    }
+
+    fn delete_todo_tag(&mut self, tag_id: u64, cx: &mut Context<Self>) {
+        if self.todo_workspace.delete_tag(tag_id) {
+            self.todo_tag_error = self
+                .todo_workspace
+                .save_default()
+                .err()
+                .map(|error| format!("标签已删除，但无法保存：{error}"));
             cx.notify();
         }
     }
@@ -3218,7 +3562,9 @@ impl Render for SynapseApp {
         let app_entity = cx.entity();
         let command_kbd = Kbd::binding_for_action(&OpenCommandPalette, None, window);
         let todo_workspace_active = self.workspace_view == WorkspaceView::Todo;
-        let selected_path = (!todo_workspace_active)
+        let bookmark_workspace_active = self.workspace_view == WorkspaceView::Bookmark;
+        let note_workspace_active = self.workspace_view == WorkspaceView::Note;
+        let selected_path = note_workspace_active
             .then(|| {
                 self.state
                     .active_document()
@@ -3260,6 +3606,22 @@ impl Render for SynapseApp {
                     todo_edit_input: &self.todo_edit_input,
                     todo_editing_id: self.todo_editing_id,
                     todo_edit_error: self.todo_edit_error.as_deref(),
+                    theme: synapse_theme_palette(theme.is_dark()),
+                },
+                cx,
+            )
+        } else if bookmark_workspace_active {
+            render_bookmark_workspace(
+                &self.bookmark_workspace,
+                BookmarkWorkspaceRenderState {
+                    query_input: &self.bookmark_query_input,
+                    query_error: self.bookmark_query_error.as_deref(),
+                    tag_error: self.bookmark_tag_error.as_deref(),
+                    tag_picker: self.bookmark_tag_picker,
+                    edit_input: &self.bookmark_edit_input,
+                    editing_id: self.bookmark_editing_id,
+                    edit_error: self.bookmark_edit_error.as_deref(),
+                    fetching_ids: &self.bookmark_fetching_ids,
                     theme: synapse_theme_palette(theme.is_dark()),
                 },
                 cx,
@@ -3623,7 +3985,7 @@ impl Render for SynapseApp {
             .children(tabs.into_iter().enumerate().map(|(index, tab)| {
                 let tab_id = SharedString::from(format!("tab-{index}"));
                 let close_id = SharedString::from(format!("close-tab-{index}"));
-                let is_active = !todo_workspace_active && active_tab == Some(index);
+                let is_active = note_workspace_active && active_tab == Some(index);
                 let close_app = tab_app.clone();
                 div()
                     .id(tab_id)
@@ -3720,270 +4082,413 @@ impl Render for SynapseApp {
                     .window_control_area(WindowControlArea::Drag),
             );
 
-        let editor_toolbar =
-            if todo_workspace_active {
-                let start_app = app_entity.clone();
-                let confirm_app = app_entity.clone();
-                let cancel_app = app_entity.clone();
-                let tag_editor_open = self.todo_tag_editor_open;
-                let tag_action = div()
-                    .id("todo-tag-action")
-                    .relative()
-                    .w(px(TAG_EDITOR_COLLAPSED_WIDTH))
-                    .h(px(EDITOR_TOOLBAR_HEIGHT))
-                    .flex_none()
-                    .child(
-                        div()
-                            .id("todo-tag-editor")
-                            .w_full()
-                            .h_full()
-                            .when(!tag_editor_open, |editor| editor.invisible())
-                            .when(tag_editor_open, |editor| editor.opacity(1.0))
-                            .child(
-                                Input::new(&self.todo_tag_input)
-                                    .appearance(false)
-                                    .focus_bordered(false)
-                                    .h(px(40.0))
-                                    .text_size(px(13.0))
-                                    .suffix(
-                                        div()
-                                            .h_full()
-                                            .flex()
-                                            .items_center()
-                                            .gap_1()
-                                            .pr_1()
-                                            .child(
-                                                Button::new("confirm-todo-tag")
-                                                    .ghost()
-                                                    .w(px(24.0))
-                                                    .h(px(24.0))
-                                                    .p_0()
-                                                    .rounded_full()
-                                                    .tooltip("完成新建标签")
-                                                    .child(
-                                                        Icon::Check
-                                                            .render(13.0)
-                                                            .text_color(theme.muted_foreground),
-                                                    )
-                                                    .on_click(move |_, window, cx| {
-                                                        confirm_app.update(cx, |this, cx| {
-                                                            this.confirm_new_todo_tag(window, cx);
-                                                        });
-                                                    }),
-                                            )
-                                            .child(
-                                                Button::new("cancel-todo-tag")
-                                                    .ghost()
-                                                    .w(px(24.0))
-                                                    .h(px(24.0))
-                                                    .p_0()
-                                                    .rounded_full()
-                                                    .tooltip("取消新建标签")
-                                                    .child(
-                                                        Icon::Close
-                                                            .render(13.0)
-                                                            .text_color(theme.muted_foreground),
-                                                    )
-                                                    .on_click(move |_, window, cx| {
-                                                        cancel_app.update(cx, |this, cx| {
-                                                            this.cancel_new_todo_tag(window, cx);
-                                                        });
-                                                    }),
-                                            ),
-                                    ),
-                            ),
-                    )
-                    .with_transition("todo-tag-action-width")
-                    .transition_when_else(
-                        tag_editor_open,
-                        PANEL_TRANSITION,
-                        EaseInOutCubic,
-                        |style| style.w(px(TAG_EDITOR_EXPANDED_WIDTH)),
-                        |style| style.w(px(TAG_EDITOR_COLLAPSED_WIDTH)),
-                    )
-                    .into_any_element();
-
-                let new_tag_button = div()
-                    .id("new-todo-tag-animated")
-                    .absolute()
-                    .top_0()
-                    .right_0()
-                    .w(px(TAG_EDITOR_COLLAPSED_WIDTH))
-                    .h(px(EDITOR_TOOLBAR_HEIGHT))
-                    .overflow_hidden()
-                    .child(
-                        Button::new("new-todo-tag")
-                            .ghost()
-                            .w_full()
-                            .h_full()
-                            .px_3()
-                            .child(Icon::Tag.render(15.0).text_color(theme.muted_foreground))
-                            .child("新建标签")
-                            .on_click(move |_, window, cx| {
-                                start_app.update(cx, |this, cx| {
-                                    this.begin_new_todo_tag(window, cx);
-                                });
-                            }),
-                    )
-                    .with_transition("todo-tag-button-fade")
-                    .transition_when_else(
-                        !tag_editor_open,
-                        QUICK_TRANSITION,
-                        EaseOutQuad,
-                        |style| style.opacity(1.0).w(px(TAG_EDITOR_COLLAPSED_WIDTH)),
-                        |style| style.opacity(0.0).w(px(0.0)),
-                    )
-                    .into_any_element();
-
-                Some(
+        let editor_toolbar = if todo_workspace_active {
+            let start_app = app_entity.clone();
+            let confirm_app = app_entity.clone();
+            let cancel_app = app_entity.clone();
+            let tag_editor_open = self.todo_tag_editor_open;
+            let tag_action = div()
+                .id("todo-tag-action")
+                .relative()
+                .w(px(TAG_EDITOR_COLLAPSED_WIDTH))
+                .h(px(EDITOR_TOOLBAR_HEIGHT))
+                .flex_none()
+                .child(
                     div()
-                        .id("todo-toolbar")
-                        .relative()
-                        .h(px(EDITOR_TOOLBAR_HEIGHT))
-                        .flex_none()
-                        .flex()
-                        .items_center()
-                        .px_3()
+                        .id("todo-tag-editor")
+                        .w_full()
+                        .h_full()
+                        .when(!tag_editor_open, |editor| editor.invisible())
+                        .when(tag_editor_open, |editor| editor.opacity(1.0))
                         .child(
-                            div()
-                                .flex_1()
-                                .text_size(px(13.5))
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .child("待办"),
-                        )
-                        .child(tag_action)
-                        .child(new_tag_button)
-                        .into_any_element(),
-                )
-            } else {
-                active_note_path.map(|path| {
-                    let parts = note_breadcrumb_parts(&path);
-                    let last_index = parts.len().saturating_sub(1);
-                    let source_mode = self.markdown_source_mode;
-                    let source_app = app_entity.clone();
-                    let menu_app = app_entity.clone();
-                    div()
-                        .id("editor-note-toolbar")
-                        .h(px(EDITOR_TOOLBAR_HEIGHT))
-                        .flex_none()
-                        .flex()
-                        .items_center()
-                        .px_3()
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w(px(0.0))
-                                .flex()
-                                .items_center()
-                                .overflow_hidden()
-                                .children(parts.into_iter().enumerate().map(|(index, part)| {
+                            Input::new(&self.todo_tag_input)
+                                .appearance(false)
+                                .focus_bordered(false)
+                                .h(px(40.0))
+                                .text_size(px(13.0))
+                                .suffix(
                                     div()
-                                        .min_w(px(0.0))
+                                        .h_full()
                                         .flex()
                                         .items_center()
                                         .gap_1()
-                                        .when(index > 0, |view| {
-                                            view.child(
-                                                Icon::ChevronRight
-                                                    .render(13.0)
-                                                    .flex_none()
-                                                    .text_color(theme.muted_foreground),
-                                            )
-                                        })
+                                        .pr_1()
                                         .child(
-                                            div()
-                                                .max_w(px(if index == last_index {
-                                                    260.0
-                                                } else {
-                                                    140.0
-                                                }))
-                                                .truncate()
-                                                .text_size(px(13.5))
-                                                .text_color(if index == last_index {
-                                                    theme.foreground
-                                                } else {
-                                                    theme.muted_foreground
-                                                })
-                                                .when(index == last_index, |text| {
-                                                    text.font_weight(FontWeight::SEMIBOLD)
-                                                })
-                                                .child(part),
+                                            Button::new("confirm-todo-tag")
+                                                .ghost()
+                                                .w(px(24.0))
+                                                .h(px(24.0))
+                                                .p_0()
+                                                .rounded_full()
+                                                .tooltip("完成新建标签")
+                                                .child(
+                                                    Icon::Check
+                                                        .render(13.0)
+                                                        .text_color(theme.muted_foreground),
+                                                )
+                                                .on_click(move |_, window, cx| {
+                                                    confirm_app.update(cx, |this, cx| {
+                                                        this.confirm_new_todo_tag(window, cx);
+                                                    });
+                                                }),
                                         )
-                                })),
-                        )
+                                        .child(
+                                            Button::new("cancel-todo-tag")
+                                                .ghost()
+                                                .w(px(24.0))
+                                                .h(px(24.0))
+                                                .p_0()
+                                                .rounded_full()
+                                                .tooltip("取消新建标签")
+                                                .child(
+                                                    Icon::Close
+                                                        .render(13.0)
+                                                        .text_color(theme.muted_foreground),
+                                                )
+                                                .on_click(move |_, window, cx| {
+                                                    cancel_app.update(cx, |this, cx| {
+                                                        this.cancel_new_todo_tag(window, cx);
+                                                    });
+                                                }),
+                                        ),
+                                ),
+                        ),
+                )
+                .with_transition("todo-tag-action-width")
+                .transition_when_else(
+                    tag_editor_open,
+                    PANEL_TRANSITION,
+                    EaseInOutCubic,
+                    |style| style.w(px(TAG_EDITOR_EXPANDED_WIDTH)),
+                    |style| style.w(px(TAG_EDITOR_COLLAPSED_WIDTH)),
+                )
+                .into_any_element();
+
+            let new_tag_button = div()
+                .id("new-todo-tag-animated")
+                .absolute()
+                .top_0()
+                .right_0()
+                .w(px(TAG_EDITOR_COLLAPSED_WIDTH))
+                .h(px(EDITOR_TOOLBAR_HEIGHT))
+                .overflow_hidden()
+                .child(
+                    Button::new("new-todo-tag")
+                        .ghost()
+                        .w_full()
+                        .h_full()
+                        .px_3()
+                        .child(Icon::Tag.render(15.0).text_color(theme.muted_foreground))
+                        .child("新建标签")
+                        .on_click(move |_, window, cx| {
+                            start_app.update(cx, |this, cx| {
+                                this.begin_new_todo_tag(window, cx);
+                            });
+                        }),
+                )
+                .with_transition("todo-tag-button-fade")
+                .transition_when_else(
+                    !tag_editor_open,
+                    QUICK_TRANSITION,
+                    EaseOutQuad,
+                    |style| style.opacity(1.0).w(px(TAG_EDITOR_COLLAPSED_WIDTH)),
+                    |style| style.opacity(0.0).w(px(0.0)),
+                )
+                .into_any_element();
+
+            Some(
+                div()
+                    .id("todo-toolbar")
+                    .relative()
+                    .h(px(EDITOR_TOOLBAR_HEIGHT))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .px_3()
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_size(px(13.5))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("待办"),
+                    )
+                    .child(tag_action)
+                    .child(new_tag_button)
+                    .into_any_element(),
+            )
+        } else if bookmark_workspace_active {
+            let start_app = app_entity.clone();
+            let confirm_app = app_entity.clone();
+            let cancel_app = app_entity.clone();
+            let export_app = app_entity.clone();
+            let tag_editor_open = self.bookmark_tag_editor_open;
+            let tag_action = div()
+                .id("bookmark-tag-action")
+                .relative()
+                .w(px(TAG_EDITOR_COLLAPSED_WIDTH))
+                .h(px(EDITOR_TOOLBAR_HEIGHT))
+                .flex_none()
+                .child(
+                    div()
+                        .id("bookmark-tag-editor")
+                        .w_full()
+                        .h_full()
+                        .when(!tag_editor_open, |editor| editor.invisible())
                         .child(
-                            Button::new("toggle-markdown-source")
-                                .ghost()
-                                .size(px(40.0))
-                                .tooltip(if source_mode {
-                                    "Show rich editor"
-                                } else {
-                                    "Show Markdown source"
-                                })
-                                .child(
+                            Input::new(&self.bookmark_tag_input)
+                                .appearance(false)
+                                .focus_bordered(false)
+                                .h(px(40.0))
+                                .text_size(px(13.0))
+                                .suffix(
                                     div()
-                                        .size(px(28.0))
+                                        .h_full()
                                         .flex()
                                         .items_center()
-                                        .justify_center()
-                                        .rounded_md()
-                                        .border_1()
-                                        .border_color(theme.tab_bar_segmented)
-                                        .bg(if source_mode {
-                                            theme.foreground
-                                        } else {
-                                            theme.secondary_hover
-                                        })
+                                        .gap_1()
+                                        .pr_1()
                                         .child(
-                                            if source_mode {
-                                                Icon::RichText
+                                            Button::new("confirm-bookmark-tag")
+                                                .ghost()
+                                                .size(px(24.0))
+                                                .p_0()
+                                                .tooltip("完成新建标签")
+                                                .child(
+                                                    Icon::Check
+                                                        .render(13.0)
+                                                        .text_color(theme.muted_foreground),
+                                                )
+                                                .on_click(move |_, window, cx| {
+                                                    confirm_app.update(cx, |this, cx| {
+                                                        this.confirm_new_bookmark_tag(window, cx)
+                                                    });
+                                                }),
+                                        )
+                                        .child(
+                                            Button::new("cancel-bookmark-tag")
+                                                .ghost()
+                                                .size(px(24.0))
+                                                .p_0()
+                                                .tooltip("取消新建标签")
+                                                .child(
+                                                    Icon::Close
+                                                        .render(13.0)
+                                                        .text_color(theme.muted_foreground),
+                                                )
+                                                .on_click(move |_, window, cx| {
+                                                    cancel_app.update(cx, |this, cx| {
+                                                        this.cancel_new_bookmark_tag(window, cx)
+                                                    });
+                                                }),
+                                        ),
+                                ),
+                        ),
+                )
+                .with_transition("bookmark-tag-action-width")
+                .transition_when_else(
+                    tag_editor_open,
+                    PANEL_TRANSITION,
+                    EaseInOutCubic,
+                    |style| style.w(px(TAG_EDITOR_EXPANDED_WIDTH)),
+                    |style| style.w(px(TAG_EDITOR_COLLAPSED_WIDTH)),
+                )
+                .into_any_element();
+            let new_tag_button = div()
+                .id("new-bookmark-tag-animated")
+                .absolute()
+                .top_0()
+                .right_0()
+                .w(px(TAG_EDITOR_COLLAPSED_WIDTH))
+                .h(px(EDITOR_TOOLBAR_HEIGHT))
+                .overflow_hidden()
+                .child(
+                    Button::new("new-bookmark-tag")
+                        .ghost()
+                        .w_full()
+                        .h_full()
+                        .px_3()
+                        .child(Icon::Tag.render(15.0).text_color(theme.muted_foreground))
+                        .child("新建标签")
+                        .on_click(move |_, window, cx| {
+                            start_app
+                                .update(cx, |this, cx| this.begin_new_bookmark_tag(window, cx));
+                        }),
+                )
+                .with_transition("bookmark-tag-button-fade")
+                .transition_when_else(
+                    !tag_editor_open,
+                    QUICK_TRANSITION,
+                    EaseOutQuad,
+                    |style| style.opacity(1.0).w(px(TAG_EDITOR_COLLAPSED_WIDTH)),
+                    |style| style.opacity(0.0).w(px(0.0)),
+                )
+                .into_any_element();
+            Some(
+                div()
+                    .id("bookmark-toolbar")
+                    .relative()
+                    .h(px(EDITOR_TOOLBAR_HEIGHT))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .px_3()
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_size(px(13.5))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("书签"),
+                    )
+                    .child(
+                        Button::new("export-bookmarks")
+                            .ghost()
+                            .h_full()
+                            .px_3()
+                            .child(
+                                Icon::Download
+                                    .render(15.0)
+                                    .text_color(theme.muted_foreground),
+                            )
+                            .child("导出")
+                            .on_click(move |_, _, cx| {
+                                export_app.update(cx, |this, cx| this.export_bookmarks(cx));
+                            }),
+                    )
+                    .child(tag_action)
+                    .child(new_tag_button)
+                    .into_any_element(),
+            )
+        } else {
+            active_note_path.map(|path| {
+                let parts = note_breadcrumb_parts(&path);
+                let last_index = parts.len().saturating_sub(1);
+                let source_mode = self.markdown_source_mode;
+                let source_app = app_entity.clone();
+                let menu_app = app_entity.clone();
+                div()
+                    .id("editor-note-toolbar")
+                    .h(px(EDITOR_TOOLBAR_HEIGHT))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .px_3()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .flex()
+                            .items_center()
+                            .overflow_hidden()
+                            .children(parts.into_iter().enumerate().map(|(index, part)| {
+                                div()
+                                    .min_w(px(0.0))
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .when(index > 0, |view| {
+                                        view.child(
+                                            Icon::ChevronRight
+                                                .render(13.0)
+                                                .flex_none()
+                                                .text_color(theme.muted_foreground),
+                                        )
+                                    })
+                                    .child(
+                                        div()
+                                            .max_w(px(if index == last_index {
+                                                260.0
                                             } else {
-                                                Icon::Code
-                                            }
-                                            .render(15.0)
-                                            .text_color(if source_mode {
+                                                140.0
+                                            }))
+                                            .truncate()
+                                            .text_size(px(13.5))
+                                            .text_color(if index == last_index {
+                                                theme.foreground
+                                            } else {
+                                                theme.muted_foreground
+                                            })
+                                            .when(index == last_index, |text| {
+                                                text.font_weight(FontWeight::SEMIBOLD)
+                                            })
+                                            .child(part),
+                                    )
+                            })),
+                    )
+                    .child(
+                        Button::new("toggle-markdown-source")
+                            .ghost()
+                            .size(px(40.0))
+                            .tooltip(if source_mode {
+                                "Show rich editor"
+                            } else {
+                                "Show Markdown source"
+                            })
+                            .child(
+                                div()
+                                    .size(px(28.0))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded_md()
+                                    .border_1()
+                                    .border_color(theme.tab_bar_segmented)
+                                    .bg(if source_mode {
+                                        theme.foreground
+                                    } else {
+                                        theme.secondary_hover
+                                    })
+                                    .child(
+                                        if source_mode {
+                                            Icon::RichText
+                                        } else {
+                                            Icon::Code
+                                        }
+                                        .render(15.0)
+                                        .text_color(
+                                            if source_mode {
                                                 theme.background
                                             } else {
                                                 theme.muted_foreground
-                                            }),
+                                            },
                                         ),
-                                )
-                                .on_click(move |_, _, cx| {
-                                    source_app.update(cx, |this, cx| {
-                                        this.toggle_markdown_source_mode(cx);
-                                    });
-                                }),
-                        )
-                        .child(
-                            Button::new("open-note-actions")
-                                .ghost()
-                                .size(px(40.0))
-                                .tooltip("Note actions")
-                                .child(
-                                    div()
-                                        .size(px(28.0))
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .rounded_md()
-                                        .border_1()
-                                        .border_color(theme.tab_bar_segmented)
-                                        .bg(theme.secondary_hover)
-                                        .child(
-                                            Icon::MoreVertical
-                                                .render(15.0)
-                                                .text_color(theme.muted_foreground),
-                                        ),
-                                )
-                                .on_click(move |_, _, cx| {
-                                    menu_app.update(cx, |this, cx| {
-                                        this.toggle_note_actions_menu(cx);
-                                    });
-                                }),
-                        )
-                        .into_any_element()
-                })
-            };
+                                    ),
+                            )
+                            .on_click(move |_, _, cx| {
+                                source_app.update(cx, |this, cx| {
+                                    this.toggle_markdown_source_mode(cx);
+                                });
+                            }),
+                    )
+                    .child(
+                        Button::new("open-note-actions")
+                            .ghost()
+                            .size(px(40.0))
+                            .tooltip("Note actions")
+                            .child(
+                                div()
+                                    .size(px(28.0))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded_md()
+                                    .border_1()
+                                    .border_color(theme.tab_bar_segmented)
+                                    .bg(theme.secondary_hover)
+                                    .child(
+                                        Icon::MoreVertical
+                                            .render(15.0)
+                                            .text_color(theme.muted_foreground),
+                                    ),
+                            )
+                            .on_click(move |_, _, cx| {
+                                menu_app.update(cx, |this, cx| {
+                                    this.toggle_note_actions_menu(cx);
+                                });
+                            }),
+                    )
+                    .into_any_element()
+            })
+        };
 
         let sidebar_hover = theme.sidebar_accent;
         let sidebar_ink = theme.sidebar_foreground;
@@ -4083,7 +4588,7 @@ impl Render for SynapseApp {
                                     .flex()
                                     .items_center()
                                     .gap(px(10.0))
-                                    .pl_2()
+                                    .pl(px(SIDEBAR_TREE_ROOT_INSET))
                                     .cursor_pointer()
                                     .child(Icon::Todo.render(15.0).flex_none().text_color(row_ink))
                                     .child(
@@ -4143,58 +4648,102 @@ impl Render for SynapseApp {
             })
             .child({
                 let shortcut_app = app_entity.clone();
-                let add_app = app_entity.clone();
+                let quick_app = app_entity.clone();
+                let bookmark_quick_open = self.bookmark_quick_open;
+                let bookmark_workspace_active = self.workspace_view == WorkspaceView::Bookmark;
+                let palette = synapse_theme_palette(theme.is_dark());
+                let row_ink = if bookmark_workspace_active {
+                    palette.foreground
+                } else {
+                    palette.muted
+                };
                 div()
                     .w_full()
-                    .h(px(30.0))
-                    .flex()
-                    .items_center()
+                    .flex_none()
                     .child(
-                        Button::new("bookmark-shortcut")
-                            .ghost()
-                            .flex_1()
-                            .min_w(px(0.0))
-                            .h_full()
-                            .px_3()
-                            .justify_start()
+                        div()
+                            .id("bookmark-collection")
+                            .w_full()
+                            .h(px(30.0))
+                            .flex()
+                            .items_center()
+                            .rounded_md()
+                            .when(bookmark_workspace_active, |row| {
+                                row.bg(palette.active).text_color(palette.foreground)
+                            })
+                            .when(!bookmark_workspace_active, |row| {
+                                row.text_color(palette.muted).hover(move |style| {
+                                    style.bg(palette.hover).text_color(palette.foreground)
+                                })
+                            })
                             .child(
                                 div()
+                                    .id("bookmark-collection-nav")
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .h_full()
                                     .flex()
                                     .items_center()
-                                    .gap_2()
+                                    .gap(px(10.0))
+                                    .pl(px(SIDEBAR_TREE_ROOT_INSET))
+                                    .cursor_pointer()
                                     .child(
-                                        Icon::Bookmark
-                                            .render(16.0)
-                                            .flex_none()
-                                            .text_color(theme.muted_foreground),
+                                        Icon::Bookmark.render(15.0).flex_none().text_color(row_ink),
                                     )
-                                    .child("书签"),
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w(px(0.0))
+                                            .overflow_hidden()
+                                            .whitespace_nowrap()
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_size(px(13.0))
+                                            .child("书签"),
+                                    )
+                                    .on_click(move |_, window, cx| {
+                                        shortcut_app.update(cx, |this, cx| {
+                                            this.open_bookmark_workspace(window, cx)
+                                        });
+                                    }),
                             )
-                            .on_click(move |_, window, cx| {
-                                shortcut_app.update(cx, |this, cx| {
-                                    this.open_command_palette(window, cx);
-                                });
-                            }),
-                    )
-                    .child(
-                        Button::new("bookmark-add")
-                            .ghost()
-                            .w(px(SIDEBAR_SHORTCUT_ACTION_WIDTH))
-                            .h_full()
-                            .p_0()
-                            .rounded(ButtonRounded::None)
                             .child(
-                                Icon::Plus
-                                    .render(14.0)
+                                div()
+                                    .id("bookmark-collection-toggle")
+                                    .w(px(SIDEBAR_SHORTCUT_ACTION_WIDTH))
+                                    .h_full()
                                     .flex_none()
-                                    .text_color(theme.muted_foreground),
-                            )
-                            .on_click(move |_, window, cx| {
-                                add_app.update(cx, |this, cx| {
-                                    this.open_command_palette(window, cx);
-                                });
-                            }),
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded_md()
+                                    .cursor_pointer()
+                                    .hover(move |style| {
+                                        style.bg(palette.active).text_color(palette.foreground)
+                                    })
+                                    .child(
+                                        if bookmark_quick_open {
+                                            Icon::Minus
+                                        } else {
+                                            Icon::Plus
+                                        }
+                                        .render(14.0)
+                                        .flex_none()
+                                        .text_color(row_ink),
+                                    )
+                                    .on_click(move |_, _, cx| {
+                                        cx.stop_propagation();
+                                        quick_app.update(cx, |this, cx| {
+                                            this.toggle_bookmark_quick_picker(cx)
+                                        });
+                                    }),
+                            ),
                     )
+                    .child(render_bookmark_quick_picker(
+                        &self.bookmark_workspace,
+                        bookmark_quick_open,
+                        palette,
+                        cx,
+                    ))
             })
             .child(
                 div()
@@ -4301,7 +4850,7 @@ impl Render for SynapseApp {
                                     .flex()
                                     .items_center()
                                     .gap_2()
-                                    .pl(px(12.0 + depth as f32 * 16.0))
+                                    .pl(px(SIDEBAR_TREE_ROOT_INSET + depth as f32 * 16.0))
                                     .pr_2()
                                     .font_family(SIDEBAR_TREE_FONT_FAMILY)
                                     .text_size(px(SIDEBAR_TREE_FONT_SIZE))
@@ -4414,7 +4963,7 @@ impl Render for SynapseApp {
                                     .flex()
                                     .items_center()
                                     .gap_2()
-                                    .pl(px(12.0 + depth as f32 * 16.0))
+                                    .pl(px(SIDEBAR_TREE_ROOT_INSET + depth as f32 * 16.0))
                                     .pr_2()
                                     .font_family(SIDEBAR_TREE_FONT_FAMILY)
                                     .text_size(px(SIDEBAR_TREE_FONT_SIZE))
@@ -4507,7 +5056,7 @@ impl Render for SynapseApp {
                                 .h(px(28.0))
                                 .flex()
                                 .items_center()
-                                .pl(px(12.0 + depth as f32 * 16.0))
+                                .pl(px(SIDEBAR_TREE_ROOT_INSET + depth as f32 * 16.0))
                                 .pr_2()
                                 .text_xs()
                                 .text_color(theme.muted_foreground)
@@ -5055,10 +5604,10 @@ impl Render for SynapseApp {
                                 .justify_start()
                                 .child(Icon::Bookmark.render(17.0))
                                 .child(div().flex_1().child("Open Bookmarks"))
-                                .on_click(move |_, _, cx| {
+                                .on_click(move |_, window, cx| {
                                     cx.stop_propagation();
                                     bookmarks_app.update(cx, |this, cx| {
-                                        this.dismiss_command_palette(cx);
+                                        this.open_bookmark_workspace(window, cx);
                                     });
                                 }),
                         )
@@ -5432,6 +5981,7 @@ fn main() {
     let state = ShellState::from_vault_argument(std::env::args_os().nth(1));
     let theme_preference = load_theme_preference();
     let todo_workspace = TodoWorkspace::load_default();
+    let bookmark_workspace = BookmarkWorkspace::load_default();
     let http_client = SynapseHttpClient::new().expect("failed to initialize the HTTP client");
 
     Application::new()
@@ -5500,6 +6050,18 @@ fn main() {
                             .placeholder("编辑待办…")
                             .clean_on_escape()
                     });
+                    let bookmark_query_input = cx.new(|cx| {
+                        InputState::new(window, cx)
+                            .placeholder("搜索书签，或粘贴链接…")
+                            .clean_on_escape()
+                    });
+                    let bookmark_tag_input =
+                        cx.new(|cx| InputState::new(window, cx).placeholder("标签名称"));
+                    let bookmark_edit_input = cx.new(|cx| {
+                        InputState::new(window, cx)
+                            .placeholder("编辑书签标题…")
+                            .clean_on_escape()
+                    });
                     let editor_line_layouts = Rc::new(RefCell::new(Vec::new()));
                     let editor_list_state = ListState::new(0, ListAlignment::Top, px(320.0));
                     let app = cx.new(|cx| {
@@ -5550,6 +6112,50 @@ fn main() {
                                     }
                                 },
                             ),
+                            cx.subscribe_in(
+                                &bookmark_query_input,
+                                window,
+                                |this: &mut SynapseApp, _, event: &InputEvent, window, cx| {
+                                    match event {
+                                        InputEvent::Change => {
+                                            if this.bookmark_query_error.take().is_some() {
+                                                cx.notify();
+                                            }
+                                        }
+                                        InputEvent::PressEnter { secondary: false } => {
+                                            this.confirm_bookmark_query(window, cx);
+                                        }
+                                        _ => {}
+                                    }
+                                },
+                            ),
+                            cx.subscribe_in(
+                                &bookmark_tag_input,
+                                window,
+                                |this: &mut SynapseApp, _, event: &InputEvent, window, cx| {
+                                    if let InputEvent::PressEnter { secondary: false } = event {
+                                        this.confirm_new_bookmark_tag(window, cx);
+                                    }
+                                },
+                            ),
+                            cx.subscribe_in(
+                                &bookmark_edit_input,
+                                window,
+                                |this: &mut SynapseApp, _, event: &InputEvent, window, cx| {
+                                    match event {
+                                        InputEvent::Change => {
+                                            if this.bookmark_edit_error.take().is_some() {
+                                                cx.notify();
+                                            }
+                                        }
+                                        InputEvent::PressEnter { secondary: false } => {
+                                            this.confirm_edit_bookmark(window, cx);
+                                        }
+                                        InputEvent::Blur => this.cancel_edit_bookmark(cx),
+                                        _ => {}
+                                    }
+                                },
+                            ),
                         ];
                         SynapseApp {
                             state,
@@ -5567,6 +6173,18 @@ fn main() {
                             todo_edit_error: None,
                             todo_tag_picker: None,
                             todo_quick_open: false,
+                            bookmark_query_input,
+                            bookmark_tag_input,
+                            bookmark_edit_input,
+                            bookmark_workspace,
+                            bookmark_tag_editor_open: false,
+                            bookmark_query_error: None,
+                            bookmark_tag_error: None,
+                            bookmark_editing_id: None,
+                            bookmark_edit_error: None,
+                            bookmark_tag_picker: None,
+                            bookmark_quick_open: false,
+                            bookmark_fetching_ids: BTreeSet::new(),
                             _input_subscriptions: input_subscriptions,
                             theme_preference,
                             theme_settings_open: false,

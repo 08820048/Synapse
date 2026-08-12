@@ -21,12 +21,12 @@ use super::{Icon, SynapseApp, SynapseThemePalette};
 const CONTENT_MAX_WIDTH: f32 = 900.0;
 const TAG_COLUMN_WIDTH: f32 = 168.0;
 const TAG_ROW_CONTENT_WIDTH: f32 = TAG_COLUMN_WIDTH - 16.0;
-const TAG_ROW_HEIGHT: f32 = 40.0;
-const TAG_ROW_GAP: f32 = 2.0;
-const TAG_PILL_TRANSITION: Duration = Duration::from_millis(180);
-const TAG_PILL_SPRING_STIFFNESS: f32 = 360.0;
-const TAG_PILL_SPRING_DAMPING: f32 = 32.0;
-const TAG_PILL_SPRING_MASS: f32 = 0.6;
+pub(super) const TAG_ROW_HEIGHT: f32 = 40.0;
+pub(super) const TAG_ROW_GAP: f32 = 2.0;
+pub(super) const TAG_PILL_TRANSITION: Duration = Duration::from_millis(180);
+pub(super) const TAG_PILL_SPRING_STIFFNESS: f32 = 360.0;
+pub(super) const TAG_PILL_SPRING_DAMPING: f32 = 32.0;
+pub(super) const TAG_PILL_SPRING_MASS: f32 = 0.6;
 const TAG_NAME_MAX_CHARS: usize = 48;
 const TODO_TEXT_MAX_CHARS: usize = 500;
 
@@ -35,7 +35,7 @@ const TODO_TEXT_MAX_CHARS: usize = 500;
 /// `SPRING_LAYOUT` (stiffness 360, damping 32, mass 0.6) normalized to the
 /// project animation convention's 180ms panel duration.
 #[derive(Clone, Copy, Debug, Default)]
-struct TagPillSpring;
+pub(super) struct TagPillSpring;
 
 impl Transition for TagPillSpring {
     fn calculate(&self, progress: f32) -> f32 {
@@ -304,6 +304,20 @@ impl TodoWorkspace {
         self.todos.len() != previous_len
     }
 
+    pub(super) fn delete_tag(&mut self, tag_id: u64) -> bool {
+        let Some(index) = self.tags.iter().position(|tag| tag.id == tag_id) else {
+            return false;
+        };
+        let tag_name = self.tags.remove(index).name;
+        for todo in &mut self.todos {
+            todo.tags.retain(|tag| tag != &tag_name);
+        }
+        if self.selected_tag_id == Some(tag_id) {
+            self.selected_tag_id = None;
+        }
+        true
+    }
+
     pub(super) fn clear_completed(&mut self) -> usize {
         let previous_len = self.todos.len();
         self.todos.retain(|todo| !todo.done);
@@ -559,7 +573,7 @@ fn decode_tags(value: &str) -> Option<Vec<String>> {
     Some(tags)
 }
 
-fn tag_color(index: usize) -> Hsla {
+pub(super) fn tag_color(index: usize) -> Hsla {
     const COLORS: [u32; 6] = [0x2f8cff, 0xff9f1a, 0x16a3ff, 0x6c63e8, 0xa0a0a0, 0x35b779];
     rgb(COLORS[index % COLORS.len()]).into()
 }
@@ -676,8 +690,11 @@ pub(super) fn render_todo_workspace(
                                         .h(px(TAG_ROW_HEIGHT))
                                         .px_2()
                                         .justify_start()
-                                        .when(selected_tag_id.is_none(), |button| {
-                                            button.text_color(theme.foreground)
+                                        .text_size(px(13.0))
+                                        .text_color(if selected_tag_id.is_none() {
+                                            theme.foreground
+                                        } else {
+                                            theme.muted
                                         })
                                         .child(
                                             div()
@@ -719,55 +736,116 @@ pub(super) fn render_todo_workspace(
                                     let usage_count = workspace.tag_usage_count(tag_id);
                                     let color = tag_color(tag.color_index);
                                     let tag_app = app.clone();
-                                    Button::new(SharedString::from(format!("todo-tag-{tag_id}")))
-                                        .ghost()
+                                    let delete_app = app.clone();
+                                    let hover_group = SharedString::from(format!(
+                                        "todo-tag-row-{tag_id}"
+                                    ));
+                                    div()
+                                        .group(hover_group.clone())
+                                        .relative()
                                         .w_full()
                                         .h(px(TAG_ROW_HEIGHT))
-                                        .px_2()
-                                        .justify_start()
-                                        .when(selected_tag_id == Some(tag_id), |button| {
-                                            button.text_color(theme.foreground)
+                                        .rounded(px(6.0))
+                                        .when(selected_tag_id != Some(tag_id), |row| {
+                                            row.hover(move |style| {
+                                                style
+                                                    .bg(theme.hover)
+                                                    .text_color(theme.foreground)
+                                            })
                                         })
                                         .child(
-                                            div()
-                                                .w(px(TAG_ROW_CONTENT_WIDTH))
-                                                .flex()
-                                                .items_center()
-                                                .gap_2()
+                                            Button::new(SharedString::from(format!(
+                                                "todo-tag-{tag_id}"
+                                            )))
+                                                .ghost()
+                                                .w_full()
+                                                .h_full()
+                                                .px_2()
+                                                .justify_start()
+                                                .text_size(px(13.0))
+                                                .text_color(if selected_tag_id == Some(tag_id) {
+                                                    theme.foreground
+                                                } else {
+                                                    theme.muted
+                                                })
                                                 .child(
                                                     div()
-                                                        .size(px(9.0))
-                                                        .flex_none()
-                                                        .rounded_full()
-                                                        .bg(color),
+                                                        .w(px(TAG_ROW_CONTENT_WIDTH))
+                                                        .flex()
+                                                        .items_center()
+                                                        .gap_2()
+                                                        .child(
+                                                            div()
+                                                                .size(px(9.0))
+                                                                .flex_none()
+                                                                .rounded_full()
+                                                                .bg(color),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .flex_1()
+                                                                .min_w(px(0.0))
+                                                                .truncate()
+                                                                .text_left()
+                                                                .child(tag_name),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .w(px(28.0))
+                                                                .pr(px(2.0))
+                                                                .text_right()
+                                                                .text_size(px(11.5))
+                                                                .group_hover(
+                                                                    hover_group.clone(),
+                                                                    |count| count.opacity(0.0),
+                                                                )
+                                                                .text_color(
+                                                                    if selected_tag_id
+                                                                        == Some(tag_id)
+                                                                    {
+                                                                        theme.muted
+                                                                    } else {
+                                                                        theme.faint
+                                                                    },
+                                                                )
+                                                                .child(usage_count.to_string()),
+                                                        ),
                                                 )
-                                                .child(
-                                                    div()
-                                                        .flex_1()
-                                                        .min_w(px(0.0))
-                                                        .truncate()
-                                                        .text_left()
-                                                        .child(tag_name),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .w(px(28.0))
-                                                        .text_right()
-                                                        .text_size(px(11.5))
-                                                        .text_color(if selected_tag_id == Some(tag_id)
-                                                        {
-                                                            theme.muted
-                                                        } else {
-                                                            theme.faint
-                                                        })
-                                                        .child(usage_count.to_string()),
-                                                ),
+                                                .on_click(move |_, _, cx| {
+                                                    tag_app.update(cx, |this, cx| {
+                                                        this.select_todo_tag(Some(tag_id), cx);
+                                                    });
+                                                }),
                                         )
-                                        .on_click(move |_, _, cx| {
-                                            tag_app.update(cx, |this, cx| {
-                                                this.select_todo_tag(Some(tag_id), cx);
-                                            });
-                                        })
+                                        .child(
+                                            Button::new(SharedString::from(format!(
+                                                "delete-todo-tag-{tag_id}"
+                                            )))
+                                            .ghost()
+                                            .absolute()
+                                            .right_0()
+                                            .top_0()
+                                            .w(px(40.0))
+                                            .h_full()
+                                            .p_0()
+                                            .opacity(0.0)
+                                            .invisible()
+                                            .group_hover(hover_group, |button| {
+                                                button.visible().opacity(1.0)
+                                            })
+                                            .tooltip("删除标签")
+                                            .child(
+                                                Icon::Close
+                                                    .render(12.0)
+                                                    .text_color(theme.faint),
+                                            )
+                                            .on_click(move |_, _, cx| {
+                                                cx.stop_propagation();
+                                                delete_app.update(cx, |this, cx| {
+                                                    this.delete_todo_tag(tag_id, cx);
+                                                });
+                                            }),
+                                        )
                                 }))
                         )
                         .when(workspace.tags().is_empty(), |column| {
@@ -1481,6 +1559,18 @@ mod tests {
         assert!(!workspace.contains_todo(third_id));
         assert_eq!(workspace.tag_usage_count(work_tag), 1);
         assert_eq!(workspace.clear_completed(), 0);
+    }
+
+    #[test]
+    fn deleting_a_tag_removes_every_assignment_without_deleting_todos() {
+        let mut workspace = TodoWorkspace::default();
+        let tag_id = workspace.add_tag("工作").unwrap();
+        workspace.add_todo("保留这条待办").unwrap();
+        assert!(workspace.delete_tag(tag_id));
+        assert!(workspace.tags.is_empty());
+        assert_eq!(workspace.todos.len(), 1);
+        assert!(workspace.todos[0].tags.is_empty());
+        assert_eq!(workspace.selected_tag_id, None);
     }
 
     #[test]

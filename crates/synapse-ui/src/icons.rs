@@ -31,10 +31,11 @@ pub enum Icon {
     CloseAll,
     Check,
     Tag,
+    Globe,
 }
 
 impl Icon {
-    const ALL: [Self; 26] = [
+    const ALL: [Self; 27] = [
         Self::Search,
         Self::Todo,
         Self::Bookmark,
@@ -61,6 +62,7 @@ impl Icon {
         Self::CloseAll,
         Self::Check,
         Self::Tag,
+        Self::Globe,
     ];
 
     pub fn path(self) -> &'static str {
@@ -91,6 +93,7 @@ impl Icon {
             Self::CloseAll => "lucide/circle-x.svg",
             Self::Check => "lucide/check.svg",
             Self::Tag => "lucide/tag.svg",
+            Self::Globe => "lucide/globe.svg",
         }
     }
 
@@ -162,6 +165,7 @@ impl AssetSource for SynapseAssets {
             }
             "lucide/check.svg" => Some(include_bytes!("../../../assets/icons/lucide/check.svg")),
             "lucide/tag.svg" => Some(include_bytes!("../../../assets/icons/lucide/tag.svg")),
+            "lucide/globe.svg" => Some(include_bytes!("../../../assets/icons/lucide/globe.svg")),
             _ => None,
         };
 
