@@ -3654,6 +3654,7 @@ impl Render for SynapseApp {
             let tag_action = div()
                 .id("todo-tag-action")
                 .relative()
+                .w(px(TAG_EDITOR_COLLAPSED_WIDTH))
                 .h(px(EDITOR_TOOLBAR_HEIGHT))
                 .flex_none()
                 .with_transition("todo-tag-action-width")
@@ -3669,6 +3670,7 @@ impl Render for SynapseApp {
                         .id("todo-tag-editor")
                         .w_full()
                         .h_full()
+                        .opacity(0.0)
                         .with_transition("todo-tag-editor-fade")
                         .transition_when_else(
                             tag_editor_open,
@@ -3738,15 +3740,15 @@ impl Render for SynapseApp {
                         .right_0()
                         .w(px(TAG_EDITOR_COLLAPSED_WIDTH))
                         .h(px(EDITOR_TOOLBAR_HEIGHT))
+                        .overflow_hidden()
                         .with_transition("todo-tag-button-fade")
                         .transition_when_else(
                             !tag_editor_open,
                             QUICK_TRANSITION,
                             EaseOutQuad,
-                            |style| style.opacity(1.0),
-                            |style| style.opacity(0.0),
+                            |style| style.opacity(1.0).w(px(TAG_EDITOR_COLLAPSED_WIDTH)),
+                            |style| style.opacity(0.0).w(px(0.0)),
                         )
-                        .when(tag_editor_open, |wrapper| wrapper.invisible())
                         .child(
                             Button::new("new-todo-tag")
                                 .ghost()
