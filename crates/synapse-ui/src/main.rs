@@ -544,11 +544,14 @@ struct SynapseApp {
     command_search: Entity<InputState>,
     todo_tag_input: Entity<InputState>,
     todo_item_input: Entity<InputState>,
+    todo_edit_input: Entity<InputState>,
     todo_workspace: TodoWorkspace,
     workspace_view: WorkspaceView,
     todo_tag_editor_open: bool,
     todo_tag_error: Option<String>,
     todo_item_error: Option<String>,
+    todo_editing_id: Option<u64>,
+    todo_edit_error: Option<String>,
     todo_tag_picker: Option<TodoTagPicker>,
     _input_subscriptions: Vec<Subscription>,
     theme_preference: ThemePreference,
@@ -978,6 +981,53 @@ impl SynapseApp {
                 .save_default()
                 .err()
                 .map(|error| format!("待办状态已更新，但无法保存：{error}"));
+            cx.notify();
+        }
+    }
+
+    fn begin_edit_todo(&mut self, todo_id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(text) = self.todo_workspace.todo_text(todo_id) else {
+            return;
+        };
+        self.todo_editing_id = Some(todo_id);
+        self.todo_edit_error = None;
+        self.todo_tag_picker = None;
+        self.todo_edit_input.update(cx, |input, cx| {
+            input.set_value(text, window, cx);
+        });
+        window.focus(&self.todo_edit_input.focus_handle(cx));
+        cx.notify();
+    }
+
+    fn confirm_edit_todo(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(todo_id) = self.todo_editing_id else {
+            return;
+        };
+        let text = self.todo_edit_input.read(cx).value().to_string();
+        match self.todo_workspace.update_todo_text(todo_id, &text) {
+            Ok(true) => {
+                self.todo_editing_id = None;
+                self.todo_edit_error = self
+                    .todo_workspace
+                    .save_default()
+                    .err()
+                    .map(|error| format!("待办已更新，但无法保存：{error}"));
+            }
+            Ok(false) => {
+                // 文本未变化或待办已不存在：直接结束编辑
+                self.todo_editing_id = None;
+            }
+            Err(error) => {
+                self.todo_edit_error = Some(error.message().to_owned());
+                window.focus(&self.todo_edit_input.focus_handle(cx));
+            }
+        }
+        cx.notify();
+    }
+
+    fn cancel_edit_todo(&mut self, cx: &mut Context<Self>) {
+        if self.todo_editing_id.take().is_some() {
+            self.todo_edit_error = None;
             cx.notify();
         }
     }
@@ -3186,6 +3236,9 @@ impl Render for SynapseApp {
                     todo_error: self.todo_item_error.as_deref(),
                     tag_error: self.todo_tag_error.as_deref(),
                     tag_picker: self.todo_tag_picker,
+                    todo_edit_input: &self.todo_edit_input,
+                    todo_editing_id: self.todo_editing_id,
+                    todo_edit_error: self.todo_edit_error.as_deref(),
                     theme: synapse_theme_palette(theme.is_dark()),
                 },
                 cx,
@@ -3657,28 +3710,13 @@ impl Render for SynapseApp {
                 .w(px(TAG_EDITOR_COLLAPSED_WIDTH))
                 .h(px(EDITOR_TOOLBAR_HEIGHT))
                 .flex_none()
-                .with_transition("todo-tag-action-width")
-                .transition_when_else(
-                    tag_editor_open,
-                    PANEL_TRANSITION,
-                    EaseInOutCubic,
-                    |style| style.w(px(TAG_EDITOR_EXPANDED_WIDTH)),
-                    |style| style.w(px(TAG_EDITOR_COLLAPSED_WIDTH)),
-                )
                 .child(
                     div()
                         .id("todo-tag-editor")
                         .w_full()
                         .h_full()
-                        .opacity(0.0)
-                        .with_transition("todo-tag-editor-fade")
-                        .transition_when_else(
-                            tag_editor_open,
-                            QUICK_TRANSITION,
-                            EaseOutQuad,
-                            |style| style.opacity(1.0),
-                            |style| style.opacity(0.0),
-                        )
+                        .when(!tag_editor_open, |editor| editor.invisible())
+                        .when(tag_editor_open, |editor| editor.opacity(1.0))
                         .child(
                             Input::new(&self.todo_tag_input)
                                 .appearance(false)
@@ -3733,41 +3771,52 @@ impl Render for SynapseApp {
                                 ),
                         ),
                 )
-                .child(
-                    div()
-                        .id("new-todo-tag-animated")
-                        .absolute()
-                        .right_0()
-                        .w(px(TAG_EDITOR_COLLAPSED_WIDTH))
-                        .h(px(EDITOR_TOOLBAR_HEIGHT))
-                        .overflow_hidden()
-                        .with_transition("todo-tag-button-fade")
-                        .transition_when_else(
-                            !tag_editor_open,
-                            QUICK_TRANSITION,
-                            EaseOutQuad,
-                            |style| style.opacity(1.0).w(px(TAG_EDITOR_COLLAPSED_WIDTH)),
-                            |style| style.opacity(0.0).w(px(0.0)),
-                        )
-                        .child(
-                            Button::new("new-todo-tag")
-                                .ghost()
-                                .w_full()
-                                .h_full()
-                                .px_3()
-                                .child(Icon::Tag.render(15.0).text_color(theme.muted_foreground))
-                                .child("新建标签")
-                                .on_click(move |_, window, cx| {
-                                    start_app.update(cx, |this, cx| {
-                                        this.begin_new_todo_tag(window, cx);
-                                    });
-                                }),
-                        ),
+                .with_transition("todo-tag-action-width")
+                .transition_when_else(
+                    tag_editor_open,
+                    PANEL_TRANSITION,
+                    EaseInOutCubic,
+                    |style| style.w(px(TAG_EDITOR_EXPANDED_WIDTH)),
+                    |style| style.w(px(TAG_EDITOR_COLLAPSED_WIDTH)),
                 )
                 .into_any_element();
+
+            let new_tag_button = div()
+                .id("new-todo-tag-animated")
+                .absolute()
+                .top_0()
+                .right_0()
+                .w(px(TAG_EDITOR_COLLAPSED_WIDTH))
+                .h(px(EDITOR_TOOLBAR_HEIGHT))
+                .overflow_hidden()
+                .child(
+                    Button::new("new-todo-tag")
+                        .ghost()
+                        .w_full()
+                        .h_full()
+                        .px_3()
+                        .child(Icon::Tag.render(15.0).text_color(theme.muted_foreground))
+                        .child("新建标签")
+                        .on_click(move |_, window, cx| {
+                            start_app.update(cx, |this, cx| {
+                                this.begin_new_todo_tag(window, cx);
+                            });
+                        }),
+                )
+                .with_transition("todo-tag-button-fade")
+                .transition_when_else(
+                    !tag_editor_open,
+                    QUICK_TRANSITION,
+                    EaseOutQuad,
+                    |style| style.opacity(1.0).w(px(TAG_EDITOR_COLLAPSED_WIDTH)),
+                    |style| style.opacity(0.0).w(px(0.0)),
+                )
+                .into_any_element();
+
             Some(
                 div()
                     .id("todo-toolbar")
+                    .relative()
                     .h(px(EDITOR_TOOLBAR_HEIGHT))
                     .flex_none()
                     .flex()
@@ -3781,6 +3830,7 @@ impl Render for SynapseApp {
                             .child("待办"),
                     )
                     .child(tag_action)
+                    .child(new_tag_button)
                     .into_any_element(),
             )
         } else {
@@ -5386,6 +5436,11 @@ fn main() {
                             .placeholder("添加待办…")
                             .clean_on_escape()
                     });
+                    let todo_edit_input = cx.new(|cx| {
+                        InputState::new(window, cx)
+                            .placeholder("编辑待办…")
+                            .clean_on_escape()
+                    });
                     let editor_line_layouts = Rc::new(RefCell::new(Vec::new()));
                     let editor_list_state = ListState::new(0, ListAlignment::Top, px(320.0));
                     let app = cx.new(|cx| {
@@ -5416,6 +5471,26 @@ fn main() {
                                     }
                                 },
                             ),
+                            cx.subscribe_in(
+                                &todo_edit_input,
+                                window,
+                                |this: &mut SynapseApp, _, event: &InputEvent, window, cx| {
+                                    match event {
+                                        InputEvent::Change => {
+                                            if this.todo_edit_error.take().is_some() {
+                                                cx.notify();
+                                            }
+                                        }
+                                        InputEvent::PressEnter { secondary: false } => {
+                                            this.confirm_edit_todo(window, cx);
+                                        }
+                                        InputEvent::Blur => {
+                                            this.cancel_edit_todo(cx);
+                                        }
+                                        _ => {}
+                                    }
+                                },
+                            ),
                         ];
                         SynapseApp {
                             state,
@@ -5423,11 +5498,14 @@ fn main() {
                             command_search,
                             todo_tag_input,
                             todo_item_input,
+                            todo_edit_input,
                             todo_workspace,
                             workspace_view: WorkspaceView::Note,
                             todo_tag_editor_open: false,
                             todo_tag_error: None,
                             todo_item_error: None,
+                            todo_editing_id: None,
+                            todo_edit_error: None,
                             todo_tag_picker: None,
                             _input_subscriptions: input_subscriptions,
                             theme_preference,

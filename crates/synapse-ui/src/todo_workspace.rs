@@ -11,6 +11,7 @@ use gpui::{
 use gpui_animation::{animation::TransitionExt, transition::Transition};
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputState};
+use gpui_component::InteractiveElementExt;
 
 use super::{Icon, SynapseApp, SynapseThemePalette};
 
@@ -95,6 +96,9 @@ pub(super) struct TodoWorkspaceRenderState<'a> {
     pub(super) todo_error: Option<&'a str>,
     pub(super) tag_error: Option<&'a str>,
     pub(super) tag_picker: Option<TodoTagPicker>,
+    pub(super) todo_edit_input: &'a Entity<InputState>,
+    pub(super) todo_editing_id: Option<u64>,
+    pub(super) todo_edit_error: Option<&'a str>,
     pub(super) theme: SynapseThemePalette,
 }
 
@@ -115,12 +119,12 @@ pub(super) enum AddTodoTagError {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum AddTodoError {
+pub(super) enum TodoTextError {
     Empty,
     TooLong,
 }
 
-impl AddTodoError {
+impl TodoTextError {
     pub(super) fn message(self) -> &'static str {
         match self {
             Self::Empty => "待办内容不能为空",
@@ -182,13 +186,13 @@ impl TodoWorkspace {
             .count()
     }
 
-    pub(super) fn add_todo(&mut self, text: &str) -> Result<u64, AddTodoError> {
+    pub(super) fn add_todo(&mut self, text: &str) -> Result<u64, TodoTextError> {
         let text = text.trim();
         if text.is_empty() {
-            return Err(AddTodoError::Empty);
+            return Err(TodoTextError::Empty);
         }
         if text.chars().count() > TODO_TEXT_MAX_CHARS {
-            return Err(AddTodoError::TooLong);
+            return Err(TodoTextError::TooLong);
         }
 
         let id = self.next_todo_id.max(1);
@@ -207,6 +211,38 @@ impl TodoWorkspace {
             },
         );
         Ok(id)
+    }
+
+    /// Replace the text of an existing todo. Text is trimmed and validated with
+    /// the same rules as creation; returns `false` when the todo does not exist
+    /// or the normalized text is unchanged, so callers can skip persistence.
+    pub(super) fn update_todo_text(
+        &mut self,
+        todo_id: u64,
+        text: &str,
+    ) -> Result<bool, TodoTextError> {
+        let text = text.trim();
+        if text.is_empty() {
+            return Err(TodoTextError::Empty);
+        }
+        if text.chars().count() > TODO_TEXT_MAX_CHARS {
+            return Err(TodoTextError::TooLong);
+        }
+        let Some(todo) = self.todos.iter_mut().find(|todo| todo.id == todo_id) else {
+            return Ok(false);
+        };
+        if todo.text == text {
+            return Ok(false);
+        }
+        todo.text = text.to_owned();
+        Ok(true)
+    }
+
+    pub(super) fn todo_text(&self, todo_id: u64) -> Option<String> {
+        self.todos
+            .iter()
+            .find(|todo| todo.id == todo_id)
+            .map(|todo| todo.text.clone())
     }
 
     pub(super) fn toggle_todo(&mut self, todo_id: u64) -> bool {
@@ -530,6 +566,9 @@ pub(super) fn render_todo_workspace(
         todo_error,
         tag_error,
         tag_picker,
+        todo_edit_input,
+        todo_editing_id,
+        todo_edit_error,
         theme,
     } = render_state;
     let app = cx.entity();
@@ -829,6 +868,7 @@ pub(super) fn render_todo_workspace(
                             let picker_app = app.clone();
                             let copy_app = app.clone();
                             let delete_app = app.clone();
+                            let edit_app = app.clone();
                             let todo_text = todo.text.clone();
                             let copy_text = todo.text.clone();
                             let assigned_tags = todo
@@ -844,6 +884,7 @@ pub(super) fn render_todo_workspace(
                                 .collect::<Vec<_>>();
                             let picker_open = tag_picker
                                 .is_some_and(|picker| picker.todo_id == todo_id);
+                            let editing = todo_editing_id == Some(todo_id);
                             let hover_group = SharedString::from(format!("todo-row-{todo_id}"));
                             div()
                                 .id(SharedString::from(format!("todo-row-{todo_id}")))
@@ -895,17 +936,49 @@ pub(super) fn render_todo_workspace(
                                         .flex_1()
                                         .min_w(px(0.0))
                                         .pt(px(9.0))
-                                        .child(
-                                            div()
-                                                .text_size(px(13.5))
-                                                .text_color(if todo.done {
-                                                    theme.faint
-                                                } else {
-                                                    theme.foreground
+                                        .when(editing, |editor| {
+                                            editor
+                                                .child(
+                                                    Input::new(todo_edit_input)
+                                                        .appearance(false)
+                                                        .focus_bordered(false)
+                                                        .h(px(30.0))
+                                                        .text_size(px(13.5)),
+                                                )
+                                                .when_some(todo_edit_error.map(str::to_owned), |editor, error| {
+                                                    editor.child(
+                                                        div()
+                                                            .mt_1()
+                                                            .text_xs()
+                                                            .text_color(rgb(0xe25555))
+                                                            .child(error),
+                                                    )
                                                 })
-                                                .when(todo.done, |text| text.line_through())
-                                                .child(todo_text),
-                                        )
+                                        })
+                                        .when(!editing, |view| {
+                                            view.child(
+                                                div()
+                                                    .id(SharedString::from(format!(
+                                                        "todo-text-{todo_id}"
+                                                    )))
+                                                    .text_size(px(13.5))
+                                                    .text_color(if todo.done {
+                                                        theme.faint
+                                                    } else {
+                                                        theme.foreground
+                                                    })
+                                                    .when(todo.done, |text| text.line_through())
+                                                    .child(todo_text)
+                                                    .on_double_click(move |_, window, cx| {
+                                                        cx.stop_propagation();
+                                                        edit_app.update(cx, |this, cx| {
+                                                            this.begin_edit_todo(
+                                                                todo_id, window, cx,
+                                                            );
+                                                        });
+                                                    }),
+                                            )
+                                        })
                                         .when(!assigned_tags.is_empty(), |content| {
                                             content.child(
                                                 div()
