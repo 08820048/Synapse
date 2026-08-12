@@ -70,7 +70,7 @@ Synapse 是一款使用 Rust 与 GPUI 构建的高性能、本地优先 Markdown
 - Markdown 呈现：当前仍是可编辑的轻量块级实时呈现；后续分阶段把 writ 的解析、位置映射和更多语法节点接入 GPUI 渲染层。
 - Mermaid：固定使用纯 Rust `rusty-mermaid 0.2.0` 的 SVG 后端，不引入 WebView 或 JavaScript Mermaid 运行时。
 - 数学公式：固定使用纯 Rust `RaTeX 0.1.14` 解析、排版并生成嵌入字形的自包含 SVG，不依赖 WebView、JavaScript、网络或系统 LaTeX。
-- 文件监听：后续使用 notify。
+- 文件监听：使用 `notify 7.0.0` 递归监听当前 Vault；外部文件变化经过 180ms trailing debounce 自动刷新侧栏，不重载或覆盖已打开笔记缓冲区。
 - 文件系统始终是 Markdown 文档的真实来源。
 
 架构保持清晰分层：

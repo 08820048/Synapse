@@ -15,6 +15,7 @@ gpui-animation = "=0.2.63"
 gpui-component = { path = "vendor/gpui-component" }
 gpui-component-assets = "=0.5.1"
 futures = "=0.3.33"
+notify = "=7.0.0"
 reqwest = { package = "zed-reqwest", version = "=0.12.15-zed", default-features = false, features = ["charset", "http2", "macos-system-configuration", "rustls-tls-native-roots", "stream"] }
 ropey = "=1.6.1"
 ratex-layout = "=0.1.14"

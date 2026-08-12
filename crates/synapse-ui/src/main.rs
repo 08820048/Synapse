@@ -13,6 +13,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use futures::StreamExt as _;
 use gpui::{
     AnyElement, App, Application, Bounds, ClickEvent, ClipboardEntry, ClipboardItem, Context,
     Corner, CursorStyle, ElementInputHandler, Entity, FocusHandle, Focusable, FontWeight, Hsla,
@@ -32,6 +33,7 @@ use gpui_component::{
     input::{Input, InputEvent, InputState},
     kbd::Kbd,
 };
+use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher as _};
 use synapse::ShellState;
 use synapse_core::{VaultEntry, VaultEntryKind};
 
@@ -84,6 +86,7 @@ const SIDEBAR_SEARCH_INNER_PADDING: f32 = 12.0;
 const SIDEBAR_SEARCH_CONTENT_WIDTH: f32 =
     SIDEBAR_WIDTH - SIDEBAR_SEARCH_OUTER_MARGIN * 2.0 - SIDEBAR_SEARCH_INNER_PADDING * 2.0;
 const QUICK_TRANSITION: Duration = Duration::from_millis(140);
+const VAULT_REFRESH_DEBOUNCE: Duration = Duration::from_millis(180);
 const PANEL_TRANSITION: Duration = Duration::from_millis(180);
 const MARKD_PANEL_SPRING_STIFFNESS: f32 = 420.0;
 const MARKD_PANEL_SPRING_DAMPING: f32 = 40.0;
@@ -573,6 +576,9 @@ struct SynapseApp {
     bookmark_tag_picker: Option<BookmarkTagPicker>,
     bookmark_quick_open: bool,
     bookmark_fetching_ids: BTreeSet<u64>,
+    vault_watcher: Option<RecommendedWatcher>,
+    vault_watcher_generation: u64,
+    vault_refresh_generation: u64,
     _input_subscriptions: Vec<Subscription>,
     theme_preference: ThemePreference,
     theme_settings_open: bool,
@@ -957,6 +963,105 @@ fn hex_value(byte: u8) -> Option<u8> {
 }
 
 impl SynapseApp {
+    fn restart_vault_watcher(&mut self, cx: &mut Context<Self>) {
+        self.vault_watcher.take();
+        self.vault_watcher_generation = self.vault_watcher_generation.wrapping_add(1);
+        let generation = self.vault_watcher_generation;
+        let Some(root) = self.state.vault_root().map(Path::to_path_buf) else {
+            return;
+        };
+        let (sender, mut receiver) = futures::channel::mpsc::unbounded();
+        let watcher =
+            notify::recommended_watcher(
+                move |result: notify::Result<notify::Event>| match result {
+                    Ok(event) if !matches!(event.kind, EventKind::Access(_)) => {
+                        let _ = sender.unbounded_send(Ok(()));
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        let _ = sender.unbounded_send(Err(error.to_string()));
+                    }
+                },
+            );
+        let mut watcher = match watcher {
+            Ok(watcher) => watcher,
+            Err(error) => {
+                self.state
+                    .set_error_message(format!("Unable to watch the Vault: {error}"));
+                cx.notify();
+                return;
+            }
+        };
+        if let Err(error) = watcher.watch(&root, RecursiveMode::Recursive) {
+            self.state.set_error_message(format!(
+                "Unable to watch the Vault at {}: {error}",
+                root.display()
+            ));
+            cx.notify();
+            return;
+        }
+        self.vault_watcher = Some(watcher);
+        cx.spawn(async move |this, cx| {
+            while let Some(event) = receiver.next().await {
+                let active = this
+                    .update(cx, |this, cx| {
+                        if this.vault_watcher_generation != generation {
+                            return false;
+                        }
+                        match event {
+                            Ok(()) => this.schedule_vault_refresh(cx),
+                            Err(error) => {
+                                this.state.set_error_message(format!(
+                                    "The Vault file watcher reported an error: {error}"
+                                ));
+                                cx.notify();
+                            }
+                        }
+                        true
+                    })
+                    .unwrap_or(false);
+                if !active {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn schedule_vault_refresh(&mut self, cx: &mut Context<Self>) {
+        self.vault_refresh_generation = self.vault_refresh_generation.wrapping_add(1);
+        let refresh_generation = self.vault_refresh_generation;
+        let watcher_generation = self.vault_watcher_generation;
+        let timer = cx.background_executor().timer(VAULT_REFRESH_DEBOUNCE);
+        cx.spawn(async move |this, cx| {
+            timer.await;
+            let _ = this.update(cx, |this, cx| {
+                if this.vault_watcher_generation != watcher_generation
+                    || this.vault_refresh_generation != refresh_generation
+                {
+                    return;
+                }
+                match this.state.refresh_vault_entries() {
+                    Ok(true) => {
+                        let existing_directories = this
+                            .state
+                            .entries
+                            .iter()
+                            .filter(|entry| entry.kind == VaultEntryKind::Directory)
+                            .map(|entry| entry.relative_path.clone())
+                            .collect::<BTreeSet<_>>();
+                        this.collapsed_directories
+                            .retain(|path| existing_directories.contains(path));
+                        cx.notify();
+                    }
+                    Ok(false) => {}
+                    Err(_) => cx.notify(),
+                }
+            });
+        })
+        .detach();
+    }
+
     fn open_bookmark_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.workspace_view = WorkspaceView::Bookmark;
         self.dismiss_command_palette(cx);
@@ -1614,6 +1719,7 @@ impl SynapseApp {
                             this.collapsed_directories.clear();
                             this.editor_selection.collapse(0);
                             this.editor_marked_range = None;
+                            this.restart_vault_watcher(cx);
                         }
                     }
                     Ok(Ok(None)) => {}
@@ -4416,7 +4522,8 @@ impl Render for SynapseApp {
                     )
                     .child(
                         Button::new("toggle-markdown-source")
-                            .ghost()
+                            .text()
+                            .rounded(ButtonRounded::None)
                             .size(px(40.0))
                             .tooltip(if source_mode {
                                 "Show rich editor"
@@ -4424,34 +4531,17 @@ impl Render for SynapseApp {
                                 "Show Markdown source"
                             })
                             .child(
-                                div()
-                                    .size(px(28.0))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .rounded_md()
-                                    .border_1()
-                                    .border_color(theme.tab_bar_segmented)
-                                    .bg(if source_mode {
-                                        theme.foreground
-                                    } else {
-                                        theme.secondary_hover
-                                    })
-                                    .child(
-                                        if source_mode {
-                                            Icon::RichText
-                                        } else {
-                                            Icon::Code
-                                        }
-                                        .render(15.0)
-                                        .text_color(
-                                            if source_mode {
-                                                theme.background
-                                            } else {
-                                                theme.muted_foreground
-                                            },
-                                        ),
-                                    ),
+                                if source_mode {
+                                    Icon::RichText
+                                } else {
+                                    Icon::Code
+                                }
+                                .render(15.0)
+                                .text_color(if source_mode {
+                                    theme.foreground
+                                } else {
+                                    theme.muted_foreground
+                                }),
                             )
                             .on_click(move |_, _, cx| {
                                 source_app.update(cx, |this, cx| {
@@ -4461,24 +4551,14 @@ impl Render for SynapseApp {
                     )
                     .child(
                         Button::new("open-note-actions")
-                            .ghost()
+                            .text()
+                            .rounded(ButtonRounded::None)
                             .size(px(40.0))
                             .tooltip("Note actions")
                             .child(
-                                div()
-                                    .size(px(28.0))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .rounded_md()
-                                    .border_1()
-                                    .border_color(theme.tab_bar_segmented)
-                                    .bg(theme.secondary_hover)
-                                    .child(
-                                        Icon::MoreVertical
-                                            .render(15.0)
-                                            .text_color(theme.muted_foreground),
-                                    ),
+                                Icon::MoreVertical
+                                    .render(15.0)
+                                    .text_color(theme.muted_foreground),
                             )
                             .on_click(move |_, _, cx| {
                                 menu_app.update(cx, |this, cx| {
@@ -6185,6 +6265,9 @@ fn main() {
                             bookmark_tag_picker: None,
                             bookmark_quick_open: false,
                             bookmark_fetching_ids: BTreeSet::new(),
+                            vault_watcher: None,
+                            vault_watcher_generation: 0,
+                            vault_refresh_generation: 0,
                             _input_subscriptions: input_subscriptions,
                             theme_preference,
                             theme_settings_open: false,
@@ -6235,6 +6318,7 @@ fn main() {
                     });
                     app.update(cx, |app, cx| {
                         app.restart_editor_cursor_blink(cx);
+                        app.restart_vault_watcher(cx);
                         cx.observe_window_appearance(window, |app, window, cx| {
                             if app.theme_preference == ThemePreference::System {
                                 apply_synapse_theme(ThemePreference::System, Some(window), cx);

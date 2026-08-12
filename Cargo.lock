@@ -6529,6 +6529,7 @@ dependencies = [
  "gpui-animation",
  "gpui-component",
  "gpui-component-assets",
+ "notify",
  "ratex-layout",
  "ratex-parser",
  "ratex-svg",

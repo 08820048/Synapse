@@ -102,6 +102,15 @@ impl ShellState {
         self.vault_error = Some(message);
     }
 
+    /// Refresh only the Vault directory snapshot after an external filesystem
+    /// notification. Open document buffers and their dirty state are preserved.
+    pub fn refresh_vault_entries(&mut self) -> Result<bool, SessionError> {
+        let previous = self.entries.clone();
+        self.refresh_entries()?;
+        self.vault_error = None;
+        Ok(self.entries != previous)
+    }
+
     pub fn create_directory(&mut self, parent: &Path, name: &str) -> Result<PathBuf, SessionError> {
         let result = self
             .vault
@@ -986,6 +995,30 @@ mod tests {
         assert_eq!(state.notes.len(), 1);
         assert_eq!(state.notes[0].relative_path, Path::new("keep.md"));
         assert!(state.status_message().contains("does not exist"));
+    }
+
+    #[test]
+    fn external_vault_refresh_discovers_new_entries_without_reloading_dirty_tabs() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("open.md"), "# Original").unwrap();
+        let mut state = ShellState::from_vault_argument(Some(directory.path().into()));
+        state.select_note(Path::new("open.md")).unwrap();
+        state.move_end();
+        state.insert_text(" edited").unwrap();
+        fs::create_dir(directory.path().join("external-folder")).unwrap();
+        fs::write(
+            directory.path().join("external-folder/new.md"),
+            "# External",
+        )
+        .unwrap();
+
+        assert!(state.refresh_vault_entries().unwrap());
+        assert!(state.entries.iter().any(|entry| {
+            entry.relative_path == Path::new("external-folder/new.md")
+                && entry.kind == VaultEntryKind::Note
+        }));
+        assert_eq!(state.active_document().unwrap().text(), "# Original edited");
+        assert!(state.active_document().unwrap().is_dirty());
     }
 
     #[test]
