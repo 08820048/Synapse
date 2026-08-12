@@ -22,7 +22,10 @@ use gpui::{
     WindowControlArea, WindowOptions, actions, anchored, canvas, deferred, div, hsla, img, list,
     point, prelude::*, px, relative, rgb, rgba, size,
 };
-use gpui_animation::{animation::TransitionExt, transition::general::EaseOutQuad};
+use gpui_animation::{
+    animation::TransitionExt,
+    transition::{Transition, general::EaseOutQuad},
+};
 use gpui_component::{
     ActiveTheme, IconName, Root, Sizable as _, Theme, ThemeMode,
     button::{Button, ButtonRounded, ButtonVariants as _},
@@ -76,6 +79,9 @@ const SIDEBAR_SEARCH_CONTENT_WIDTH: f32 =
     SIDEBAR_WIDTH - SIDEBAR_SEARCH_OUTER_MARGIN * 2.0 - SIDEBAR_SEARCH_INNER_PADDING * 2.0;
 const QUICK_TRANSITION: Duration = Duration::from_millis(140);
 const PANEL_TRANSITION: Duration = Duration::from_millis(180);
+const MARKD_PANEL_SPRING_STIFFNESS: f32 = 420.0;
+const MARKD_PANEL_SPRING_DAMPING: f32 = 40.0;
+const MARKD_PANEL_SPRING_MASS: f32 = 0.5;
 const EDITOR_CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(530);
 const TITLEBAR_HEIGHT: f32 = 44.0;
 const SIDEBAR_WIDTH: f32 = 248.0;
@@ -102,6 +108,35 @@ const TABLE_CELL_HORIZONTAL_PADDING: f32 = 10.0;
 const TABLE_CELL_VERTICAL_PADDING: f32 = 6.0;
 const MENU_ITEM_ICON_SLOT_SIZE: f32 = 18.0;
 const MENU_ITEM_ICON_SIZE: f32 = 15.0;
+
+#[derive(Clone, Copy, Debug, Default)]
+struct MarkdPanelSpring;
+
+impl Transition for MarkdPanelSpring {
+    fn calculate(&self, progress: f32) -> f32 {
+        markd_panel_spring_progress(progress)
+    }
+}
+
+fn markd_panel_spring_progress(progress: f32) -> f32 {
+    let progress = progress.clamp(0.0, 1.0);
+    if progress == 0.0 || progress == 1.0 {
+        return progress;
+    }
+
+    let discriminant = (MARKD_PANEL_SPRING_DAMPING * MARKD_PANEL_SPRING_DAMPING
+        - 4.0 * MARKD_PANEL_SPRING_MASS * MARKD_PANEL_SPRING_STIFFNESS)
+        .sqrt();
+    let denominator = 2.0 * MARKD_PANEL_SPRING_MASS;
+    let slow_root = (-MARKD_PANEL_SPRING_DAMPING + discriminant) / denominator;
+    let fast_root = (-MARKD_PANEL_SPRING_DAMPING - discriminant) / denominator;
+    let response = |seconds: f32| {
+        1.0 + (fast_root * (slow_root * seconds).exp() - slow_root * (fast_root * seconds).exp())
+            / (slow_root - fast_root)
+    };
+    let duration = PANEL_TRANSITION.as_secs_f32();
+    (response(progress * duration) / response(duration)).clamp(0.0, 1.0)
+}
 const TAB_CONTEXT_MENU_WIDTH: f32 = 176.0;
 const TREE_CONTEXT_MENU_WIDTH: f32 = 218.0;
 const MERMAID_PREVIEW_MAX_HEIGHT: f32 = 520.0;
@@ -3449,7 +3484,7 @@ impl Render for SynapseApp {
         let tab_muted = theme.muted_foreground;
         let tab_hover = theme.secondary_hover;
         let tab_warning = theme.warning;
-        let titlebar_left_inset = titlebar_left_inset(self.left_sidebar_open);
+        let titlebar_left_inset_width = titlebar_left_inset(self.left_sidebar_open);
         let sidebar_toggle_app = app_entity.clone();
         let tab_bar = div()
             .id("document-tabs")
@@ -3460,12 +3495,21 @@ impl Render for SynapseApp {
             .bg(tab_background)
             .child(
                 div()
+                    .id("titlebar-sidebar-inset")
                     .h_full()
-                    .w(titlebar_left_inset)
+                    .w(titlebar_left_inset_width)
                     .flex_none()
                     .border_b_1()
                     .border_color(tab_border)
-                    .window_control_area(WindowControlArea::Drag),
+                    .window_control_area(WindowControlArea::Drag)
+                    .with_transition("titlebar-sidebar-inset-transition")
+                    .transition_when_else(
+                        self.left_sidebar_open,
+                        PANEL_TRANSITION,
+                        MarkdPanelSpring,
+                        |style| style.w(titlebar_left_inset(true)),
+                        |style| style.w(titlebar_left_inset(false)),
+                    ),
             )
             .child(
                 div()
@@ -3821,13 +3865,9 @@ impl Render for SynapseApp {
 
         let sidebar_hover = theme.sidebar_accent;
         let sidebar_ink = theme.sidebar_foreground;
-        let left_sidebar = div()
+        let sidebar_content = div()
             .id("left-sidebar")
-            .w(if self.left_sidebar_open {
-                px(SIDEBAR_WIDTH)
-            } else {
-                px(0.0)
-            })
+            .w(px(SIDEBAR_WIDTH))
             .h_full()
             .flex_none()
             .flex()
@@ -4339,6 +4379,26 @@ impl Render for SynapseApp {
                                 });
                             })
                     }),
+            );
+
+        let left_sidebar = div()
+            .id("left-sidebar-viewport")
+            .w(if self.left_sidebar_open {
+                px(SIDEBAR_WIDTH)
+            } else {
+                px(0.0)
+            })
+            .h_full()
+            .flex_none()
+            .overflow_hidden()
+            .child(sidebar_content)
+            .with_transition("left-sidebar-width-transition")
+            .transition_when_else(
+                self.left_sidebar_open,
+                PANEL_TRANSITION,
+                MarkdPanelSpring,
+                |style| style.w(px(SIDEBAR_WIDTH)),
+                |style| style.w(px(0.0)),
             );
 
         let context_menu = self.tab_context_menu.clone().map(|menu| {
@@ -5380,6 +5440,7 @@ mod tests {
         fs,
         path::{Path, PathBuf},
         rc::Rc,
+        time::Duration,
     };
 
     use gpui::{Image, ImageFormat, MouseButton, px, rgb};
@@ -5392,20 +5453,21 @@ mod tests {
         EDITOR_BODY_FONT_SIZE, EDITOR_BODY_LINE_HEIGHT, EDITOR_COMPACT_GUTTER,
         EDITOR_PAGE_MAX_WIDTH, EDITOR_REGULAR_GUTTER, EDITOR_RULE_BLOCK_HEIGHT,
         EDITOR_RULE_THICKNESS, EDITOR_TOP_PADDING, EDITOR_WIDE_GUTTER, FileTreeRow,
-        MENU_ITEM_ICON_SIZE, MENU_ITEM_ICON_SLOT_SIZE, MarkdownImagePreview, SIDEBAR_FOOTER_HEIGHT,
-        SIDEBAR_SEARCH_CONTENT_WIDTH, SIDEBAR_SEARCH_INNER_PADDING, SIDEBAR_SEARCH_OUTER_MARGIN,
-        SIDEBAR_SHORTCUT_ACTION_WIDTH, SIDEBAR_SHORTCUT_HEIGHT, SIDEBAR_TREE_FONT_FAMILY,
-        SIDEBAR_TREE_FONT_SIZE, SIDEBAR_TREE_ROW_HEIGHT, TABLE_CELL_HORIZONTAL_PADDING,
-        TABLE_CELL_VERTICAL_PADDING, TABLE_FONT_SIZE, TABLE_ROW_MIN_HEIGHT, TITLEBAR_HEIGHT,
-        ThemePreference, active_document_outline_index, build_document_outline,
-        build_file_tree_rows, build_image_previews, build_math_previews, build_mermaid_previews,
-        changed_line_span, clipboard_image_extension, code_block_edges,
+        MARKD_PANEL_SPRING_DAMPING, MARKD_PANEL_SPRING_MASS, MARKD_PANEL_SPRING_STIFFNESS,
+        MENU_ITEM_ICON_SIZE, MENU_ITEM_ICON_SLOT_SIZE, MarkdownImagePreview, PANEL_TRANSITION,
+        SIDEBAR_FOOTER_HEIGHT, SIDEBAR_SEARCH_CONTENT_WIDTH, SIDEBAR_SEARCH_INNER_PADDING,
+        SIDEBAR_SEARCH_OUTER_MARGIN, SIDEBAR_SHORTCUT_ACTION_WIDTH, SIDEBAR_SHORTCUT_HEIGHT,
+        SIDEBAR_TREE_FONT_FAMILY, SIDEBAR_TREE_FONT_SIZE, SIDEBAR_TREE_ROW_HEIGHT,
+        TABLE_CELL_HORIZONTAL_PADDING, TABLE_CELL_VERTICAL_PADDING, TABLE_FONT_SIZE,
+        TABLE_ROW_MIN_HEIGHT, TITLEBAR_HEIGHT, ThemePreference, active_document_outline_index,
+        build_document_outline, build_file_tree_rows, build_image_previews, build_math_previews,
+        build_mermaid_previews, changed_line_span, clipboard_image_extension, code_block_edges,
         command_palette_key_bindings, default_window_size, document_outline_horizontal_layout,
         document_outline_is_visible, document_outline_layout, editor_horizontal_gutter,
         editor_page_content_width, file_manager_reveal_command, is_tab_context_trigger,
-        normalize_clipboard_text, note_breadcrumb_parts, persist_clipboard_image,
-        resolve_markdown_image, source_lines, synapse_mermaid_theme, synapse_theme_palette,
-        synapse_titlebar_options, titlebar_left_inset,
+        markd_panel_spring_progress, normalize_clipboard_text, note_breadcrumb_parts,
+        persist_clipboard_image, resolve_markdown_image, source_lines, synapse_mermaid_theme,
+        synapse_theme_palette, synapse_titlebar_options, titlebar_left_inset,
     };
 
     #[test]
@@ -5598,6 +5660,23 @@ mod tests {
         assert_eq!(light.foreground, rgb(0x191919).into());
         assert_eq!(dark.muted, rgb(0x8f8f8a).into());
         assert_eq!(dark.foreground, rgb(0xebebe8).into());
+    }
+
+    #[test]
+    fn sidebar_panel_transition_matches_markd_spring_tokens_and_stays_interruptible() {
+        assert_eq!(PANEL_TRANSITION, Duration::from_millis(180));
+        assert_eq!(MARKD_PANEL_SPRING_STIFFNESS, 420.0);
+        assert_eq!(MARKD_PANEL_SPRING_DAMPING, 40.0);
+        assert_eq!(MARKD_PANEL_SPRING_MASS, 0.5);
+        assert_eq!(markd_panel_spring_progress(0.0), 0.0);
+        assert_eq!(markd_panel_spring_progress(1.0), 1.0);
+
+        let samples = (0..=20)
+            .map(|step| markd_panel_spring_progress(step as f32 / 20.0))
+            .collect::<Vec<_>>();
+        assert!(samples.windows(2).all(|pair| pair[0] <= pair[1]));
+        assert!(samples.iter().all(|value| (0.0..=1.0).contains(value)));
+        assert!(markd_panel_spring_progress(0.5) > 0.5);
     }
 
     #[test]
