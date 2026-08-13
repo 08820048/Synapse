@@ -651,7 +651,6 @@ struct EditorRenderCache {
     vault_root: PathBuf,
     relative_path: PathBuf,
     revision: u64,
-    cursor: usize,
     dark_mode: bool,
     source_mode: bool,
     writ_revision: u64,
@@ -686,14 +685,12 @@ impl EditorRenderCache {
         vault_root: &Path,
         relative_path: &Path,
         revision: u64,
-        cursor: usize,
         dark_mode: bool,
         source_mode: bool,
     ) -> bool {
         self.vault_root == vault_root
             && self.relative_path == relative_path
             && self.revision == revision
-            && self.cursor == cursor
             && self.dark_mode == dark_mode
             && self.source_mode == source_mode
     }
@@ -2811,6 +2808,8 @@ fn render_table_row(
     header_background: Hsla,
     foreground: Hsla,
 ) -> AnyElement {
+    let active =
+        (line.start_char..=line.start_char + line.source_len_chars).contains(&row_context.cursor);
     if table.is_delimiter {
         return div().h(px(0.0)).overflow_hidden().into_any_element();
     }
@@ -2858,7 +2857,7 @@ fn render_table_row(
                                 .when(is_header, |style| style.font_weight(FontWeight::SEMIBOLD))
                                 .child(cell)
                         }))
-                        .child(editor_block_layout_canvas(index, line, row_context, false)),
+                        .child(editor_block_layout_canvas(index, line, row_context, active)),
                 ),
         )
         .into_any_element()
@@ -2868,6 +2867,7 @@ fn render_mermaid_preview_row(
     index: usize,
     line: Rc<SourceLine>,
     row_context: &EditorRowContext,
+    active: bool,
     preview: Option<&MermaidPreview>,
     style: MermaidPreviewStyle,
 ) -> AnyElement {
@@ -2952,7 +2952,7 @@ fn render_mermaid_preview_row(
                         .text_color(style.foreground)
                         .cursor_pointer()
                         .child(content)
-                        .child(editor_block_layout_canvas(index, line, row_context, false)),
+                        .child(editor_block_layout_canvas(index, line, row_context, active)),
                 ),
         )
         .into_any_element()
@@ -2962,6 +2962,7 @@ fn render_math_block_row(
     index: usize,
     line: Rc<SourceLine>,
     row_context: &EditorRowContext,
+    active: bool,
     preview: Option<&MathPreview>,
     muted: Hsla,
     danger: Hsla,
@@ -3035,7 +3036,7 @@ fn render_math_block_row(
                         .min_w(px(0.0))
                         .cursor_pointer()
                         .child(content)
-                        .child(editor_block_layout_canvas(index, line, row_context, false)),
+                        .child(editor_block_layout_canvas(index, line, row_context, active)),
                 ),
         )
         .into_any_element()
@@ -3083,6 +3084,8 @@ fn render_markdown_image_block(
     muted: Hsla,
     border: Hsla,
 ) -> AnyElement {
+    let active =
+        (line.start_char..=line.start_char + line.source_len_chars).contains(&row_context.cursor);
     let alt: SharedString = image.alt.clone().into();
     let content = match preview {
         Some(preview) if markdown_image_source(preview).is_some() => {
@@ -3144,7 +3147,7 @@ fn render_markdown_image_block(
                         .justify_center()
                         .cursor_pointer()
                         .child(content)
-                        .child(editor_block_layout_canvas(index, line, row_context, false)),
+                        .child(editor_block_layout_canvas(index, line, row_context, active)),
                 ),
         )
         .into_any_element()
@@ -3196,6 +3199,7 @@ fn render_task_row(
     index: usize,
     line: Rc<SourceLine>,
     row_context: &EditorRowContext,
+    active: bool,
     preview_style: TaskPreviewStyle,
 ) -> AnyElement {
     let Some(task) = line.presentation.task_item.clone() else {
@@ -3276,7 +3280,7 @@ fn render_task_row(
                             line_layouts: row_context.line_layouts.clone(),
                             line_index: index,
                             source_line: preview,
-                            active: false,
+                            active,
                             cursor: row_context.cursor,
                             selection: row_context.selection.clone(),
                             cursor_visible: row_context.cursor_visible,
@@ -3297,6 +3301,7 @@ fn render_footnote_definition_row(
     index: usize,
     line: Rc<SourceLine>,
     row_context: &EditorRowContext,
+    active: bool,
     preview_style: FootnotePreviewStyle,
 ) -> AnyElement {
     let Some(footnote) = line.presentation.footnote_definition.clone() else {
@@ -3356,7 +3361,7 @@ fn render_footnote_definition_row(
                                 line_layouts: row_context.line_layouts.clone(),
                                 line_index: index,
                                 source_line: preview,
-                                active: false,
+                                active,
                                 cursor: row_context.cursor,
                                 selection: row_context.selection.clone(),
                                 cursor_visible: row_context.cursor_visible,
@@ -3487,6 +3492,8 @@ fn render_inline_preview_row(
     footnote_accent: Hsla,
     border: Hsla,
 ) -> AnyElement {
+    let active =
+        (line.start_char..=line.start_char + line.source_len_chars).contains(&row_context.cursor);
     let display = &line.presentation.display;
     let display_len = display.chars().count();
     let mut inline_items: Vec<(usize, usize, AnyElement)> = line
@@ -3580,7 +3587,7 @@ fn render_inline_preview_row(
                         .line_height(px(EDITOR_BODY_LINE_HEIGHT))
                         .cursor_pointer()
                         .children(elements)
-                        .child(editor_block_layout_canvas(index, line, row_context, false)),
+                        .child(editor_block_layout_canvas(index, line, row_context, active)),
                 ),
         )
         .into_any_element()
@@ -3593,20 +3600,10 @@ fn char_slice(text: &str, start: usize, end: usize) -> String {
         .collect()
 }
 
-fn code_block_edges(
-    code_line: Option<editor_surface::MarkdownCodeLine>,
-    active: bool,
-    mermaid_block_active: bool,
-) -> (bool, bool) {
-    if mermaid_block_active {
-        return (
-            code_line.is_some_and(|code| code.is_opening_fence),
-            code_line.is_some_and(|code| code.is_closing_fence),
-        );
-    }
+fn code_block_edges(code_line: Option<editor_surface::MarkdownCodeLine>) -> (bool, bool) {
     (
-        code_line.is_some_and(|code| code.is_first_content || (active && code.is_opening_fence)),
-        code_line.is_some_and(|code| code.is_last_content || (active && code.is_closing_fence)),
+        code_line.is_some_and(|code| code.is_first_content),
+        code_line.is_some_and(|code| code.is_last_content),
     )
 }
 
@@ -3621,16 +3618,9 @@ fn render_editor_row(
     let active =
         (line.start_char..=line.start_char + line.source_len_chars).contains(&row_context.cursor);
     let kind = line.presentation.kind;
-    let mermaid_block_active = line
-        .presentation
-        .mermaid_block
-        .as_ref()
-        .is_some_and(|block| {
-            (block.source_start_char..=block.source_end_char).contains(&row_context.cursor)
-        });
-    if let Some(block) = line.presentation.mermaid_block.as_ref()
-        && !mermaid_block_active
-    {
+    if let Some(block) = line.presentation.mermaid_block.as_ref() {
+        let block_active =
+            (block.source_start_char..=block.source_end_char).contains(&row_context.cursor);
         if !block.is_anchor {
             return div().h(px(0.0)).overflow_hidden().into_any_element();
         }
@@ -3638,6 +3628,7 @@ fn render_editor_row(
             index,
             line.clone(),
             row_context,
+            block_active,
             row_context.mermaid_previews.get(&index),
             MermaidPreviewStyle {
                 background: theme.background,
@@ -3651,24 +3642,23 @@ fn render_editor_row(
     if let Some(block) = line.presentation.math_block.as_ref() {
         let block_active =
             (block.source_start_char..=block.source_end_char).contains(&row_context.cursor);
-        if !block_active {
-            if !block.is_anchor {
-                return div().h(px(0.0)).overflow_hidden().into_any_element();
-            }
-            return render_math_block_row(
-                index,
-                line.clone(),
-                row_context,
-                row_context.math_previews.get(&block.source_start_char),
-                theme.muted_foreground,
-                theme.danger,
-            );
+        if !block.is_anchor {
+            return div().h(px(0.0)).overflow_hidden().into_any_element();
         }
+        return render_math_block_row(
+            index,
+            line.clone(),
+            row_context,
+            block_active,
+            row_context.math_previews.get(&block.source_start_char),
+            theme.muted_foreground,
+            theme.danger,
+        );
     }
     if matches!(kind, MarkdownBlockKind::ThematicBreak) {
         return render_thematic_break_row(index, line, row_context, active, theme.border);
     }
-    if !active && let Some(image) = line.presentation.image_block.as_ref() {
+    if let Some(image) = line.presentation.image_block.as_ref() {
         return render_markdown_image_block(
             index,
             line.clone(),
@@ -3679,11 +3669,12 @@ fn render_editor_row(
             theme.border,
         );
     }
-    if !active && line.presentation.footnote_definition.is_some() {
+    if line.presentation.footnote_definition.is_some() {
         return render_footnote_definition_row(
             index,
             line,
             row_context,
+            active,
             FootnotePreviewStyle {
                 foreground: theme.foreground,
                 muted: theme.muted_foreground,
@@ -3695,11 +3686,12 @@ fn render_editor_row(
             },
         );
     }
-    if !active && line.presentation.task_item.is_some() {
+    if line.presentation.task_item.is_some() {
         return render_task_row(
             index,
             line,
             row_context,
+            active,
             TaskPreviewStyle {
                 foreground: theme.foreground,
                 muted: theme.muted_foreground,
@@ -3713,7 +3705,7 @@ fn render_editor_row(
             },
         );
     }
-    if !active && let Some(table) = line.presentation.table_row.as_ref() {
+    if let Some(table) = line.presentation.table_row.as_ref() {
         return render_table_row(
             index,
             line.clone(),
@@ -3724,10 +3716,9 @@ fn render_editor_row(
             theme.foreground,
         );
     }
-    if !active
-        && (!line.presentation.inline_math.is_empty()
-            || !line.presentation.inline_footnotes.is_empty()
-            || !line.presentation.inline_images.is_empty())
+    if !line.presentation.inline_math.is_empty()
+        || !line.presentation.inline_footnotes.is_empty()
+        || !line.presentation.inline_images.is_empty()
     {
         return render_inline_preview_row(
             index,
@@ -3757,10 +3748,10 @@ fn render_editor_row(
             .quote_line
             .is_some_and(|quote| quote.is_last);
     let code_line = line.presentation.code_line;
-    if !active && !mermaid_block_active && code_line.is_some_and(|code| code.is_fence) {
+    if code_line.is_some_and(|code| code.is_fence) {
         return div().h(px(0.0)).overflow_hidden().into_any_element();
     }
-    let (code_first, code_last) = code_block_edges(code_line, active, mermaid_block_active);
+    let (code_first, code_last) = code_block_edges(code_line);
     div()
         .w_full()
         .min_w(px(0.0))
@@ -4014,7 +4005,6 @@ impl Render for SynapseApp {
                     &vault_root,
                     &relative_path,
                     revision,
-                    cursor,
                     dark_mode,
                     source_mode,
                 )
@@ -4158,7 +4148,6 @@ impl Render for SynapseApp {
                     vault_root,
                     relative_path,
                     revision,
-                    cursor,
                     dark_mode,
                     source_mode,
                     writ_revision: revision,
@@ -7729,7 +7718,6 @@ mod tests {
             vault_root: PathBuf::from("/vault"),
             relative_path: PathBuf::from("diagram.md"),
             revision: 7,
-            cursor: 1,
             dark_mode: true,
             source_mode: false,
             writ_revision: 7,
@@ -7791,25 +7779,24 @@ mod tests {
             true,
             false,
         ));
+        assert!(cache.matches(Path::new("/vault"), Path::new("diagram.md"), 7, true, false,));
     }
 
     #[test]
-    fn p4_active_mermaid_uses_one_continuous_code_block_boundary() {
-        let source = "before\n```mermaid\nflowchart LR\nA --> B\n```\nafter";
-        let cursor = source.find("A --> B").expect("diagram content byte");
-        let lines = source_lines(source, cursor, false);
+    fn code_block_surface_uses_rendered_content_edges() {
+        let lines = source_lines("```rust\nfn main() {}\n```", 0, false);
 
         assert_eq!(
-            code_block_edges(lines[1].presentation.code_line, false, true),
-            (true, false)
-        );
-        assert_eq!(
-            code_block_edges(lines[2].presentation.code_line, false, true),
+            code_block_edges(lines[0].presentation.code_line),
             (false, false)
         );
         assert_eq!(
-            code_block_edges(lines[4].presentation.code_line, false, true),
-            (false, true)
+            code_block_edges(lines[1].presentation.code_line),
+            (true, true)
+        );
+        assert_eq!(
+            code_block_edges(lines[2].presentation.code_line),
+            (false, false)
         );
     }
 

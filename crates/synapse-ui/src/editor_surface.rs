@@ -314,14 +314,16 @@ pub fn source_lines_with_mode(
 
 pub fn source_lines_from_buffer(
     buffer: &mut Buffer,
-    cursor: usize,
+    _cursor: usize,
     dark_mode: bool,
 ) -> Vec<SourceLine> {
     let snapshot = buffer.render_snapshot();
     let styles_by_line = snapshot.inline_styles_by_line();
-    let cursor_byte = snapshot
-        .rope
-        .char_to_byte(cursor.min(snapshot.rope.len_chars()));
+    // The default editor is a persistent rich presentation. Keep the render caret
+    // outside the document so Writ never reveals Markdown delimiters merely because
+    // Synapse's native caret moved into a line or inline span. Full raw syntax remains
+    // available through the explicit source-mode toggle.
+    let render_cursor_byte = snapshot.rope.len_bytes().saturating_add(1);
     let theme = if dark_mode {
         EditorTheme::nord()
     } else {
@@ -348,13 +350,13 @@ pub fn source_lines_from_buffer(
             let byte_range = snapshot.line_byte_range(line_index);
             let source_len_chars = source.chars().count();
             let markers = snapshot.line_markers(line_index);
-            let cursor_on_line = (byte_range.start..=byte_range.end).contains(&cursor_byte);
+            let cursor_on_line = false;
             let render = build_line_render(
                 &snapshot,
                 line_index,
                 &theme,
                 14.0,
-                cursor_byte,
+                render_cursor_byte,
                 &styles_by_line[line_index],
                 &[],
                 None,
@@ -381,28 +383,6 @@ pub fn source_lines_from_buffer(
             let hidden_bullet_marker = matches!(kind, MarkdownBlockKind::Bullet)
                 .then_some(list_marker_range.as_ref())
                 .flatten();
-            if cursor_on_line {
-                for marker in &markers.markers {
-                    let display = render.map.buffer_range_to_display(marker.range.clone());
-                    if !display.is_empty() {
-                        muted_ranges.push(display);
-                    }
-                }
-                for region in &styles_by_line[line_index] {
-                    let full = render
-                        .map
-                        .buffer_range_to_display(region.full_range.clone());
-                    let content = render
-                        .map
-                        .buffer_range_to_display(region.content_range.clone());
-                    if full.start < content.start {
-                        muted_ranges.push(full.start..content.start);
-                    }
-                    if content.end < full.end {
-                        muted_ranges.push(content.end..full.end);
-                    }
-                }
-            }
             let run_ranges = MarkdownRunRanges {
                 muted: &muted_ranges,
                 list_marker: list_marker_range.as_ref(),
@@ -435,33 +415,22 @@ pub fn source_lines_from_buffer(
             continue;
         }
         lines[index - 1].presentation.kind = MarkdownBlockKind::Heading(level);
-        let underline_is_active = (lines[index].start_char
-            ..=lines[index].start_char + lines[index].source_len_chars)
-            .contains(&cursor);
-        if !underline_is_active {
-            lines[index].presentation = hidden_source_presentation(raw_lines[index]);
-        }
+        lines[index].presentation = hidden_source_presentation(raw_lines[index]);
     }
-    annotate_inline_underlines(&mut lines, &raw_lines, cursor, dark_mode);
+    annotate_inline_underlines(&mut lines, &raw_lines, dark_mode);
     annotate_table_rows(&mut lines, &raw_lines);
     annotate_quote_lines(&mut lines);
     annotate_callout_lines(&mut lines, snapshot.callouts());
     annotate_code_lines(&mut lines, &raw_lines);
     annotate_mermaid_blocks(&mut lines, &raw_lines);
-    reveal_active_mermaid_fences(&mut lines, &raw_lines, cursor);
     annotate_math(&mut lines, &raw_lines);
     annotate_task_items(&mut lines, &raw_lines);
     annotate_footnotes(&mut lines, &raw_lines);
-    annotate_images(&mut lines, &raw_lines, cursor);
+    annotate_images(&mut lines, &raw_lines);
     lines
 }
 
-fn annotate_inline_underlines(
-    lines: &mut [SourceLine],
-    raw_lines: &[&str],
-    cursor: usize,
-    dark_mode: bool,
-) {
+fn annotate_inline_underlines(lines: &mut [SourceLine], raw_lines: &[&str], dark_mode: bool) {
     let annotations = inline_underline_annotations(raw_lines);
     for ((line, source), annotation) in lines
         .iter_mut()
@@ -472,81 +441,59 @@ fn annotate_inline_underlines(
             continue;
         }
 
-        let cursor_on_line =
-            (line.start_char..=line.start_char + line.source_len_chars).contains(&cursor);
-        if cursor_on_line {
-            let display_to_source = line.presentation.display_to_source.clone();
-            line.presentation.runs = restyle_markdown_runs(
-                &line.presentation.display,
-                &line.presentation.runs,
-                |display_char, run| {
-                    let source_char = display_to_source
-                        [display_char.min(display_to_source.len().saturating_sub(1))];
-                    run.muted = annotation
-                        .markers
-                        .iter()
-                        .any(|range| range.contains(&source_char));
-                    run.underline = annotation
-                        .content
-                        .iter()
-                        .any(|range| range.contains(&source_char));
-                },
-            );
-        } else {
-            let source_chars: Vec<_> = source.chars().collect();
-            let mut stripped = String::with_capacity(source.len());
-            let mut source_to_stripped = Vec::with_capacity(source_chars.len() + 1);
-            let mut stripped_to_source = Vec::with_capacity(source_chars.len() + 1);
-            let mut stripped_char = 0;
-            for (source_char, character) in source_chars.iter().copied().enumerate() {
-                source_to_stripped.push(stripped_char);
-                let is_marker = annotation
-                    .markers
-                    .iter()
-                    .any(|range| range.contains(&source_char));
-                if is_marker {
-                    continue;
-                }
-                stripped_to_source.push(source_char);
-                stripped.push(character);
-                stripped_char += 1;
-            }
+        let source_chars: Vec<_> = source.chars().collect();
+        let mut stripped = String::with_capacity(source.len());
+        let mut source_to_stripped = Vec::with_capacity(source_chars.len() + 1);
+        let mut stripped_to_source = Vec::with_capacity(source_chars.len() + 1);
+        let mut stripped_char = 0;
+        for (source_char, character) in source_chars.iter().copied().enumerate() {
             source_to_stripped.push(stripped_char);
-            stripped_to_source.push(source_chars.len());
-
-            let fragment_source = format!("cursor\n{stripped}");
-            let Some(mut fragment) = source_lines(&fragment_source, 0, dark_mode)
-                .into_iter()
-                .nth(1)
-                .map(|line| line.presentation)
-            else {
+            let is_marker = annotation
+                .markers
+                .iter()
+                .any(|range| range.contains(&source_char));
+            if is_marker {
                 continue;
-            };
-            let underline_ranges: Vec<_> = annotation
-                .content
-                .iter()
-                .map(|range| {
-                    fragment.display_char_for_source(source_to_stripped[range.start])
-                        ..fragment.display_char_for_source(source_to_stripped[range.end])
-                })
-                .collect();
-            fragment.runs =
-                restyle_markdown_runs(&fragment.display, &fragment.runs, |display_char, run| {
-                    run.underline |= underline_ranges
-                        .iter()
-                        .any(|range| range.contains(&display_char));
-                });
-            fragment.source_to_display = source_to_stripped
-                .iter()
-                .map(|source| fragment.display_char_for_source(*source))
-                .collect();
-            fragment.display_to_source = fragment
-                .display_to_source
-                .iter()
-                .map(|source| stripped_to_source[*source])
-                .collect();
-            line.presentation = fragment;
+            }
+            stripped_to_source.push(source_char);
+            stripped.push(character);
+            stripped_char += 1;
         }
+        source_to_stripped.push(stripped_char);
+        stripped_to_source.push(source_chars.len());
+
+        let fragment_source = format!("cursor\n{stripped}");
+        let Some(mut fragment) = source_lines(&fragment_source, 0, dark_mode)
+            .into_iter()
+            .nth(1)
+            .map(|line| line.presentation)
+        else {
+            continue;
+        };
+        let underline_ranges: Vec<_> = annotation
+            .content
+            .iter()
+            .map(|range| {
+                fragment.display_char_for_source(source_to_stripped[range.start])
+                    ..fragment.display_char_for_source(source_to_stripped[range.end])
+            })
+            .collect();
+        fragment.runs =
+            restyle_markdown_runs(&fragment.display, &fragment.runs, |display_char, run| {
+                run.underline |= underline_ranges
+                    .iter()
+                    .any(|range| range.contains(&display_char));
+            });
+        fragment.source_to_display = source_to_stripped
+            .iter()
+            .map(|source| fragment.display_char_for_source(*source))
+            .collect();
+        fragment.display_to_source = fragment
+            .display_to_source
+            .iter()
+            .map(|source| stripped_to_source[*source])
+            .collect();
+        line.presentation = fragment;
         if matches!(line.presentation.kind, MarkdownBlockKind::Html) {
             line.presentation.kind = MarkdownBlockKind::Paragraph;
         }
@@ -1005,34 +952,6 @@ fn annotate_mermaid_blocks(lines: &mut [SourceLine], raw_lines: &[&str]) {
     }
 }
 
-fn reveal_active_mermaid_fences(lines: &mut [SourceLine], raw_lines: &[&str], cursor: usize) {
-    for (line, source) in lines.iter_mut().zip(raw_lines) {
-        let block_active = line
-            .presentation
-            .mermaid_block
-            .as_ref()
-            .is_some_and(|block| {
-                (block.source_start_char..=block.source_end_char).contains(&cursor)
-            });
-        let is_fence = line
-            .presentation
-            .code_line
-            .is_some_and(|code| code.is_fence);
-        if !block_active || !is_fence || line.presentation.display == *source {
-            continue;
-        }
-
-        let len = source.chars().count();
-        let mut run = plain_style_run(source.len());
-        run.mono = true;
-        run.muted = true;
-        line.presentation.display = (*source).to_owned();
-        line.presentation.runs = (!source.is_empty()).then_some(run).into_iter().collect();
-        line.presentation.source_to_display = (0..=len).collect();
-        line.presentation.display_to_source = (0..=len).collect();
-    }
-}
-
 fn annotate_math(lines: &mut [SourceLine], raw_lines: &[&str]) {
     annotate_math_blocks(lines, raw_lines);
     for (line, source) in lines.iter_mut().zip(raw_lines) {
@@ -1407,7 +1326,7 @@ fn detect_inline_footnotes(source: &str) -> Vec<(Range<usize>, String)> {
     references
 }
 
-fn annotate_images(lines: &mut [SourceLine], raw_lines: &[&str], cursor: usize) {
+fn annotate_images(lines: &mut [SourceLine], raw_lines: &[&str]) {
     for (line, source) in lines.iter_mut().zip(raw_lines) {
         if line.presentation.code_line.is_some() {
             continue;
@@ -1437,20 +1356,6 @@ fn annotate_images(lines: &mut [SourceLine], raw_lines: &[&str], cursor: usize) 
             } else {
                 line.presentation.inline_images.push(image);
             }
-        }
-        let active = (line.start_char..=line.start_char + line.source_len_chars).contains(&cursor);
-        if active
-            && (line.presentation.image_block.is_some()
-                || !line.presentation.inline_images.is_empty())
-        {
-            let len = source.chars().count();
-            line.presentation.display = (*source).to_owned();
-            line.presentation.runs = (!source.is_empty())
-                .then(|| plain_style_run(source.len()))
-                .into_iter()
-                .collect();
-            line.presentation.source_to_display = (0..=len).collect();
-            line.presentation.display_to_source = (0..=len).collect();
         }
     }
 }
@@ -2775,11 +2680,11 @@ mod tests {
         assert_eq!(nested.display, "before bold and code after");
         assert!(nested.runs.iter().any(|run| run.bold && run.underline));
         assert!(nested.runs.iter().any(|run| run.mono && run.underline));
-        assert_eq!(active.display, "<u>中文</u>");
-        assert!(active.runs.iter().any(|run| run.muted));
-        assert!(active.runs.iter().any(|run| run.underline && !run.muted));
-        assert_eq!(active.display_char_for_source(4), 4);
-        assert_eq!(active.source_char_for_display(4), 4);
+        assert_eq!(active.display, "中文");
+        assert!(active.runs.iter().all(|run| !run.muted));
+        assert!(active.runs.iter().any(|run| run.underline));
+        assert_eq!(active.display_char_for_source(3), 0);
+        assert_eq!(active.source_char_for_display(1), 4);
         assert_eq!(multiline[1].presentation.display, "first");
         assert_eq!(multiline[2].presentation.display, "second");
         assert!(
@@ -2847,7 +2752,8 @@ mod tests {
 
         let active_source = "before ![badge](badge.svg) after";
         let active = source_lines(active_source, 2, false);
-        assert_eq!(active[0].presentation.display, active_source);
+        assert_eq!(active[0].presentation.display, "before  after");
+        assert_eq!(active[0].presentation.inline_images.len(), 1);
     }
 
     #[test]
@@ -2965,21 +2871,34 @@ mod tests {
     }
 
     #[test]
-    fn p4_active_mermaid_reveals_both_fences_with_identity_cursor_mapping() {
+    fn p4_mermaid_stays_rendered_when_the_cursor_enters_the_block() {
         let source = "before\n```mermaid\nflowchart LR\nA --> B\n```\nafter";
         let cursor = source.find("A --> B").expect("diagram content byte");
         let lines = source_lines(source, cursor, false);
 
-        assert_eq!(lines[1].presentation.display, "```mermaid");
-        assert_eq!(lines[4].presentation.display, "```");
-        assert_eq!(lines[1].presentation.display_char_for_source(5), 5);
-        assert_eq!(lines[4].presentation.source_char_for_display(2), 2);
         assert!(
-            lines[4]
+            lines[1]
                 .presentation
-                .runs
-                .iter()
-                .all(|run| run.mono && run.muted)
+                .mermaid_block
+                .as_ref()
+                .unwrap()
+                .is_anchor
+        );
+        assert!(
+            !lines[2]
+                .presentation
+                .mermaid_block
+                .as_ref()
+                .unwrap()
+                .is_anchor
+        );
+        assert!(
+            !lines[4]
+                .presentation
+                .mermaid_block
+                .as_ref()
+                .unwrap()
+                .is_anchor
         );
     }
 
@@ -3171,27 +3090,25 @@ mod tests {
     }
 
     #[test]
-    fn p2_cursor_line_reveals_markdown_source_while_other_lines_stay_rendered() {
+    fn default_rich_mode_keeps_markdown_rendered_when_the_cursor_moves() {
         let lines = source_lines("# 当前标题\n**预览**", 4, true);
 
-        assert_eq!(lines[0].presentation.display, "# 当前标题");
+        assert_eq!(lines[0].presentation.display, "当前标题");
         assert_eq!(lines[1].presentation.display, "预览");
     }
 
     #[test]
-    fn editor_active_markdown_markers_use_muted_style_runs() {
+    fn default_rich_mode_keeps_inline_markers_hidden_on_the_active_line() {
         let line = source_lines("**bold**", 1, true).remove(0).presentation;
         let code = source_lines("`code`", 2, true).remove(0).presentation;
 
-        assert_eq!(line.display, "**bold**");
-        assert!(line.runs.first().is_some_and(|run| run.muted));
-        assert!(line.runs.last().is_some_and(|run| run.muted));
-        assert!(line.runs.iter().any(|run| run.bold && !run.muted));
-        assert_eq!(code.display, "`code`");
-        assert!(code.runs.first().is_some_and(|run| run.muted));
-        assert!(code.runs.last().is_some_and(|run| run.muted));
-        assert!(code.runs.iter().any(|run| run.mono && !run.muted));
-        assert_eq!(inline_code_byte_ranges(&code.runs, code.kind), vec![1..5]);
+        assert_eq!(line.display, "bold");
+        assert!(line.runs.iter().all(|run| !run.muted));
+        assert!(line.runs.iter().any(|run| run.bold));
+        assert_eq!(code.display, "code");
+        assert!(code.runs.iter().all(|run| !run.muted));
+        assert!(code.runs.iter().any(|run| run.mono));
+        assert_eq!(inline_code_byte_ranges(&code.runs, code.kind), vec![0..4]);
     }
 
     #[test]
