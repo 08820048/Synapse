@@ -314,7 +314,7 @@ pub fn source_lines_with_mode(
 
 pub fn source_lines_from_buffer(
     buffer: &mut Buffer,
-    _cursor: usize,
+    cursor: usize,
     dark_mode: bool,
 ) -> Vec<SourceLine> {
     let snapshot = buffer.render_snapshot();
@@ -422,12 +422,79 @@ pub fn source_lines_from_buffer(
     annotate_quote_lines(&mut lines);
     annotate_callout_lines(&mut lines, snapshot.callouts());
     annotate_code_lines(&mut lines, &raw_lines);
+    reveal_incomplete_fence_input(&mut lines, &raw_lines, cursor);
     annotate_mermaid_blocks(&mut lines, &raw_lines);
     annotate_math(&mut lines, &raw_lines);
     annotate_task_items(&mut lines, &raw_lines);
     annotate_footnotes(&mut lines, &raw_lines);
     annotate_images(&mut lines, &raw_lines);
     lines
+}
+
+fn reveal_incomplete_fence_input(lines: &mut [SourceLine], raw_lines: &[&str], cursor: usize) {
+    for index in 0..lines.len().min(raw_lines.len()) {
+        let line_start = lines[index].start_char;
+        let line_end = line_start + lines[index].source_len_chars;
+        let source = raw_lines[index];
+        if !(line_start..=line_end).contains(&cursor) || cursor != line_end {
+            continue;
+        }
+        let indentation = source
+            .chars()
+            .take_while(|character| *character == ' ')
+            .count();
+        if indentation > 3 {
+            continue;
+        }
+        let rest = &source[indentation..];
+        let Some(marker) = rest.chars().next() else {
+            continue;
+        };
+        if !matches!(marker, '`' | '~') {
+            continue;
+        }
+        let marker_len = rest
+            .chars()
+            .take_while(|character| *character == marker)
+            .count();
+        if marker_len == 0 {
+            continue;
+        }
+        let suffix = rest.chars().skip(marker_len).collect::<String>();
+        if suffix.chars().any(char::is_whitespace) {
+            continue;
+        }
+        let complete_block = marker_len >= 3
+            && lines
+                .iter()
+                .zip(raw_lines.iter().copied())
+                .any(|(candidate, raw)| {
+                    candidate.start_char > line_start
+                        && matching_closing_fence(raw, marker, marker_len)
+                });
+        if !complete_block {
+            lines[index].presentation = raw_source_presentation(source);
+        }
+    }
+}
+
+fn matching_closing_fence(source: &str, marker: char, minimum_len: usize) -> bool {
+    let indentation = source
+        .chars()
+        .take_while(|character| *character == ' ')
+        .count();
+    if indentation > 3 {
+        return false;
+    }
+    let rest = &source[indentation..];
+    let marker_len = rest
+        .chars()
+        .take_while(|character| *character == marker)
+        .count();
+    marker_len >= minimum_len
+        && rest
+            .chars()
+            .all(|character| character == marker || character.is_whitespace())
 }
 
 fn annotate_inline_underlines(lines: &mut [SourceLine], raw_lines: &[&str], dark_mode: bool) {
@@ -590,6 +657,32 @@ fn restyle_markdown_runs(
     result
 }
 
+fn raw_source_presentation(source: &str) -> MarkdownLinePresentation {
+    let len = source.chars().count();
+    MarkdownLinePresentation {
+        display: source.to_owned(),
+        kind: MarkdownBlockKind::Source,
+        runs: (!source.is_empty())
+            .then(|| plain_style_run(source.len()))
+            .into_iter()
+            .collect(),
+        table_row: None,
+        quote_line: None,
+        code_line: None,
+        mermaid_block: None,
+        math_block: None,
+        inline_math: Vec::new(),
+        task_item: None,
+        callout_line: None,
+        footnote_definition: None,
+        inline_footnotes: Vec::new(),
+        image_block: None,
+        inline_images: Vec::new(),
+        source_to_display: (0..=len).collect(),
+        display_to_source: (0..=len).collect(),
+    }
+}
+
 fn raw_source_lines(text: &str) -> Vec<SourceLine> {
     let mut start_char = 0;
     text.split('\n')
@@ -598,28 +691,7 @@ fn raw_source_lines(text: &str) -> Vec<SourceLine> {
             let line = SourceLine {
                 start_char,
                 source_len_chars: len,
-                presentation: MarkdownLinePresentation {
-                    display: source.to_owned(),
-                    kind: MarkdownBlockKind::Source,
-                    runs: (!source.is_empty())
-                        .then(|| plain_style_run(source.len()))
-                        .into_iter()
-                        .collect(),
-                    table_row: None,
-                    quote_line: None,
-                    code_line: None,
-                    mermaid_block: None,
-                    math_block: None,
-                    inline_math: Vec::new(),
-                    task_item: None,
-                    callout_line: None,
-                    footnote_definition: None,
-                    inline_footnotes: Vec::new(),
-                    image_block: None,
-                    inline_images: Vec::new(),
-                    source_to_display: (0..=len).collect(),
-                    display_to_source: (0..=len).collect(),
-                },
+                presentation: raw_source_presentation(source),
             };
             start_char += len + 1;
             line
@@ -898,6 +970,7 @@ fn annotate_code_lines(lines: &mut [SourceLine], raw_lines: &[&str]) {
         let last_content = fences.iter().rposition(|is_fence| !is_fence);
         let first_fence = fences.iter().position(|is_fence| *is_fence);
         let last_fence = fences.iter().rposition(|is_fence| *is_fence);
+        let has_closing_fence = first_fence.is_some() && last_fence != first_fence;
 
         for (offset, is_fence) in fences.into_iter().enumerate() {
             lines[start + offset].presentation.code_line = Some(MarkdownCodeLine {
@@ -909,6 +982,13 @@ fn annotate_code_lines(lines: &mut [SourceLine], raw_lines: &[&str]) {
                 is_first_content: first_content == Some(offset),
                 is_last_content: last_content == Some(offset),
             });
+        }
+        if !has_closing_fence && let Some(opening_offset) = first_fence {
+            // A newly typed fence must remain visible until Enter inserts the closing fence;
+            // otherwise the persistent rich renderer would hide the line before a language
+            // identifier (for example `rust`) can be completed.
+            lines[start + opening_offset].presentation =
+                raw_source_presentation(raw_lines[start + opening_offset]);
         }
         start = end;
     }
@@ -2818,6 +2898,34 @@ mod tests {
                 .iter()
                 .any(|run| run.syntax_rgba.is_some())
         );
+    }
+
+    #[test]
+    fn incomplete_code_fence_stays_visible_until_smart_enter_closes_it() {
+        for source in ["`", "``", "```", "```r", "```rust"] {
+            let line = source_lines(source, source.chars().count(), false);
+            assert_eq!(line[0].presentation.display, source);
+            assert_eq!(line[0].presentation.kind, MarkdownBlockKind::Source);
+        }
+
+        let incomplete = source_lines("```rust", 7, false);
+        assert_eq!(incomplete[0].presentation.display, "```rust");
+        assert_eq!(incomplete[0].presentation.kind, MarkdownBlockKind::Source);
+
+        let complete = source_lines("```rust\n\n```", 8, false);
+        assert!(
+            complete[0]
+                .presentation
+                .code_line
+                .is_some_and(|line| line.is_opening_fence)
+        );
+        assert!(
+            complete[2]
+                .presentation
+                .code_line
+                .is_some_and(|line| line.is_closing_fence)
+        );
+        assert_eq!(complete[0].presentation.kind, MarkdownBlockKind::Code);
     }
 
     #[test]

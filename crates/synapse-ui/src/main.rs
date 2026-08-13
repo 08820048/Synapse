@@ -193,6 +193,10 @@ fn command_palette_key_bindings() -> [&'static str; 2] {
     ["cmd-k", "ctrl-k"]
 }
 
+fn editor_backtick_key_bindings() -> [&'static str; 2] {
+    ["`", "alt-`"]
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum ThemePreference {
     #[default]
@@ -571,6 +575,13 @@ actions!(
         Copy,
         Cut,
         Paste,
+        InsertBacktick,
+        ToggleBold,
+        ToggleItalic,
+        ToggleUnderline,
+        ToggleStrikethrough,
+        ToggleInlineCode,
+        ToggleCodeBlock,
         InsertNewline,
         InsertRawNewline,
         OpenCommandPalette,
@@ -2358,6 +2369,22 @@ impl SynapseApp {
         cx.stop_propagation();
     }
 
+    fn insert_backtick(&mut self, _: &InsertBacktick, _: &mut Window, cx: &mut Context<Self>) {
+        let previous_revision = self
+            .state
+            .active_document()
+            .map_or(0, |document| document.revision());
+        let range = self.editor_selection.range();
+        if self.state.replace_active_range(range.clone(), "`").is_ok() {
+            self.sync_writ_render_buffer(previous_revision, range, "`");
+            self.editor_marked_range = None;
+            self.editor_selection.collapse(self.state.cursor());
+            self.restart_editor_cursor_blink(cx);
+            cx.notify();
+        }
+        cx.stop_propagation();
+    }
+
     fn insert_newline(&mut self, _: &InsertNewline, _: &mut Window, cx: &mut Context<Self>) {
         self.editor_marked_range = None;
         if self.editor_selection.is_empty() {
@@ -2469,6 +2496,62 @@ impl SynapseApp {
             self.restart_editor_cursor_blink(cx);
             cx.notify();
         }
+    }
+
+    fn apply_inline_format_shortcut(&mut self, format: InlineFormat, cx: &mut Context<Self>) {
+        self.toggle_selected_inline_format(format, cx);
+        cx.stop_propagation();
+    }
+
+    fn toggle_bold(&mut self, _: &ToggleBold, _: &mut Window, cx: &mut Context<Self>) {
+        self.apply_inline_format_shortcut(InlineFormat::Bold, cx);
+    }
+
+    fn toggle_italic(&mut self, _: &ToggleItalic, _: &mut Window, cx: &mut Context<Self>) {
+        self.apply_inline_format_shortcut(InlineFormat::Italic, cx);
+    }
+
+    fn toggle_underline(&mut self, _: &ToggleUnderline, _: &mut Window, cx: &mut Context<Self>) {
+        self.apply_inline_format_shortcut(InlineFormat::Underline, cx);
+    }
+
+    fn toggle_strikethrough(
+        &mut self,
+        _: &ToggleStrikethrough,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.apply_inline_format_shortcut(InlineFormat::Strikethrough, cx);
+    }
+
+    fn toggle_inline_code(&mut self, _: &ToggleInlineCode, _: &mut Window, cx: &mut Context<Self>) {
+        self.apply_inline_format_shortcut(InlineFormat::Code, cx);
+    }
+
+    fn toggle_code_block(&mut self, _: &ToggleCodeBlock, _: &mut Window, cx: &mut Context<Self>) {
+        let range = self.editor_selection.range();
+        let Some(text) = self.state.active_document().map(|document| document.text()) else {
+            cx.stop_propagation();
+            return;
+        };
+        let Some(edit) = fenced_code_block_edit(&text, range) else {
+            cx.stop_propagation();
+            return;
+        };
+        if self
+            .state
+            .replace_active_range(edit.replace_range, &edit.replacement)
+            .is_ok()
+        {
+            self.editor_selection.collapse(edit.selection.start);
+            self.editor_selection.select_to(edit.selection.end);
+            self.state.set_cursor(edit.selection.end);
+            self.editor_marked_range = None;
+            self.selection_menu_mode = SelectionMenuMode::Formatting;
+            self.restart_editor_cursor_blink(cx);
+            cx.notify();
+        }
+        cx.stop_propagation();
     }
 
     fn open_selection_link(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -4225,6 +4308,13 @@ impl Render for SynapseApp {
                 .on_action(cx.listener(Self::copy))
                 .on_action(cx.listener(Self::cut))
                 .on_action(cx.listener(Self::paste))
+                .on_action(cx.listener(Self::insert_backtick))
+                .on_action(cx.listener(Self::toggle_bold))
+                .on_action(cx.listener(Self::toggle_italic))
+                .on_action(cx.listener(Self::toggle_underline))
+                .on_action(cx.listener(Self::toggle_strikethrough))
+                .on_action(cx.listener(Self::toggle_inline_code))
+                .on_action(cx.listener(Self::toggle_code_block))
                 .on_action(cx.listener(Self::insert_newline))
                 .on_action(cx.listener(Self::insert_raw_newline))
                 .on_mouse_down(MouseButton::Left, cx.listener(Self::editor_mouse_down))
@@ -6589,7 +6679,7 @@ fn inline_format_bounds(
     selection: Range<usize>,
     format: InlineFormat,
 ) -> Option<(Range<usize>, Range<usize>)> {
-    if selection.is_empty() || selection.end > text.chars().count() {
+    if selection.end > text.chars().count() {
         return None;
     }
     let (opening, closing) = inline_format_markers(format);
@@ -6650,7 +6740,7 @@ fn inline_format_edit(
             selection: start..end,
         });
     }
-    if selection.is_empty() || selection.end > text.chars().count() {
+    if selection.end > text.chars().count() {
         return None;
     }
     let selected = text
@@ -6664,6 +6754,36 @@ fn inline_format_edit(
     Some(InlineFormatEdit {
         replace_range: selection.clone(),
         selection: selection.start + opening_len..selection.end + opening_len,
+        replacement,
+    })
+}
+
+fn fenced_code_block_edit(text: &str, selection: Range<usize>) -> Option<InlineFormatEdit> {
+    let chars = text.chars().collect::<Vec<_>>();
+    if selection.end > chars.len() {
+        return None;
+    }
+    if selection.is_empty() {
+        return Some(InlineFormatEdit {
+            replace_range: selection.clone(),
+            replacement: "```\n\n```".to_owned(),
+            selection: selection.start + 4..selection.start + 4,
+        });
+    }
+
+    let line_start = chars[..selection.start]
+        .iter()
+        .rposition(|character| *character == '\n')
+        .map_or(0, |index| index + 1);
+    let line_end = chars[selection.end..]
+        .iter()
+        .position(|character| *character == '\n')
+        .map_or(chars.len(), |index| selection.end + index);
+    let content = chars[line_start..line_end].iter().collect::<String>();
+    let replacement = format!("```\n{content}\n```");
+    Some(InlineFormatEdit {
+        replace_range: line_start..line_end,
+        selection: line_start + 4..line_start + 4 + content.chars().count(),
         replacement,
     })
 }
@@ -6880,6 +7000,28 @@ fn main() {
                 KeyBinding::new("ctrl-x", Cut, Some("SynapseEditor")),
                 KeyBinding::new("cmd-v", Paste, Some("SynapseEditor")),
                 KeyBinding::new("ctrl-v", Paste, Some("SynapseEditor")),
+                KeyBinding::new(
+                    editor_backtick_key_bindings()[0],
+                    InsertBacktick,
+                    Some("SynapseEditor"),
+                ),
+                KeyBinding::new(
+                    editor_backtick_key_bindings()[1],
+                    InsertBacktick,
+                    Some("SynapseEditor"),
+                ),
+                KeyBinding::new("cmd-b", ToggleBold, Some("SynapseEditor")),
+                KeyBinding::new("ctrl-b", ToggleBold, Some("SynapseEditor")),
+                KeyBinding::new("cmd-i", ToggleItalic, Some("SynapseEditor")),
+                KeyBinding::new("ctrl-i", ToggleItalic, Some("SynapseEditor")),
+                KeyBinding::new("cmd-u", ToggleUnderline, Some("SynapseEditor")),
+                KeyBinding::new("ctrl-u", ToggleUnderline, Some("SynapseEditor")),
+                KeyBinding::new("cmd-shift-s", ToggleStrikethrough, Some("SynapseEditor")),
+                KeyBinding::new("ctrl-shift-s", ToggleStrikethrough, Some("SynapseEditor")),
+                KeyBinding::new("cmd-e", ToggleInlineCode, Some("SynapseEditor")),
+                KeyBinding::new("ctrl-e", ToggleInlineCode, Some("SynapseEditor")),
+                KeyBinding::new("cmd-alt-c", ToggleCodeBlock, Some("SynapseEditor")),
+                KeyBinding::new("ctrl-alt-c", ToggleCodeBlock, Some("SynapseEditor")),
                 KeyBinding::new("enter", InsertNewline, Some("SynapseEditor")),
                 KeyBinding::new("shift-enter", InsertRawNewline, Some("SynapseEditor")),
             ]);
@@ -7187,13 +7329,13 @@ mod tests {
         build_image_previews, build_math_previews, build_mermaid_previews, changed_line_span,
         clipboard_image_extension, code_block_edges, command_palette_key_bindings,
         default_window_size, document_outline_horizontal_layout, document_outline_is_visible,
-        document_outline_layout, editor_horizontal_gutter, editor_page_content_width,
-        file_manager_reveal_command, inline_format_edit, inline_format_is_active,
-        is_tab_context_trigger, markd_panel_spring_progress, markdown_link_context,
-        normalize_clipboard_text, normalize_markdown_link_destination, note_breadcrumb_parts,
-        persist_clipboard_image, resolve_markdown_image, source_lines_from_buffer,
-        synapse_mermaid_theme, synapse_theme_palette, synapse_titlebar_options,
-        titlebar_left_inset,
+        document_outline_layout, editor_backtick_key_bindings, editor_horizontal_gutter,
+        editor_page_content_width, fenced_code_block_edit, file_manager_reveal_command,
+        inline_format_edit, inline_format_is_active, is_tab_context_trigger,
+        markd_panel_spring_progress, markdown_link_context, normalize_clipboard_text,
+        normalize_markdown_link_destination, note_breadcrumb_parts, persist_clipboard_image,
+        resolve_markdown_image, source_lines_from_buffer, synapse_mermaid_theme,
+        synapse_theme_palette, synapse_titlebar_options, titlebar_left_inset,
     };
 
     fn sfnt_table<'a>(font: &'a [u8], tag: &[u8; 4]) -> Option<&'a [u8]> {
@@ -7291,6 +7433,46 @@ mod tests {
             4..6,
             InlineFormat::Italic
         ));
+    }
+
+    #[test]
+    fn format_shortcuts_insert_paired_markers_at_an_empty_cursor() {
+        assert_eq!(
+            inline_format_edit("中文", 1..1, InlineFormat::Bold),
+            Some(InlineFormatEdit {
+                replace_range: 1..1,
+                replacement: "****".to_owned(),
+                selection: 3..3,
+            })
+        );
+        assert_eq!(
+            inline_format_edit("中文", 1..1, InlineFormat::Code),
+            Some(InlineFormatEdit {
+                replace_range: 1..1,
+                replacement: "``".to_owned(),
+                selection: 2..2,
+            })
+        );
+    }
+
+    #[test]
+    fn code_block_shortcut_wraps_complete_lines_or_inserts_an_empty_block() {
+        assert_eq!(
+            fenced_code_block_edit("前言\n第一行\n第二行\n结尾", 4..9),
+            Some(InlineFormatEdit {
+                replace_range: 3..10,
+                replacement: "```\n第一行\n第二行\n```".to_owned(),
+                selection: 7..14,
+            })
+        );
+        assert_eq!(
+            fenced_code_block_edit("正文", 1..1),
+            Some(InlineFormatEdit {
+                replace_range: 1..1,
+                replacement: "```\n\n```".to_owned(),
+                selection: 5..5,
+            })
+        );
     }
 
     #[test]
@@ -7527,6 +7709,11 @@ mod tests {
     #[test]
     fn component_command_palette_has_native_cross_platform_shortcuts() {
         assert_eq!(command_palette_key_bindings(), ["cmd-k", "ctrl-k"]);
+    }
+
+    #[test]
+    fn editor_accepts_both_plain_and_option_grave_backtick_input() {
+        assert_eq!(editor_backtick_key_bindings(), ["`", "alt-`"]);
     }
 
     #[test]

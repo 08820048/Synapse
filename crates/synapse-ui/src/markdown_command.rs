@@ -10,6 +10,10 @@ pub struct MarkdownEdit {
 }
 
 pub fn smart_enter_edit(source: &str, cursor_char: usize) -> MarkdownEdit {
+    if let Some(edit) = fenced_code_block_enter_edit(source, cursor_char) {
+        return edit;
+    }
+
     let mut editor = EditorState::new(source);
     let cursor_byte = char_to_byte(source, cursor_char);
     editor.set_cursor(cursor_byte);
@@ -37,6 +41,91 @@ pub fn smart_enter_edit(source: &str, cursor_char: usize) -> MarkdownEdit {
         cursor: cursor_char + replacement.chars().count(),
         replacement,
     }
+}
+
+fn fenced_code_block_enter_edit(source: &str, cursor_char: usize) -> Option<MarkdownEdit> {
+    let chars = source.chars().collect::<Vec<_>>();
+    let cursor = cursor_char.min(chars.len());
+    let line_start = chars[..cursor]
+        .iter()
+        .rposition(|character| *character == '\n')
+        .map_or(0, |index| index + 1);
+    let line_end = chars[cursor..]
+        .iter()
+        .position(|character| *character == '\n')
+        .map_or(chars.len(), |index| cursor + index);
+    if cursor != line_end {
+        return None;
+    }
+
+    let line = chars[line_start..line_end].iter().collect::<String>();
+    let indentation_chars = line
+        .chars()
+        .take_while(|character| *character == ' ')
+        .count();
+    if indentation_chars > 3 {
+        return None;
+    }
+    let indentation = " ".repeat(indentation_chars);
+    let rest = &line[indentation_chars..];
+    let marker = rest.chars().next()?;
+    if !matches!(marker, '`' | '~') {
+        return None;
+    }
+    let marker_len = rest
+        .chars()
+        .take_while(|character| *character == marker)
+        .count();
+    if marker_len < 3 {
+        return None;
+    }
+    let info = rest.chars().skip(marker_len).collect::<String>();
+    if (marker == '`' && info.contains('`')) || info.contains('\t') || info.contains('\n') {
+        return None;
+    }
+    let info = info.trim();
+    if info.chars().any(char::is_whitespace) {
+        return None;
+    }
+
+    let fence = marker.to_string().repeat(marker_len);
+    let has_closing_fence = source
+        .chars()
+        .skip(line_end)
+        .collect::<String>()
+        .lines()
+        .skip(1)
+        .any(|candidate| is_matching_closing_fence(candidate, marker, marker_len));
+    let replacement = if has_closing_fence {
+        format!("\n{indentation}")
+    } else {
+        format!("\n{indentation}\n{indentation}{fence}")
+    };
+    Some(MarkdownEdit {
+        range: cursor..cursor,
+        cursor: cursor + 1 + indentation_chars,
+        replacement,
+    })
+}
+
+fn is_matching_closing_fence(line: &str, marker: char, minimum_len: usize) -> bool {
+    let indentation = line
+        .chars()
+        .take_while(|character| *character == ' ')
+        .count();
+    if indentation > 3 {
+        return false;
+    }
+    let rest = &line[indentation..];
+    let marker_len = rest
+        .chars()
+        .take_while(|character| *character == marker)
+        .count();
+    marker_len >= minimum_len
+        && marker_len == rest.trim_end().chars().count()
+        && rest
+            .chars()
+            .all(|character| character == marker || character.is_whitespace())
 }
 
 fn empty_list_marker_range(editor: &EditorState) -> Option<Range<usize>> {
@@ -102,5 +191,25 @@ mod tests {
     #[test]
     fn p2_writ_cursor_conversion_preserves_emoji_and_chinese() {
         assert_eq!(apply("- 😀中文", 5), ("- 😀中文\n- ".to_owned(), 8));
+    }
+
+    #[test]
+    fn markdown_fence_enter_creates_a_complete_language_code_block() {
+        assert_eq!(apply("```rust", 7), ("```rust\n\n```".to_owned(), 8));
+        assert_eq!(
+            apply("  ~~~typescript", 15),
+            ("  ~~~typescript\n  \n  ~~~".to_owned(), 18)
+        );
+    }
+
+    #[test]
+    fn markdown_fence_enter_reuses_an_existing_closing_fence() {
+        assert_eq!(apply("```rust\n```", 7), ("```rust\n\n```".to_owned(), 8));
+    }
+
+    #[test]
+    fn markdown_fence_enter_rejects_inline_or_incomplete_markers() {
+        assert_eq!(apply("text ```rust", 12), ("text ```rust\n".to_owned(), 13));
+        assert_eq!(apply("``rust", 6), ("``rust\n".to_owned(), 7));
     }
 }

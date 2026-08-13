@@ -96,10 +96,18 @@ cargo run -p synapse -- /path/to/markdown-folder
 | 操作 | 快捷键 |
 |---|---|
 | 保存 | macOS `Cmd+S`，Windows/Linux `Ctrl+S` |
+| 粗体 | macOS `Cmd+B`，Windows/Linux `Ctrl+B` |
+| 斜体 | macOS `Cmd+I`，Windows/Linux `Ctrl+I` |
+| 下划线 | macOS `Cmd+U`，Windows/Linux `Ctrl+U` |
+| 删除线 | macOS `Cmd+Shift+S`，Windows/Linux `Ctrl+Shift+S` |
+| 行内代码 | macOS `Cmd+E`，Windows/Linux `Ctrl+E` |
+| 围栏代码块 | macOS `Cmd+Option+C`，Windows/Linux `Ctrl+Alt+C` |
 | 换行 | `Enter` |
 | 原始换行（不续写 Markdown 容器） | `Shift+Enter` |
 | 删除 | `Backspace` / `Delete` |
 | 移动光标 | `Up` / `Down` / `Left` / `Right` / `Home` / `End`，或鼠标点击文本位置 |
+
+格式快捷键会包裹当前选区；没有选区时会插入成对标记并把光标放在中间。行首输入 `````rust``、`~~~typescript` 等围栏后按 `Enter`，会自动补齐闭合围栏并将光标放入代码区；下方已有匹配闭合围栏时不会重复插入。
 
 ## 验证
 

@@ -1166,6 +1166,26 @@ mod tests {
     }
 
     #[test]
+    fn markdown_fence_can_be_typed_character_by_character_and_completed_with_enter() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("note.md"), "").unwrap();
+        let mut state =
+            ShellState::from_vault_argument(Some(OsString::from(directory.path().as_os_str())));
+        state.select_note(Path::new("note.md")).unwrap();
+
+        for character in ['`', '`', '`', 'r', 'u', 's', 't'] {
+            state.insert_text(&character.to_string()).unwrap();
+        }
+        assert_eq!(state.active_document().unwrap().text(), "```rust");
+        assert_eq!(state.cursor(), 7);
+
+        state.smart_enter().unwrap();
+
+        assert_eq!(state.active_document().unwrap().text(), "```rust\n\n```");
+        assert_eq!(state.cursor(), 8);
+    }
+
+    #[test]
     fn note_editing_ac8_save_active_persists_and_updates_status() {
         let directory = tempfile::tempdir().unwrap();
         fs::write(directory.path().join("note.md"), "before").unwrap();
