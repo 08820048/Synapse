@@ -1,7 +1,7 @@
 # Synapse 开发进度
 
-> 最后更新：2026-08-13（编辑器工具栏纯图标化）
-> 当前阶段：界面细节 — 编辑器右上角源码切换与更多操作已移除重复按钮表面，并通过最终非视觉回归
+> 最后更新：2026-08-13（修复 Markdown 加粗与行内代码最终绘制）
+> 当前阶段：编辑器交互 — 加粗和行内代码已从语法解析贯通到 GPUI 最终 TextRun/背景绘制，并继续保持持久 Writ 增量编辑路径
 > 同步规则：每次功能调整后立即维护本文件；每轮开发结束前再次核对代码、测试与本文档一致性。
 
 ## 当前可用功能
@@ -36,13 +36,19 @@
 - 编辑器使用真实 shaped-line 布局处理鼠标点击，光标会定位到最近的 Unicode 字符边界；上下移动经过短行后仍保留期望列。
 - 普通 Enter 已接入 `writ 0.18.1` tree-sitter 列表上下文：支持无序/有序/任务列表与引用续写、序号递增和空列表退出；Shift+Enter 保留原始换行。
 - 任务列表在阅读状态使用 16px GPUI 原生复选框替换 `[ ]` / `[x]` 源码标记，支持嵌套任务与大小写 `X`；点击复选框会直接切换标准 Markdown 标记、保持原光标位置并更新脏状态。
-- 编辑光标以约 530ms 周期闪烁；输入、点击或方向移动会立即恢复可见并使旧计时任务失效。
+- 编辑光标以约 530ms 周期闪烁；输入、点击或方向移动会立即恢复可见并使旧计时任务失效。光标宽度由 1px 提升为居中的 1.5px，颜色直接使用 Ornata 同源的完整 ink/foreground（浅色 `#191919`、深色 `#ebebe8`），不再呈现细弱浅线。
 - 编辑器具备锚点/活动端选区：支持鼠标跨行拖选、Shift + Left/Right/Up/Down/Home/End 扩展选择，并绘制选区背景。
+- 鼠标或 Shift 键盘形成非空选区后，会在选区上方 8px 自动显示纯 Rust + GPUI 划词工具条；拖选过程中隐藏，释放后显示，跨行与软换行选区使用真实 shaped-line 坐标定位，窗口边缘自动限制在 12px 安全区内。
+- 划词工具条按参考项目使用 32px 高、8px 圆角、2px 内边距和阴影浮层；最左侧为带 Lucide `sparkles` 的反色 `Ask AI`，其后是 28×28 的粗体、斜体、下划线、删除线、行内代码和链接按钮，激活状态反色并保留 Tooltip。
+- 划词工具条不再依赖 GPUI Component 按钮的隐式 `currentColor` 继承：`Ask AI` 文本和 Sparkles、六个格式/链接图标、链接确认文本及 AI 发送图标均使用显式主题前景色，浮层自身也设置 `popover_foreground` 兜底；`Ask AI` 内容禁止 flex 压缩，深浅主题和按钮状态下均不会再与背景同色或被挤没。
+- 粗体、斜体、删除线、行内代码分别写入标准 Markdown 标记，下划线使用可移植的 `<u>…</u>`；再次点击可移除格式。包裹与取消均保持原正文选区，支持中文和其他 Unicode 文本，并避免把粗体 `**` 错判成斜体 `*`。下划线已接入原生呈现链：编辑行保留浅色 HTML 标记，非编辑行隐藏标记并绘制真实下划线，支持跨行以及与粗体、行内代码组合，同时保留源码/显示字符映射。
+- 链接按钮会在同一浮层内切换为 `Paste a link…` 输入框和 `Set` 操作；可为选区创建标准 `[文本](地址)`，裸域名补全 HTTPS，内部相对路径和锚点保持原样；再次编辑链接文字时读取既有地址，清空地址则解除链接。
+- `Ask AI` 点击后会在格式条上方展开 340px、16px 圆角的输入面板，包含 Sparkles、需求输入和 40px 圆形发送按钮；目前按规划仅完成 UI、中文 IME/回车输入与空值禁用，不连接模型、网络或任何 AI 后端。
 - 支持 `Cmd/Ctrl+A` 全选、`Cmd/Ctrl+C` 复制、`Cmd/Ctrl+X` 剪切和 `Cmd/Ctrl+V` 文本/图片粘贴；输入、删除、换行和粘贴会替换当前选区。
 - 复制读取 Markdown 源码选区；文本粘贴通过 GPUI 系统剪贴板读取并统一 CRLF/CR 换行，不会把多行 Markdown 压成一行。
 - 剪贴板图片粘贴会保留 PNG/JPEG/WebP/GIF/SVG/BMP/TIFF 原格式，写入当前笔记同级 `assets/` 目录并插入相对 Markdown 图片语法；时间戳文件名带碰撞递增保护，不覆盖既有附件。
 - Markdown 呈现已从手写逐行字符规则迁移到 writ 的 tree-sitter-md `RenderSnapshot`、结构标记、行内样式和 buffer/display 映射。
-- 当前可呈现 ATX/Setext H1–H6、无序/有序/任务列表、带高对比竖线的引用块、全宽主题分割线、带语法高亮的围栏代码块、粗体、斜体、删除线、行内代码、链接、独立/行内图片和基础 GFM 表格；源码仍是保存权威数据。
+- 当前可呈现 ATX/Setext H1–H6、无序/有序/任务列表、带高对比竖线的引用块、全宽主题分割线、带语法高亮的围栏代码块、粗体、斜体、下划线、删除线、行内代码、链接、独立/行内图片和基础 GFM 表格；源码仍是保存权威数据。编辑器显式使用 Inter，并内置 Google Fonts 官方 Normal/Italic 可变字体及独立的 700 Bold/Bold Italic 字体面；粗体由 GPUI 实际匹配独立粗体字形，不再只修改无法可靠生效的可变字重字段。行内代码使用平台等宽字体，并绘制 Ornata 同款主题 hover 背景、4px 圆角和约 0.15em/0.4em 的视觉内边距；围栏代码块不重复套用行内代码背景。
 - writ 的重叠样式运行会转换为 GPUI 完整连续的 `TextRun`，链接下划线、强调、代码色和删除线可组合呈现。
 - 光标所在行会显示完整 Markdown 源码标记，移动到其他行后才恢复阅读样式，改善隐藏标记时的定位和结构编辑体验。
 - 编辑状态由会话持续跟踪，`Modified` 通过页签脏状态圆点反馈；底部状态文案随底部工具栏一并移除。
@@ -122,6 +128,8 @@
 - Settings 已提供可操作的 Appearance 面板，支持 System、Light、Dark；System 会监听系统外观变化，选择结果保存到用户配置目录。
 - 浅色主题使用 `#fbfbfa` 编辑画布和 `#f4f4f2` 侧栏，深色使用 `#1a1a1a` 与 `#151515`，保证导航与写作区层级可辨。
 - Markdown 呈现结果按 Vault、笔记路径、文档 revision、光标和主题缓存；光标闪烁、侧栏动画及无关状态刷新不再重复复制 Rope 和解析全文。
+- 编辑器渲染缓存现在长期持有与当前文档 revision 对齐的 Writ Buffer；中文输入、组合输入、Backspace、Delete 和选区替换直接在该 Rope 上按字节范围增量更新，下一帧复用解析状态，不再为每个按键重新创建并全量解析 Writ Buffer。缓存同步通过 revision 校验，不复制全文，也不在调试构建中逐键全文比较。
+- 自动新建笔记的一级标题/文件名联动（包括中文 IME 组合提交）只在编辑范围触及首行时执行；正文区域的连续输入与删除不再提取全文标题、触发文件系统重命名判断或重新扫描 Vault。文档目录也直接复用本帧已解析行生成，不再执行第二次 Markdown 解析。
 - 编辑器使用 GPUI 原生变高虚拟列表，只创建、测量和塑形可视范围及上下 320px 缓冲区，长文档不再一次性构造全部行元素。
 - 编辑行布局通过共享缓存直接回写，不再在每一行 paint 后调用应用实体更新；离开视口的命中布局会随滚动清理。
 - 源码/显示字符映射使用一次性 Unicode 字节边界表；release 非视觉探针从旧算法约 79.7ms 降至约 46.4µs。
@@ -129,6 +137,10 @@
 
 ## 正在开发
 
+- Markdown 加粗已从“只写入 650 权重字段”修正为注册并匹配 Inter 700 Bold / Bold Italic 独立字体面；字体 OS/2 表回归会直接验证权重与 bold/italic 标志，避免再次出现字段正确但实际仍选中 Regular 的假修复。行内代码继续使用真实等宽字体与主题背景。按要求未启动应用、未执行截图或自动 UI 操作，等待产品手动验收。
+- 斜体、连续输入/删除性能与光标可见性调整已通过全工作区 148 项测试（另有 1 项手动性能探针按设计忽略）、两个 Synapse 包定向 Fmt、`cargo check -p synapse`、全工作区 Clippy 严格检查和 `git diff --check`；新增回归锁定斜体样式运行、Unicode 增量 Writ 编辑、正文编辑不触发标题/路径联动、Rope 首行长度及目录复用。按要求未启动应用、未执行截图或自动 UI 操作，等待产品手动验收快速 Backspace/Delete 跟手性、斜体字形和两种主题下的光标视觉。
+- 划词工具条内容可见性修复已通过全工作区 145 项测试（另有 1 项手动性能探针按设计忽略）、全工作区 Clippy 严格检查、定向 Fmt 和 `git diff --check`；按要求未启动应用或执行截图测试，等待产品手动验收深浅主题下的 `Ask AI`、格式图标、链接确认及禁用/可用发送状态。
+- 编辑器文本划词功能已通过全工作区 145 项测试（另有 1 项手动性能探针按设计忽略）、`cargo fmt --manifest-path crates/synapse-ui/Cargo.toml -- --check`、`cargo check -p synapse`、全工作区 Clippy 严格检查和 `git diff --check`；新增 3 项定向回归锁定中文选区格式包裹/取消、粗斜体区分、链接上下文解析与地址规范化，以及下划线的中文、嵌套样式、编辑态和跨行原生呈现。按要求未启动应用或执行截图测试，等待产品手动验收真实鼠标拖选、软换行/跨行定位、链接输入和 Ask AI 展开效果。
 - 编辑器工具栏纯图标调整已通过 `cargo fmt --manifest-path crates/synapse-ui/Cargo.toml -- --check`、`cargo check -p synapse`、全工作区 Clippy 严格检查和 `git diff --check`；`cargo fmt --all --check` 仅被仓库既有 vendored GPUI Component 与当前 rustfmt 的导入排序差异阻断，本轮未改动第三方目录。按要求未启动应用或执行截图测试，等待产品手动验收静止、源码激活及更多菜单三种状态。
 - Vault 外部变化刷新已通过全工作区 142 项测试（另有 1 项手动性能探针按设计忽略）和 `cargo clippy --workspace --all-targets -- -D warnings`；新增回归锁定“发现外部新增条目但保持未保存文档缓冲区”。按要求未启动应用或执行截图测试，等待产品从 Finder/终端/下载器手动验收真实文件系统事件。
 - 侧栏集合图标对齐调整已通过 `cargo check -p synapse`、侧栏字体/布局定向回归、Clippy 严格检查和 `git diff --check`；按要求未启动应用或执行截图测试，等待产品手动确认光学对齐效果。
@@ -161,7 +173,7 @@
 | V3 文件管理回归 | 通过 | 核心、会话、资源与平台命令测试全部通过 |
 | Rust 格式化 | 通过 | Synapse 两个 workspace 包分别通过 `cargo fmt --package … -- --check`；vendor 保持上游源码原样 |
 | Clippy | 通过 | workspace/all-targets，warnings 视为错误 |
-| 自动化测试 | 通过 | 133 个 Synapse workspace 测试全部通过，另有 1 个手动 release 性能探针按需运行；供应组件上游 102 个测试此前已通过 |
+| 自动化测试 | 通过 | 149 个 Synapse workspace 测试全部通过，另有 1 个手动 release 性能探针按需运行；供应组件上游 102 个测试此前已通过 |
 | GPUI 原生交互 | 部分通过 | IME、鼠标定位/拖选、Shift 选区、全选/复制/剪切/粘贴、列表续写、可点击任务框、光标闪烁、提示块、脚注、Mermaid 与数学 SVG 已接入；其余扩展语法组件和高级编辑行为仍需补齐；按要求未运行截图或自动界面操作 |
 | 编辑器与侧栏性能 | 待手动验收 | 已完成解析缓存、GPUI 变高虚拟列表、共享布局回写、线性字符映射和非布局侧栏动画；字符边界 release 探针约 79.7ms → 46.4µs。按要求未启动应用，尚无真实帧率数据 |
 
@@ -860,10 +872,47 @@
 - 新增模型回归测试锁定完整列表对完成项的保留、顺序和状态；README、待办规格、Lucide 来源记录与本进度文档同步。使用 `make-interfaces-feel-better` 的独立命中区、官方图标和明确状态反馈原则；没有引入 WebView、HTML/CSS 或 JavaScript。
 - 最终非视觉回归通过：workspace/all-targets 的 134 个自动化测试、严格 Clippy、Synapse 包格式检查和 `git diff --check` 全部成功，1 个手动性能探针按设计忽略；全程未启动软件或执行截图测试。
 
+### 2026-08-13 — 修复斜体字形、连续编辑延迟与细弱光标
+
+- 直接核对本机与远程 `ornata-new` 同源的 `/Users/xuyi/Documents/Ornata-markd`：参考编辑器以 Inter Variable 加载独立 Italic 字体文件，正文和光标均使用主题 `ink`；CodeMirror 光标约 1.2px。Synapse 原解析链已经生成 italic style run，但此前只内置 Normal 字体，GPUI 无法稳定合成斜体，因此菜单写入语法后视觉上仍像普通文本。
+- 新增 Google Fonts 官方 `Inter-Italic[opsz,wght].ttf`，与 Normal 可变字体一起在启动时注册；正文行显式使用 `Inter`。保留标准 `*文本*` Markdown 数据格式，并新增呈现回归确认标记隐藏后仍生成 italic style run。
+- 光标宽度从 1px 调整为 1.5px，并以实际 x 坐标为中心绘制，避免单向加宽产生位置偏移；颜色继续使用完整主题 foreground，即与参考项目一致的浅色 `#191919` / 深色 `#ebebe8`，不添加透明度。
+- 定位删除延迟的主要同步热路径：此前每次按键都会把 NoteDocument Rope 转为 String、重新构造 Writ Buffer 并解析整篇 Markdown；自动新建笔记还会在正文每次编辑时重新提取一级标题，并可能进入文件系统路径与 Vault 条目同步。
+- `EditorRenderCache` 现在持有 revision 对齐的持久 Writ Buffer；原生输入协议、中文组合输入、Backspace、Delete 和选区替换把 Unicode 字符范围直接转换为缓存 Rope 字节范围并调用 Writ 增量 replace。同步用 revision 和路径校验，不复制旧全文，也不做逐键全文比较；缓存命中后的渲染也直接从 Writ 快照逐行读取，不再先把整篇 Rope 扁平化成 String；缓存失配时安全退回一次完整解析。
+- `NoteDocument` 新增基于 Rope 首行的长度查询，只有触及首行的编辑（包括 IME 组合提交）才运行标题/文件名联动；正文连续输入、删除不会再提取全文标题或扫描 Vault。目录数据直接从本帧已解析的 H1–H3 行构建，活动标题会去除可见源码标记，不再为目录执行第二次 Markdown 解析。
+- 新增/扩展 4 类定向回归，覆盖真实斜体 style run、中文字符范围的 Writ 增量替换、正文编辑保持链接文件路径与目录快照、Rope 首行长度和活动标题目录清理。最终非视觉回归通过两个 Synapse 包格式检查、`cargo check -p synapse`、workspace/all-targets 的 148 项自动化测试、严格 Clippy 和 `git diff --check`；1 项手动性能探针按设计忽略。
+- 按要求没有启动应用、截图或运行自动 UI 操作；快速连续删除的最终主观跟手性、斜体字形和光标视觉由产品手动验收。
+
+### 2026-08-13 — Markdown 加粗与行内代码最终绘制初次调整
+
+- 产品验收指出 `**加粗**` 和行内反引号代码虽然标记会被隐藏，但最终视觉没有正常体现。检查确认 Writ 已正确生成 bold/mono style run，缺口位于 GPUI 最终绘制层：加粗使用笼统的 700 `bold()`，没有对齐参考项目的 650 正文字重；行内代码只有等宽字体，没有参考项目的背景、圆角和内边距。
+- 加粗 TextRun 初次改为直接设置 Inter Variable 650 字重，对齐 Ornata `.prose-note strong { font-weight: 650 }`；后续产品手动验收确认 GPUI/macOS 仍选中 Regular 字体面，屏幕上的加粗与普通文本没有可辨差异，因此这项实现已被下方“实际字体匹配修正”替代。
+- 行内代码继续使用平台等宽字体（macOS 为 Menlo），并按真实 mono run 字节范围在文字下方绘制主题 `hover` 表面、4px 圆角、约 2.4px 垂直和 6.4px 水平视觉内边距；软换行时按每个视觉行分段绘制并限制在编辑器边界内。
+- 当前编辑行继续显示反引号源码标记，但标记保持 muted，内部代码立即显示等宽字体和代码背景；移开光标后反引号隐藏，代码样式保留。围栏代码块和完整源码模式明确排除这层行内背景，避免重复嵌套表面。
+- 待办正文和脚注定义复用同一个行内代码背景 token，普通正文、待办及脚注的 Markdown 呈现保持一致。
+- 扩展语法回归验证加粗与 mono run；当时新增的 GPUI TextRun 回归只锁定了 650 字段和 Menlo 字体，未验证字体选择器最终选中的真实字体面，因此未能发现 Regular 回退问题。行内代码相关回归仍然有效。
+- 按要求未启动应用、截图或运行自动 UI 操作；最终字重、代码胶囊视觉和编辑态切换由产品手动验收。
+
+### 2026-08-13 — 修正 Markdown 加粗实际字体匹配
+
+- 产品手动验收确认初次调整无效：`**加粗**` 的 `TextRun.font.weight` 虽然已经变为 650，但最终字形和普通文本完全一致。进一步检查 GPUI 0.2.2 的 macOS 文字系统，确认它使用 `font_kit::matching::find_best_match` 按注册字体面的静态 style/weight 属性选取字体，不会像浏览器 CSS 那样自动实例化 Inter 可变字体的任意 `wght` 轴；只注册 Regular 可变字体时，650 请求仍可能选回 Regular。
+- 从仓库已有的 Google Fonts 官方 Inter Normal/Italic 可变字体生成同源的 weight-700 `Inter-Bold.ttf` 与 `Inter-BoldItalic.ttf`，并与 Normal/Italic 一起在 GPUI 启动阶段注册为同一 `Inter` 字族。普通粗体会精确命中 Bold，`***粗斜体***` 会精确命中 Bold Italic，不再依赖平台伪粗体或不可控的变量轴匹配。
+- 最终 Markdown strong run 明确请求 700；删除线、下划线、斜体等组合样式继续叠加在同一 TextRun，不改变保存的标准 Markdown 源码。使用 macOS CoreText 对同一段“中文abc”做无窗口塑形探针：Regular 基准实际得到 `PingFangSC-Regular` 且 bold=false，Bold 基准实际得到 `PingFangSC-Semibold` 且 bold=true，确认中文后备字体也随独立粗体基准正确变粗，而不是只修复英文字形。
+- 字体资源文档新增 Bold/Bold Italic 的来源、生成方式与 SHA-256；新增 SFNT/OS/2 结构回归，直接读取打包字体的 `usWeightClass` 和 `fsSelection`，确认 Bold 为 700+Bold、Bold Italic 为 700+Bold+Italic。它验证的是实际提供给 GPUI 匹配的字体面，而不再只是业务层权重字段。
+- 最终非视觉回归通过加粗字体面结构、包含中文粗体/粗斜体的最终 GPUI TextRun 两项定向测试、macOS CoreText 中文字体回退探针、workspace/all-targets 的 150 项自动化测试、严格 Clippy、两个 Synapse 包格式检查和 `git diff --check`；1 项手动性能探针按设计忽略。按要求未启动应用、截图或执行自动 UI 操作，实际加粗视觉等待产品手动验收。
+
+### 2026-08-13 — 修正 Markdown 斜体实际字形与中文强调
+
+- 产品手动验收确认粗体已经生效，但 `*斜体*` 仍与普通文本没有可辨区别。检查打包字体和 CoreText 实际塑形结果后确认存在两个独立问题：GPUI/macOS 对 Inter Italic 可变字体仍依赖静态属性匹配；更关键的是 Inter 没有中文字形，italic run 的中文会回退到 `PingFangSC-Regular`，其 italic=false，因此即使业务层 TextRun 已经设置 Italic，中文最终仍是直立常规字形。
+- 从官方 `Inter-Italic-Variable.ttf` 生成明确的 weight-400 `Inter-Italic.ttf` 并替换运行时注册的 Italic 可变字体；其 OS/2 表明确声明 400+Italic，Latin/数字/西文标点会稳定命中真实 Inter Italic，而不是再次依赖 GPUI 对变量轴的推断。
+- 为 Markdown italic run 增加纯 GPUI 的跨平台 CJK 强调后备栈：macOS 普通斜体优先 `Kaiti SC`、粗斜体优先 `Kaiti SC Bold`，并保留繁体与 `STKaiti` 后备；Windows 使用 `KaiTi`，Linux 使用 Noto Serif CJK。中文字体没有原生 italic face，原生文字系统也无法通过 italic trait 生成该字形，因此采用中文排版中以楷体表达强调的惯例；没有引入 WebView、CSS、Canvas 或 JavaScript。
+- macOS CoreText 无窗口塑形探针确认：`*中文 italic*` 最终拆分为 `STKaitiSC-Regular` + 真实 `InterItalic-Italic`，`***中文粗斜体***` 拆分为 `STKaitiSC-Bold` + 真实 `InterItalic-BoldItalic`；普通中文正文仍保持原有 PingFang，不会全局更换字体。组合样式继续保留粗体、下划线、删除线等既有属性。
+- 新增/扩展回归直接读取 concrete Italic 的 OS/2 权重与 italic/bold 标志，并锁定最终 GPUI TextRun 的 Italic style、普通/粗斜体 CJK 后备顺序和组合样式。最终非视觉回归通过 workspace/all-targets 的 150 项自动化测试、严格 Clippy、两个 Synapse 包格式检查和 `git diff --check`；1 项手动性能探针按设计忽略。按要求未启动应用、截图或执行自动 UI 操作；最终视觉等待产品手动验收。
+
 ## 下一步
 
 1. 由产品方分别在窄窗口、默认窗口和最大化窗口手动验收标题栏页签、侧栏即时左移、正文边距和长文档滚动体感。
-2. 将光标移动造成的活动行源码/预览切换进一步改为双行局部呈现更新，避免纯光标跨字符时重新解析全文。
-3. 增加 1k/10k 行 Markdown 解析缓存命中、局部编辑和虚拟列表状态微基准，建立持续性能预算。
+2. 将光标移动造成的活动行源码/预览切换进一步改为双行局部呈现更新；本轮已消除连续输入/删除的 Writ 全量重建与整篇 String 扁平化，下一步缩小每帧 SourceLine 重建范围。
+3. 增加 1k/10k 行 Markdown 持久 Writ 缓冲区命中、局部编辑和虚拟列表状态微基准，建立持续性能预算。
 4. 继续实现搜索、Todo 文本编辑、Bookmarks、会话恢复和 HTML、定义列表等其余扩展 Markdown 组件。
 5. 待办 P1（标签选中 pill 滑动、新建标签输入框动画与无边框样式）已实现，等待产品手动验收标签点击体感与输入框展开动画。

@@ -325,6 +325,7 @@ impl ShellState {
     pub fn insert_text(&mut self, text: &str) -> Result<(), SessionError> {
         let index = self.active_tab.ok_or(SessionError::NoActiveNote)?;
         let tab = &mut self.tabs[index];
+        let edit_start = tab.cursor;
         tab.document
             .insert(tab.cursor, text)
             .map_err(SessionError::Buffer)?;
@@ -334,7 +335,9 @@ impl ShellState {
             self.status_message = "Modified".to_owned();
             self.vault_error = None;
         }
-        self.sync_active_linked_title();
+        if edit_start <= self.tabs[index].document.first_line_len_chars() {
+            self.sync_active_linked_title();
+        }
         Ok(())
     }
 
@@ -372,6 +375,7 @@ impl ShellState {
         sync_linked_title: bool,
     ) -> Result<(), SessionError> {
         let index = self.active_tab.ok_or(SessionError::NoActiveNote)?;
+        let edit_start = range.start;
         let tab = &mut self.tabs[index];
         tab.document
             .remove(range.clone())
@@ -383,14 +387,19 @@ impl ShellState {
         tab.preferred_column = None;
         self.status_message = "Modified".to_owned();
         self.vault_error = None;
-        if sync_linked_title {
+        if sync_linked_title && edit_start <= self.tabs[index].document.first_line_len_chars() {
             self.sync_active_linked_title();
         }
         Ok(())
     }
 
-    pub fn finalize_active_composition(&mut self) {
-        self.sync_active_linked_title();
+    pub fn finalize_active_composition(&mut self, edit_start: usize) {
+        let touches_linked_title = self
+            .active_document()
+            .is_some_and(|document| edit_start <= document.first_line_len_chars());
+        if touches_linked_title {
+            self.sync_active_linked_title();
+        }
     }
 
     pub fn set_cursor(&mut self, char_index: usize) {
@@ -406,14 +415,17 @@ impl ShellState {
         if tab.cursor == 0 {
             return Ok(());
         }
+        let removed_at = tab.cursor - 1;
         tab.document
-            .remove(tab.cursor - 1..tab.cursor)
+            .remove(removed_at..tab.cursor)
             .map_err(SessionError::Buffer)?;
         tab.cursor -= 1;
         tab.preferred_column = None;
         self.status_message = "Modified".to_owned();
         self.vault_error = None;
-        self.sync_active_linked_title();
+        if removed_at <= self.tabs[index].document.first_line_len_chars() {
+            self.sync_active_linked_title();
+        }
         Ok(())
     }
 
@@ -423,13 +435,16 @@ impl ShellState {
         if tab.cursor == tab.document.len_chars() {
             return Ok(());
         }
+        let removed_at = tab.cursor;
         tab.document
-            .remove(tab.cursor..tab.cursor + 1)
+            .remove(removed_at..removed_at + 1)
             .map_err(SessionError::Buffer)?;
         tab.preferred_column = None;
         self.status_message = "Modified".to_owned();
         self.vault_error = None;
-        self.sync_active_linked_title();
+        if removed_at <= self.tabs[index].document.first_line_len_chars() {
+            self.sync_active_linked_title();
+        }
         Ok(())
     }
 
@@ -1105,7 +1120,7 @@ mod tests {
             Path::new("未命名1.md")
         );
 
-        state.finalize_active_composition();
+        state.finalize_active_composition(2);
         assert_eq!(
             state.active_document().unwrap().relative_path(),
             Path::new("新笔记.md")
@@ -1526,6 +1541,33 @@ mod tests {
             fs::read_to_string(directory.path().join("计划.md")).unwrap(),
             "# 计划\n"
         );
+    }
+
+    #[test]
+    fn linked_title_body_edits_keep_the_linked_path_and_snapshot_stable() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state =
+            ShellState::from_vault_argument(Some(OsString::from(directory.path().as_os_str())));
+        state.create_untitled_note(Path::new("")).unwrap();
+        let document_end = state.active_document().unwrap().len_chars();
+        state.set_cursor(document_end);
+        state.insert_text("正文").unwrap();
+        let linked_path = state
+            .active_document()
+            .unwrap()
+            .relative_path()
+            .to_path_buf();
+        let entries = state.entries.clone();
+
+        state.backspace().unwrap();
+        state.insert_text("内容").unwrap();
+
+        assert_eq!(
+            state.active_document().unwrap().relative_path(),
+            linked_path
+        );
+        assert_eq!(state.active_document().unwrap().text(), "# 未命名1\n正内容");
+        assert_eq!(state.entries, entries);
     }
 
     #[test]

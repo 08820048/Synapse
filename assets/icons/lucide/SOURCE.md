@@ -15,3 +15,7 @@ for its new-label action. The artwork is unchanged; line wrapping was compacted
 without changing SVG attributes or paths. The sidebar Todo collection adds
 `minus` so its collapsed and expanded controls use matching Lucide artwork
 instead of locally drawn strokes.
+
+The editor selection toolbar adds `sparkles`, `bold`, `italic`, `underline`,
+`strikethrough`, `link`, and `arrow-up`. These files keep the Lucide 1.27.0
+artwork unchanged; only whitespace is compacted.

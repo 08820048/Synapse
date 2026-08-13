@@ -9,7 +9,9 @@ use gpui_animation::{
 };
 
 use super::{SynapseApp, SynapseThemePalette};
-use crate::editor_surface::{MarkdownBlockKind, source_lines};
+#[cfg(test)]
+use crate::editor_surface::source_lines;
+use crate::editor_surface::{MarkdownBlockKind, SourceLine};
 
 const MIN_VIEWPORT_WIDTH: f32 = 1280.0;
 const RAIL_WIDTH: f32 = 40.0;
@@ -83,6 +85,7 @@ pub(super) fn css_cubic_bezier_0201(time: f32) -> f32 {
     cubic_bezier_coordinate(parameter, 0.0, 1.0)
 }
 
+#[cfg(test)]
 pub(super) fn build_document_outline(text: &str, dark_mode: bool) -> Vec<DocumentOutlineEntry> {
     // Keep the synthetic cursor on an appended empty line so every real heading uses its
     // marker-free reading presentation, even when the editor cursor currently sits on a heading.
@@ -92,15 +95,34 @@ pub(super) fn build_document_outline(text: &str, dark_mode: bool) -> Vec<Documen
     let inactive_cursor = inactive_text.chars().count();
     let original_line_count = text.split('\n').count();
 
-    source_lines(&inactive_text, inactive_cursor, dark_mode)
-        .into_iter()
-        .take(original_line_count)
+    let lines = source_lines(&inactive_text, inactive_cursor, dark_mode);
+    build_document_outline_from_lines(
+        lines[..original_line_count]
+            .iter()
+            .map(|line| Rc::new(line.clone()))
+            .collect::<Vec<_>>()
+            .as_slice(),
+    )
+}
+
+pub(super) fn build_document_outline_from_lines(
+    lines: &[Rc<SourceLine>],
+) -> Vec<DocumentOutlineEntry> {
+    lines
+        .iter()
         .enumerate()
         .filter_map(|(line_index, line)| {
+            let line = line.as_ref();
             let MarkdownBlockKind::Heading(level @ 1..=3) = line.presentation.kind else {
                 return None;
             };
             let title = line.presentation.display.trim();
+            let marker = "#".repeat(level as usize);
+            let title = title
+                .strip_prefix(&marker)
+                .and_then(|title| title.strip_prefix(' '))
+                .unwrap_or(title)
+                .trim();
             (!title.is_empty()).then(|| DocumentOutlineEntry {
                 line_index,
                 level,

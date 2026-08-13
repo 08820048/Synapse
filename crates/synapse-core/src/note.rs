@@ -42,6 +42,14 @@ impl NoteDocument {
         self.buffer.len_chars()
     }
 
+    pub fn first_line_len_chars(&self) -> usize {
+        self.buffer
+            .line(0)
+            .chars()
+            .take_while(|character| *character != '\n')
+            .count()
+    }
+
     pub fn revision(&self) -> u64 {
         self.revision
     }
@@ -128,3 +136,15 @@ impl fmt::Display for BufferError {
 }
 
 impl Error for BufferError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn first_line_length_uses_the_rope_line() {
+        let document = NoteDocument::from_text(PathBuf::from("note.md"), "# 标题\n正文\n更多");
+
+        assert_eq!(document.first_line_len_chars(), 4);
+    }
+}

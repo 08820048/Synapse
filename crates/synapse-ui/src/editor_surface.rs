@@ -2,9 +2,9 @@ use std::{cell::RefCell, ops::Range, rc::Rc};
 
 use gpui::{
     App, Bounds, Context, Element, ElementId, ElementInputHandler, Entity, EntityInputHandler,
-    Font, GlobalElementId, InspectorElementId, IntoElement, LayoutId, PaintQuad, Pixels,
-    SharedString, StrikethroughStyle, Style, TextRun, UTF16Selection, UnderlineStyle, Window,
-    WrappedLine, fill, point, px, relative, rgba, size,
+    Font, FontFallbacks, FontWeight, GlobalElementId, InspectorElementId, IntoElement, LayoutId,
+    PaintQuad, Pixels, SharedString, StrikethroughStyle, Style, TextRun, UTF16Selection,
+    UnderlineStyle, Window, WrappedLine, fill, point, px, relative, rgba, size,
 };
 use writ::{
     buffer::Buffer,
@@ -19,6 +19,25 @@ use super::SynapseApp;
 
 const LIST_BULLET_DIAMETER: f32 = 5.0;
 const LIST_BULLET_OPTICAL_Y_OFFSET: f32 = -0.5;
+const INLINE_CODE_HORIZONTAL_PADDING: f32 = 6.4;
+const INLINE_CODE_VERTICAL_PADDING: f32 = 2.4;
+const INLINE_CODE_RADIUS: f32 = 4.0;
+const INLINE_STRONG_WEIGHT: f32 = 700.0;
+
+fn markdown_italic_fallbacks(strong: bool) -> FontFallbacks {
+    #[cfg(target_os = "macos")]
+    let families = if strong {
+        ["Kaiti SC Bold", "Kaiti TC Bold", "STKaiti"]
+    } else {
+        ["Kaiti SC", "Kaiti TC", "STKaiti"]
+    };
+    #[cfg(target_os = "windows")]
+    let families = ["KaiTi", "Microsoft YaHei", "Microsoft JhengHei"];
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let families = ["Noto Serif CJK SC", "Noto Serif CJK TC", "Noto Serif"];
+
+    FontFallbacks::from_fonts(families.into_iter().map(str::to_owned).collect())
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MarkdownBlockKind {
@@ -276,7 +295,8 @@ pub struct SourceLine {
 }
 
 pub fn source_lines(text: &str, cursor: usize, dark_mode: bool) -> Vec<SourceLine> {
-    source_lines_with_mode(text, cursor, dark_mode, false)
+    let mut buffer: Buffer = text.parse().expect("writ buffer parsing is infallible");
+    source_lines_from_buffer(&mut buffer, cursor, dark_mode)
 }
 
 pub fn source_lines_with_mode(
@@ -289,26 +309,43 @@ pub fn source_lines_with_mode(
         return raw_source_lines(text);
     }
     let mut buffer: Buffer = text.parse().expect("writ buffer parsing is infallible");
+    source_lines_from_buffer(&mut buffer, cursor, dark_mode)
+}
+
+pub fn source_lines_from_buffer(
+    buffer: &mut Buffer,
+    cursor: usize,
+    dark_mode: bool,
+) -> Vec<SourceLine> {
     let snapshot = buffer.render_snapshot();
     let styles_by_line = snapshot.inline_styles_by_line();
-    let cursor_byte = char_to_byte(text, cursor);
+    let cursor_byte = snapshot
+        .rope
+        .char_to_byte(cursor.min(snapshot.rope.len_chars()));
     let theme = if dark_mode {
         EditorTheme::nord()
     } else {
         EditorTheme::solarized_light()
     };
     let mut start_char = 0;
-
-    let mut lines: Vec<_> = (0..snapshot.line_count())
+    let raw_line_storage: Vec<_> = (0..snapshot.line_count())
         .map(|line_index| {
             let byte_range = snapshot.line_byte_range(line_index);
-            let source = snapshot
+            snapshot
                 .rope
                 .slice(
                     snapshot.rope.byte_to_char(byte_range.start)
                         ..snapshot.rope.byte_to_char(byte_range.end),
                 )
-                .to_string();
+                .to_string()
+        })
+        .collect();
+
+    let mut lines: Vec<_> = raw_line_storage
+        .iter()
+        .enumerate()
+        .map(|(line_index, source)| {
+            let byte_range = snapshot.line_byte_range(line_index);
             let source_len_chars = source.chars().count();
             let markers = snapshot.line_markers(line_index);
             let cursor_on_line = (byte_range.start..=byte_range.end).contains(&cursor_byte);
@@ -330,7 +367,7 @@ pub fn source_lines_with_mode(
                         color: callout.kind.color(&theme),
                     }),
             );
-            let kind = markdown_block_kind(&markers, &snapshot, line_index, &source);
+            let kind = markdown_block_kind(&markers, &snapshot, line_index, source);
             let mut muted_ranges: Vec<_> = render
                 .runs
                 .iter()
@@ -372,7 +409,7 @@ pub fn source_lines_with_mode(
                 hidden_bullet_marker,
             };
             let presentation = presentation_from_writ(
-                source.as_str(),
+                source,
                 byte_range.start,
                 render,
                 kind,
@@ -389,7 +426,7 @@ pub fn source_lines_with_mode(
         })
         .collect();
 
-    let raw_lines: Vec<_> = text.split('\n').collect();
+    let raw_lines: Vec<_> = raw_line_storage.iter().map(String::as_str).collect();
     for index in 1..lines.len().min(raw_lines.len()) {
         let Some(level) = setext_heading_level(raw_lines[index]) else {
             continue;
@@ -405,6 +442,7 @@ pub fn source_lines_with_mode(
             lines[index].presentation = hidden_source_presentation(raw_lines[index]);
         }
     }
+    annotate_inline_underlines(&mut lines, &raw_lines, cursor, dark_mode);
     annotate_table_rows(&mut lines, &raw_lines);
     annotate_quote_lines(&mut lines);
     annotate_callout_lines(&mut lines, snapshot.callouts());
@@ -416,6 +454,193 @@ pub fn source_lines_with_mode(
     annotate_footnotes(&mut lines, &raw_lines);
     annotate_images(&mut lines, &raw_lines, cursor);
     lines
+}
+
+fn annotate_inline_underlines(
+    lines: &mut [SourceLine],
+    raw_lines: &[&str],
+    cursor: usize,
+    dark_mode: bool,
+) {
+    let annotations = inline_underline_annotations(raw_lines);
+    for ((line, source), annotation) in lines
+        .iter_mut()
+        .zip(raw_lines.iter().copied())
+        .zip(annotations)
+    {
+        if annotation.content.is_empty() && annotation.markers.is_empty() {
+            continue;
+        }
+
+        let cursor_on_line =
+            (line.start_char..=line.start_char + line.source_len_chars).contains(&cursor);
+        if cursor_on_line {
+            let display_to_source = line.presentation.display_to_source.clone();
+            line.presentation.runs = restyle_markdown_runs(
+                &line.presentation.display,
+                &line.presentation.runs,
+                |display_char, run| {
+                    let source_char = display_to_source
+                        [display_char.min(display_to_source.len().saturating_sub(1))];
+                    run.muted = annotation
+                        .markers
+                        .iter()
+                        .any(|range| range.contains(&source_char));
+                    run.underline = annotation
+                        .content
+                        .iter()
+                        .any(|range| range.contains(&source_char));
+                },
+            );
+        } else {
+            let source_chars: Vec<_> = source.chars().collect();
+            let mut stripped = String::with_capacity(source.len());
+            let mut source_to_stripped = Vec::with_capacity(source_chars.len() + 1);
+            let mut stripped_to_source = Vec::with_capacity(source_chars.len() + 1);
+            let mut stripped_char = 0;
+            for (source_char, character) in source_chars.iter().copied().enumerate() {
+                source_to_stripped.push(stripped_char);
+                let is_marker = annotation
+                    .markers
+                    .iter()
+                    .any(|range| range.contains(&source_char));
+                if is_marker {
+                    continue;
+                }
+                stripped_to_source.push(source_char);
+                stripped.push(character);
+                stripped_char += 1;
+            }
+            source_to_stripped.push(stripped_char);
+            stripped_to_source.push(source_chars.len());
+
+            let fragment_source = format!("cursor\n{stripped}");
+            let Some(mut fragment) = source_lines(&fragment_source, 0, dark_mode)
+                .into_iter()
+                .nth(1)
+                .map(|line| line.presentation)
+            else {
+                continue;
+            };
+            let underline_ranges: Vec<_> = annotation
+                .content
+                .iter()
+                .map(|range| {
+                    fragment.display_char_for_source(source_to_stripped[range.start])
+                        ..fragment.display_char_for_source(source_to_stripped[range.end])
+                })
+                .collect();
+            fragment.runs =
+                restyle_markdown_runs(&fragment.display, &fragment.runs, |display_char, run| {
+                    run.underline |= underline_ranges
+                        .iter()
+                        .any(|range| range.contains(&display_char));
+                });
+            fragment.source_to_display = source_to_stripped
+                .iter()
+                .map(|source| fragment.display_char_for_source(*source))
+                .collect();
+            fragment.display_to_source = fragment
+                .display_to_source
+                .iter()
+                .map(|source| stripped_to_source[*source])
+                .collect();
+            line.presentation = fragment;
+        }
+        if matches!(line.presentation.kind, MarkdownBlockKind::Html) {
+            line.presentation.kind = MarkdownBlockKind::Paragraph;
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct InlineUnderlineAnnotation {
+    markers: Vec<Range<usize>>,
+    content: Vec<Range<usize>>,
+}
+
+fn inline_underline_annotations(raw_lines: &[&str]) -> Vec<InlineUnderlineAnnotation> {
+    const OPEN: &str = "<u>";
+    const CLOSE: &str = "</u>";
+
+    let mut active = false;
+    raw_lines
+        .iter()
+        .map(|source| {
+            let boundaries = char_byte_boundaries(source);
+            let mut annotation = InlineUnderlineAnnotation {
+                markers: Vec::new(),
+                content: Vec::new(),
+            };
+            let mut cursor_byte = 0;
+            while cursor_byte < source.len() {
+                if active {
+                    if let Some(close_offset) = source[cursor_byte..].find(CLOSE) {
+                        let close_byte = cursor_byte + close_offset;
+                        annotation.content.push(
+                            char_index_for_byte(&boundaries, cursor_byte)
+                                ..char_index_for_byte(&boundaries, close_byte),
+                        );
+                        let end_byte = close_byte + CLOSE.len();
+                        annotation.markers.push(
+                            char_index_for_byte(&boundaries, close_byte)
+                                ..char_index_for_byte(&boundaries, end_byte),
+                        );
+                        active = false;
+                        cursor_byte = end_byte;
+                    } else {
+                        annotation.content.push(
+                            char_index_for_byte(&boundaries, cursor_byte)
+                                ..char_index_for_byte(&boundaries, source.len()),
+                        );
+                        break;
+                    }
+                } else if let Some(open_offset) = source[cursor_byte..].find(OPEN) {
+                    let open_byte = cursor_byte + open_offset;
+                    let content_byte = open_byte + OPEN.len();
+                    annotation.markers.push(
+                        char_index_for_byte(&boundaries, open_byte)
+                            ..char_index_for_byte(&boundaries, content_byte),
+                    );
+                    active = true;
+                    cursor_byte = content_byte;
+                } else {
+                    break;
+                }
+            }
+            annotation
+        })
+        .collect()
+}
+
+fn restyle_markdown_runs(
+    display: &str,
+    runs: &[MarkdownStyleRun],
+    mut restyle: impl FnMut(usize, &mut MarkdownStyleRun),
+) -> Vec<MarkdownStyleRun> {
+    let mut result = Vec::<MarkdownStyleRun>::new();
+    let mut run_index = 0;
+    let mut run_end = runs.first().map_or(0, |run| run.len);
+    for (display_char, (display_byte, character)) in display.char_indices().enumerate() {
+        while display_byte >= run_end && run_index + 1 < runs.len() {
+            run_index += 1;
+            run_end += runs[run_index].len;
+        }
+        let mut run = runs
+            .get(run_index)
+            .cloned()
+            .unwrap_or_else(|| plain_style_run(0));
+        run.len = character.len_utf8();
+        restyle(display_char, &mut run);
+        if let Some(previous) = result.last_mut()
+            && same_markdown_style(previous, &run)
+        {
+            previous.len += run.len;
+        } else {
+            result.push(run);
+        }
+    }
+    result
 }
 
 fn raw_source_lines(text: &str) -> Vec<SourceLine> {
@@ -1738,13 +1963,13 @@ impl EditorLineLayout {
                 .source_char_for_display(display_char)
     }
 
-    fn contains_source_char(&self, char_index: usize) -> bool {
+    pub fn contains_source_char(&self, char_index: usize) -> bool {
         (self.source_line.start_char
             ..=self.source_line.start_char + self.source_line.source_len_chars)
             .contains(&char_index)
     }
 
-    fn point_for_source_char(&self, char_index: usize) -> gpui::Point<Pixels> {
+    pub fn point_for_source_char(&self, char_index: usize) -> gpui::Point<Pixels> {
         let local_source = char_index.saturating_sub(self.source_line.start_char);
         let Some(wrapped_line) = self.wrapped_line.as_ref() else {
             let fraction = local_source.min(self.source_line.source_len_chars) as f32
@@ -1777,7 +2002,9 @@ pub struct MarkdownLineElement {
     pub marker_color: gpui::Hsla,
     pub list_marker_color: gpui::Hsla,
     pub mono_font_family: SharedString,
+    pub inline_code_background_color: gpui::Hsla,
     pub cursor_color: gpui::Hsla,
+    pub cursor_width: Pixels,
     pub selection_color: gpui::Hsla,
 }
 
@@ -1791,6 +2018,7 @@ pub struct PrepaintState {
     line: Option<WrappedLine>,
     line_height: Pixels,
     bullet_marker: Option<PaintQuad>,
+    inline_code_backgrounds: Vec<PaintQuad>,
     cursor: Option<PaintQuad>,
     selections: Vec<PaintQuad>,
 }
@@ -1917,6 +2145,16 @@ impl Element for MarkdownLineElement {
                     .corner_radii(diameter / 2.0),
                 )
             });
+        let inline_code_backgrounds = inline_code_background_quads(
+            &line,
+            line_height,
+            bounds,
+            &inline_code_byte_ranges(
+                &self.source_line.presentation.runs,
+                self.source_line.presentation.kind,
+            ),
+            self.inline_code_background_color,
+        );
         let cursor = (self.active && self.selection.is_empty() && self.cursor_visible).then(|| {
             let local_source = self.cursor.saturating_sub(self.source_line.start_char);
             let display_char = self
@@ -1928,7 +2166,14 @@ impl Element for MarkdownLineElement {
                 .position_for_index(cursor_byte, line_height)
                 .unwrap_or_default();
             fill(
-                Bounds::new(bounds.origin + cursor_position, size(px(1.0), line_height)),
+                Bounds::new(
+                    bounds.origin
+                        + point(
+                            cursor_position.x - self.cursor_width / 2.0,
+                            cursor_position.y,
+                        ),
+                    size(self.cursor_width, line_height),
+                ),
                 self.cursor_color,
             )
         });
@@ -1965,6 +2210,7 @@ impl Element for MarkdownLineElement {
             line: Some(line),
             line_height,
             bullet_marker,
+            inline_code_backgrounds,
             cursor,
             selections,
         }
@@ -1987,6 +2233,9 @@ impl Element for MarkdownLineElement {
                 ElementInputHandler::new(bounds, self.app.clone()),
                 cx,
             );
+        }
+        for background in prepaint.inline_code_backgrounds.drain(..) {
+            window.paint_quad(background);
         }
         for selection in prepaint.selections.drain(..) {
             window.paint_quad(selection);
@@ -2034,10 +2283,11 @@ fn text_run_from_markdown(
         font.family = mono_font_family.clone();
     }
     if run.bold {
-        font = font.bold();
+        font.weight = FontWeight(INLINE_STRONG_WEIGHT);
     }
     if run.italic {
         font = font.italic();
+        font.fallbacks = Some(markdown_italic_fallbacks(run.bold));
     }
     let color = if run.hidden_bullet_marker {
         base_color.alpha(0.0)
@@ -2065,6 +2315,76 @@ fn text_run_from_markdown(
             thickness: px(1.0),
         }),
     }
+}
+
+fn inline_code_byte_ranges(
+    runs: &[MarkdownStyleRun],
+    kind: MarkdownBlockKind,
+) -> Vec<Range<usize>> {
+    if matches!(kind, MarkdownBlockKind::Code | MarkdownBlockKind::Source) {
+        return Vec::new();
+    }
+    let mut ranges = Vec::<Range<usize>>::new();
+    let mut start = 0;
+    for run in runs {
+        let end = start + run.len;
+        if run.mono && !run.muted {
+            if let Some(previous) = ranges.last_mut()
+                && previous.end == start
+            {
+                previous.end = end;
+            } else {
+                ranges.push(start..end);
+            }
+        }
+        start = end;
+    }
+    ranges
+}
+
+fn inline_code_background_quads(
+    line: &WrappedLine,
+    line_height: Pixels,
+    bounds: Bounds<Pixels>,
+    code_ranges: &[Range<usize>],
+    color: gpui::Hsla,
+) -> Vec<PaintQuad> {
+    let wrap_boundaries: Vec<_> = line
+        .wrap_boundaries()
+        .iter()
+        .map(|boundary| line.runs()[boundary.run_ix].glyphs[boundary.glyph_ix].index)
+        .collect();
+    let rows = visual_row_byte_ranges(line.len(), &wrap_boundaries);
+    let horizontal_padding = px(INLINE_CODE_HORIZONTAL_PADDING);
+    let vertical_padding = px(INLINE_CODE_VERTICAL_PADDING);
+    let mut quads = Vec::new();
+    for code in code_ranges {
+        for (row_index, row) in rows.iter().enumerate() {
+            let start = code.start.max(row.start).min(row.end);
+            let end = code.end.min(row.end).max(start);
+            if start == end {
+                continue;
+            }
+            let row_x = line.unwrapped_layout.x_for_index(row.start);
+            let left = (bounds.left() + line.unwrapped_layout.x_for_index(start)
+                - row_x
+                - horizontal_padding)
+                .max(bounds.left());
+            let right = (bounds.left() + line.unwrapped_layout.x_for_index(end) - row_x
+                + horizontal_padding)
+                .min(bounds.right());
+            let top = bounds.top() + line_height * row_index + vertical_padding;
+            let height = (line_height - vertical_padding * 2.0).max(px(1.0));
+            quads.push(
+                fill(
+                    Bounds::from_corners(point(left, top), point(right, top + height)),
+                    color,
+                )
+                .corner_radii(px(INLINE_CODE_RADIUS)),
+            );
+        }
+    }
+    quads
 }
 
 fn hidden_bullet_marker_range(runs: &[MarkdownStyleRun]) -> Option<Range<usize>> {
@@ -2163,8 +2483,11 @@ impl EntityInputHandler for SynapseApp {
     }
 
     fn unmark_text(&mut self, _: &mut Window, _: &mut Context<Self>) {
-        self.editor_marked_range = None;
-        self.state.finalize_active_composition();
+        let edit_start = self
+            .editor_marked_range
+            .take()
+            .map_or_else(|| self.state.cursor(), |range| range.start);
+        self.state.finalize_active_composition(edit_start);
     }
 
     fn replace_text_in_range(
@@ -2182,7 +2505,13 @@ impl EntityInputHandler for SynapseApp {
             .map(|range| utf16_range_to_char(&source, range))
             .or_else(|| self.editor_marked_range.clone())
             .unwrap_or_else(|| self.editor_selection.range());
+        let previous_revision = self
+            .state
+            .active_document()
+            .map_or(0, |document| document.revision());
+        let range_for_cache = range.clone();
         if self.state.replace_active_range(range, text).is_ok() {
+            self.sync_writ_render_buffer(previous_revision, range_for_cache, text);
             self.editor_marked_range = None;
             self.editor_selection.collapse(self.state.cursor());
             self.restart_editor_cursor_blink(cx);
@@ -2207,6 +2536,11 @@ impl EntityInputHandler for SynapseApp {
             .or_else(|| self.editor_marked_range.clone())
             .unwrap_or_else(|| self.editor_selection.range());
         let start = range.start;
+        let previous_revision = self
+            .state
+            .active_document()
+            .map_or(0, |document| document.revision());
+        let range_for_cache = range.clone();
         if self
             .state
             .replace_active_range_composing(range, new_text)
@@ -2214,6 +2548,7 @@ impl EntityInputHandler for SynapseApp {
         {
             return;
         }
+        self.sync_writ_render_buffer(previous_revision, range_for_cache, new_text);
         let inserted_chars = new_text.chars().count();
         self.editor_marked_range = (!new_text.is_empty()).then_some(start..start + inserted_chars);
         if let Some(selection) = new_selected_range_utf16 {
@@ -2313,9 +2648,10 @@ mod tests {
     use std::{hint::black_box, time::Instant};
 
     use super::{
-        EditorSelection, LIST_BULLET_DIAMETER, MarkdownBlockKind, char_byte_boundaries,
-        char_to_byte, footnote_preview_line, hidden_bullet_marker_range, source_lines,
-        source_lines_with_mode, task_preview_line, visual_row_byte_ranges,
+        EditorSelection, INLINE_STRONG_WEIGHT, LIST_BULLET_DIAMETER, MarkdownBlockKind,
+        char_byte_boundaries, char_to_byte, footnote_preview_line, hidden_bullet_marker_range,
+        inline_code_byte_ranges, source_lines, source_lines_with_mode, task_preview_line,
+        text_run_from_markdown, visual_row_byte_ranges,
     };
 
     fn present_markdown_line(source: &str) -> super::MarkdownLinePresentation {
@@ -2339,13 +2675,126 @@ mod tests {
     #[test]
     fn p2_lists_quotes_and_inline_markers_render_as_preview() {
         assert_eq!(present_markdown_line("- item").display, "• item");
+        let emphasis = present_markdown_line("*italic*");
+        assert_eq!(emphasis.display, "italic");
+        assert!(emphasis.runs.iter().any(|run| run.italic));
         assert_eq!(
             present_markdown_line("> quote").kind,
             MarkdownBlockKind::Quote
         );
+        let line = present_markdown_line("**bold** and *italic* and ~~gone~~ and `code`");
+        assert_eq!(line.display, "bold and italic and gone and code");
+        assert!(line.runs.iter().any(|run| run.bold));
+        assert!(line.runs.iter().any(|run| run.mono));
+        assert_eq!(inline_code_byte_ranges(&line.runs, line.kind), vec![29..33]);
+    }
+
+    #[test]
+    fn strong_and_inline_code_reach_the_final_gpui_text_runs() {
+        let line =
+            present_markdown_line("**加粗中文** and *中文 italic* and ***粗斜体*** and `code`");
+        let base_font = gpui::font("Inter");
+        let base_color: gpui::Hsla = gpui::rgb(0x191919).into();
+        let muted: gpui::Hsla = gpui::rgb(0x6e6e6a).into();
+        let bold = line
+            .runs
+            .iter()
+            .find(|run| run.bold && !run.italic)
+            .unwrap();
+        let bold_italic = line.runs.iter().find(|run| run.bold && run.italic).unwrap();
+        let italic = line
+            .runs
+            .iter()
+            .find(|run| run.italic && !run.bold)
+            .unwrap();
+        let code = line.runs.iter().find(|run| run.mono).unwrap();
+        let bold_text_run =
+            text_run_from_markdown(bold, &base_font, base_color, muted, muted, &"Menlo".into());
+        let bold_italic_text_run = text_run_from_markdown(
+            bold_italic,
+            &base_font,
+            base_color,
+            muted,
+            muted,
+            &"Menlo".into(),
+        );
+        let italic_text_run = text_run_from_markdown(
+            italic,
+            &base_font,
+            base_color,
+            muted,
+            muted,
+            &"Menlo".into(),
+        );
+        let code_text_run =
+            text_run_from_markdown(code, &base_font, base_color, muted, muted, &"Menlo".into());
+
         assert_eq!(
-            present_markdown_line("**bold** and *italic* and ~~gone~~ and `code`").display,
-            "bold and italic and gone and code"
+            bold_text_run.font.weight,
+            gpui::FontWeight(INLINE_STRONG_WEIGHT)
+        );
+        assert_eq!(
+            bold_italic_text_run.font.weight,
+            gpui::FontWeight(INLINE_STRONG_WEIGHT)
+        );
+        assert_eq!(bold_italic_text_run.font.style, gpui::FontStyle::Italic);
+        assert_eq!(italic_text_run.font.style, gpui::FontStyle::Italic);
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(
+                italic_text_run
+                    .font
+                    .fallbacks
+                    .as_ref()
+                    .unwrap()
+                    .fallback_list()[0],
+                "Kaiti SC"
+            );
+            assert_eq!(
+                bold_italic_text_run
+                    .font
+                    .fallbacks
+                    .as_ref()
+                    .unwrap()
+                    .fallback_list()[0],
+                "Kaiti SC Bold"
+            );
+        }
+        assert_eq!(code_text_run.font.family.as_ref(), "Menlo");
+    }
+
+    #[test]
+    fn selection_underline_markup_renders_as_underlined_text() {
+        let line = present_markdown_line("<u>underlined 中文</u>");
+        let nested = present_markdown_line("before <u>**bold** and `code`</u> after");
+        let active = source_lines("<u>中文</u>", 4, true).remove(0).presentation;
+        let multiline = source_lines("cursor\n<u>first\nsecond</u>", 0, true);
+
+        assert_eq!(line.display, "underlined 中文");
+        assert!(line.runs.iter().any(|run| run.underline));
+        assert_eq!(nested.display, "before bold and code after");
+        assert!(nested.runs.iter().any(|run| run.bold && run.underline));
+        assert!(nested.runs.iter().any(|run| run.mono && run.underline));
+        assert_eq!(active.display, "<u>中文</u>");
+        assert!(active.runs.iter().any(|run| run.muted));
+        assert!(active.runs.iter().any(|run| run.underline && !run.muted));
+        assert_eq!(active.display_char_for_source(4), 4);
+        assert_eq!(active.source_char_for_display(4), 4);
+        assert_eq!(multiline[1].presentation.display, "first");
+        assert_eq!(multiline[2].presentation.display, "second");
+        assert!(
+            multiline[1]
+                .presentation
+                .runs
+                .iter()
+                .any(|run| run.underline)
+        );
+        assert!(
+            multiline[2]
+                .presentation
+                .runs
+                .iter()
+                .any(|run| run.underline)
         );
     }
 
@@ -2732,11 +3181,17 @@ mod tests {
     #[test]
     fn editor_active_markdown_markers_use_muted_style_runs() {
         let line = source_lines("**bold**", 1, true).remove(0).presentation;
+        let code = source_lines("`code`", 2, true).remove(0).presentation;
 
         assert_eq!(line.display, "**bold**");
         assert!(line.runs.first().is_some_and(|run| run.muted));
         assert!(line.runs.last().is_some_and(|run| run.muted));
         assert!(line.runs.iter().any(|run| run.bold && !run.muted));
+        assert_eq!(code.display, "`code`");
+        assert!(code.runs.first().is_some_and(|run| run.muted));
+        assert!(code.runs.last().is_some_and(|run| run.muted));
+        assert!(code.runs.iter().any(|run| run.mono && !run.muted));
+        assert_eq!(inline_code_byte_ranges(&code.runs, code.kind), vec![1..5]);
     }
 
     #[test]

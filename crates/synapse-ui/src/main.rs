@@ -28,8 +28,8 @@ use gpui_animation::{
     transition::{Transition, general::EaseInOutCubic, general::EaseOutQuad},
 };
 use gpui_component::{
-    ActiveTheme, IconName, Root, Sizable as _, Theme, ThemeMode,
-    button::{Button, ButtonRounded, ButtonVariants as _},
+    ActiveTheme, Disableable as _, IconName, Root, Sizable as _, Theme, ThemeMode,
+    button::{Button, ButtonCustomVariant, ButtonRounded, ButtonVariants as _},
     input::{Input, InputEvent, InputState},
     kbd::Kbd,
 };
@@ -51,8 +51,10 @@ use bookmark_workspace::{
     BookmarkTagPicker, BookmarkWorkspace, BookmarkWorkspaceRenderState, fetch_link_metadata,
     is_bookmark_url_candidate, render_bookmark_quick_picker, render_bookmark_workspace,
 };
+#[cfg(test)]
+use document_outline::build_document_outline;
 use document_outline::{
-    DocumentOutlineEntry, active_document_outline_index, build_document_outline,
+    DocumentOutlineEntry, active_document_outline_index, build_document_outline_from_lines,
     document_outline_horizontal_layout, document_outline_is_visible, document_outline_layout,
     render_document_outline,
 };
@@ -60,7 +62,7 @@ use editor_blink::CursorBlinkState;
 use editor_surface::{
     EditorLineLayout, EditorSelection, MarkdownBlockKind, MarkdownCalloutKind, MarkdownImage,
     MarkdownInlineFootnote, MarkdownInlineMath, MarkdownLineElement, MarkdownTableRow, SourceLine,
-    footnote_preview_line, source_lines, source_lines_with_mode, task_preview_line,
+    footnote_preview_line, source_lines_from_buffer, source_lines_with_mode, task_preview_line,
 };
 use http_client::SynapseHttpClient;
 use icons::{Icon, SynapseAssets};
@@ -92,6 +94,7 @@ const MARKD_PANEL_SPRING_STIFFNESS: f32 = 420.0;
 const MARKD_PANEL_SPRING_DAMPING: f32 = 40.0;
 const MARKD_PANEL_SPRING_MASS: f32 = 0.5;
 const EDITOR_CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(530);
+const EDITOR_CURSOR_WIDTH: f32 = 1.5;
 const TITLEBAR_HEIGHT: f32 = 44.0;
 const SIDEBAR_WIDTH: f32 = 248.0;
 const EDITOR_PAGE_MAX_WIDTH: f32 = 1120.0;
@@ -119,6 +122,14 @@ const MENU_ITEM_ICON_SLOT_SIZE: f32 = 18.0;
 const MENU_ITEM_ICON_SIZE: f32 = 15.0;
 const TAG_EDITOR_COLLAPSED_WIDTH: f32 = 104.0;
 const TAG_EDITOR_EXPANDED_WIDTH: f32 = 240.0;
+const SELECTION_MENU_HEIGHT: f32 = 32.0;
+const SELECTION_MENU_OFFSET: f32 = 8.0;
+const SELECTION_MENU_BUTTON_SIZE: f32 = 28.0;
+const SELECTION_MENU_WIDTH: f32 = 282.0;
+const SELECTION_LINK_MENU_WIDTH: f32 = 264.0;
+const SELECTION_ASK_PANEL_WIDTH: f32 = 340.0;
+const SELECTION_ASK_PANEL_HEIGHT: f32 = 56.0;
+const SELECTION_ASK_PANEL_GAP: f32 = 8.0;
 
 #[derive(Clone, Copy, Debug, Default)]
 struct MarkdPanelSpring;
@@ -127,6 +138,23 @@ impl Transition for MarkdPanelSpring {
     fn calculate(&self, progress: f32) -> f32 {
         markd_panel_spring_progress(progress)
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum SelectionMenuMode {
+    #[default]
+    Formatting,
+    Link,
+    AskAi,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InlineFormat {
+    Bold,
+    Italic,
+    Underline,
+    Strikethrough,
+    Code,
 }
 
 fn markd_panel_spring_progress(progress: f32) -> f32 {
@@ -335,9 +363,18 @@ fn apply_synapse_theme(preference: ThemePreference, window: Option<&mut Window>,
 
 fn register_bundled_fonts(cx: &mut App) {
     const INTER_VARIABLE_FONT: &[u8] = include_bytes!("../../../assets/fonts/Inter-Variable.ttf");
+    const INTER_ITALIC_FONT: &[u8] = include_bytes!("../../../assets/fonts/Inter-Italic.ttf");
+    const INTER_BOLD_FONT: &[u8] = include_bytes!("../../../assets/fonts/Inter-Bold.ttf");
+    const INTER_BOLD_ITALIC_FONT: &[u8] =
+        include_bytes!("../../../assets/fonts/Inter-BoldItalic.ttf");
     cx.text_system()
-        .add_fonts(vec![Cow::Borrowed(INTER_VARIABLE_FONT)])
-        .expect("failed to register the bundled Inter variable font");
+        .add_fonts(vec![
+            Cow::Borrowed(INTER_VARIABLE_FONT),
+            Cow::Borrowed(INTER_ITALIC_FONT),
+            Cow::Borrowed(INTER_BOLD_FONT),
+            Cow::Borrowed(INTER_BOLD_ITALIC_FONT),
+        ])
+        .expect("failed to register the bundled Inter variable fonts");
 }
 
 fn theme_preference_path() -> Option<PathBuf> {
@@ -567,6 +604,8 @@ struct SynapseApp {
     bookmark_query_input: Entity<InputState>,
     bookmark_tag_input: Entity<InputState>,
     bookmark_edit_input: Entity<InputState>,
+    selection_link_input: Entity<InputState>,
+    selection_ask_input: Entity<InputState>,
     bookmark_workspace: BookmarkWorkspace,
     bookmark_tag_editor_open: bool,
     bookmark_query_error: Option<String>,
@@ -598,6 +637,7 @@ struct SynapseApp {
     collapsed_directories: BTreeSet<PathBuf>,
     editor_marked_range: Option<Range<usize>>,
     editor_selection: EditorSelection,
+    selection_menu_mode: SelectionMenuMode,
     editor_line_layouts: Rc<RefCell<Vec<Option<EditorLineLayout>>>>,
     editor_list_state: ListState,
     editor_visible_range: Range<usize>,
@@ -614,6 +654,8 @@ struct EditorRenderCache {
     cursor: usize,
     dark_mode: bool,
     source_mode: bool,
+    writ_revision: u64,
+    writ_buffer: writ::buffer::Buffer,
     lines: Rc<Vec<Rc<SourceLine>>>,
     outline: Rc<Vec<DocumentOutlineEntry>>,
     mermaid_previews: Rc<BTreeMap<usize, MermaidPreview>>,
@@ -1064,6 +1106,7 @@ impl SynapseApp {
 
     fn open_bookmark_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.workspace_view = WorkspaceView::Bookmark;
+        self.selection_menu_mode = SelectionMenuMode::Formatting;
         self.dismiss_command_palette(cx);
         self.dismiss_context_menus(cx);
         window.focus(&self.bookmark_query_input.focus_handle(cx));
@@ -1378,6 +1421,7 @@ impl SynapseApp {
 
     fn open_todo_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.workspace_view = WorkspaceView::Todo;
+        self.selection_menu_mode = SelectionMenuMode::Formatting;
         self.dismiss_command_palette(cx);
         self.dismiss_context_menus(cx);
         window.focus(&self.todo_item_input.focus_handle(cx));
@@ -1741,6 +1785,7 @@ impl SynapseApp {
         self.workspace_view = WorkspaceView::Note;
         self.editor_selection.collapse(self.state.cursor());
         self.editor_marked_range = None;
+        self.selection_menu_mode = SelectionMenuMode::Formatting;
         self.tab_context_menu = None;
         self.tree_context_menu = None;
         window.focus(&self.editor_focus);
@@ -1753,6 +1798,7 @@ impl SynapseApp {
         self.workspace_view = WorkspaceView::Note;
         self.editor_selection.collapse(self.state.cursor());
         self.editor_marked_range = None;
+        self.selection_menu_mode = SelectionMenuMode::Formatting;
         self.tab_context_menu = None;
         self.tree_context_menu = None;
         window.focus(&self.editor_focus);
@@ -1764,6 +1810,7 @@ impl SynapseApp {
         let _ = self.state.close_tab(index);
         self.editor_selection.collapse(self.state.cursor());
         self.editor_marked_range = None;
+        self.selection_menu_mode = SelectionMenuMode::Formatting;
         self.dismiss_context_menus(cx);
     }
 
@@ -1771,6 +1818,7 @@ impl SynapseApp {
         let _ = self.state.close_tabs_left(index);
         self.editor_selection.collapse(self.state.cursor());
         self.editor_marked_range = None;
+        self.selection_menu_mode = SelectionMenuMode::Formatting;
         self.dismiss_context_menus(cx);
     }
 
@@ -1778,6 +1826,7 @@ impl SynapseApp {
         let _ = self.state.close_tabs_right(index);
         self.editor_selection.collapse(self.state.cursor());
         self.editor_marked_range = None;
+        self.selection_menu_mode = SelectionMenuMode::Formatting;
         self.dismiss_context_menus(cx);
     }
 
@@ -1785,6 +1834,7 @@ impl SynapseApp {
         let _ = self.state.close_all_tabs();
         self.editor_selection.collapse(self.state.cursor());
         self.editor_marked_range = None;
+        self.selection_menu_mode = SelectionMenuMode::Formatting;
         self.dismiss_context_menus(cx);
     }
 
@@ -1860,6 +1910,7 @@ impl SynapseApp {
 
     fn toggle_markdown_source_mode(&mut self, cx: &mut Context<Self>) {
         self.markdown_source_mode = !self.markdown_source_mode;
+        self.selection_menu_mode = SelectionMenuMode::Formatting;
         self.editor_render_cache = None;
         self.dismiss_context_menus(cx);
         cx.notify();
@@ -2083,12 +2134,21 @@ impl SynapseApp {
 
     fn backspace(&mut self, _: &Backspace, _: &mut Window, cx: &mut Context<Self>) {
         self.editor_marked_range = None;
-        if self.editor_selection.is_empty() {
+        let previous_revision = self
+            .state
+            .active_document()
+            .map_or(0, |document| document.revision());
+        let edit = if self.editor_selection.is_empty() {
+            let cursor = self.state.cursor();
             let _ = self.state.backspace();
+            cursor.checked_sub(1).map(|start| start..cursor)
         } else {
-            let _ = self
-                .state
-                .replace_active_range(self.editor_selection.range(), "");
+            let range = self.editor_selection.range();
+            let _ = self.state.replace_active_range(range.clone(), "");
+            Some(range)
+        };
+        if let Some(range) = edit {
+            self.sync_writ_render_buffer(previous_revision, range, "");
         }
         self.editor_selection.collapse(self.state.cursor());
         self.restart_editor_cursor_blink(cx);
@@ -2098,12 +2158,25 @@ impl SynapseApp {
 
     fn delete_forward(&mut self, _: &DeleteForward, _: &mut Window, cx: &mut Context<Self>) {
         self.editor_marked_range = None;
-        if self.editor_selection.is_empty() {
+        let previous_revision = self
+            .state
+            .active_document()
+            .map_or(0, |document| document.revision());
+        let document_len = self
+            .state
+            .active_document()
+            .map_or(0, |document| document.len_chars());
+        let edit = if self.editor_selection.is_empty() {
+            let cursor = self.state.cursor();
             let _ = self.state.delete_forward();
+            (cursor < document_len).then_some(cursor..cursor + 1)
         } else {
-            let _ = self
-                .state
-                .replace_active_range(self.editor_selection.range(), "");
+            let range = self.editor_selection.range();
+            let _ = self.state.replace_active_range(range.clone(), "");
+            Some(range)
+        };
+        if let Some(range) = edit {
+            self.sync_writ_render_buffer(previous_revision, range, "");
         }
         self.editor_selection.collapse(self.state.cursor());
         self.restart_editor_cursor_blink(cx);
@@ -2317,6 +2390,7 @@ impl SynapseApp {
     fn extend_editor_selection(&mut self, cx: &mut Context<Self>) {
         self.editor_marked_range = None;
         self.editor_selection.select_to(self.state.cursor());
+        self.selection_menu_mode = SelectionMenuMode::Formatting;
         self.restart_editor_cursor_blink(cx);
         cx.stop_propagation();
         cx.notify();
@@ -2329,6 +2403,154 @@ impl SynapseApp {
         }
         let text = self.state.active_document()?.text();
         Some(text.chars().skip(range.start).take(range.len()).collect())
+    }
+
+    fn selection_menu_anchor(&self) -> Option<Point<Pixels>> {
+        let range = self.editor_selection.range();
+        if range.is_empty() || self.editor_selection.is_dragging() {
+            return None;
+        }
+        let layouts = self.editor_line_layouts.borrow();
+        let start_layout = layouts
+            .iter()
+            .flatten()
+            .find(|layout| layout.contains_source_char(range.start))?;
+        let end_index = range.end.saturating_sub(1).max(range.start);
+        let end_layout = layouts
+            .iter()
+            .flatten()
+            .find(|layout| layout.contains_source_char(end_index))?;
+        let start = start_layout.point_for_source_char(range.start);
+        let end = end_layout.point_for_source_char(range.end);
+        let selection_left = start.x.min(end.x);
+        let selection_right = if start_layout.source_line.start_char
+            == end_layout.source_line.start_char
+            && (f32::from(end.y - start.y)).abs() < 0.5
+        {
+            start.x.max(end.x)
+        } else {
+            start_layout.bounds.right().max(end.x)
+        };
+        let center_x = selection_left + (selection_right - selection_left) / 2.0;
+        let panel_stack_height = if self.selection_menu_mode == SelectionMenuMode::AskAi {
+            SELECTION_ASK_PANEL_HEIGHT + SELECTION_ASK_PANEL_GAP
+        } else {
+            0.0
+        };
+        Some(point(
+            center_x,
+            start.y - px(SELECTION_MENU_OFFSET + SELECTION_MENU_HEIGHT + panel_stack_height),
+        ))
+    }
+
+    fn selected_inline_format_active(&self, format: InlineFormat) -> bool {
+        let range = self.editor_selection.range();
+        let Some(text) = self.state.active_document().map(|document| document.text()) else {
+            return false;
+        };
+        inline_format_is_active(&text, range, format)
+    }
+
+    fn toggle_selected_inline_format(&mut self, format: InlineFormat, cx: &mut Context<Self>) {
+        let range = self.editor_selection.range();
+        let Some(text) = self.state.active_document().map(|document| document.text()) else {
+            return;
+        };
+        let Some(edit) = inline_format_edit(&text, range, format) else {
+            return;
+        };
+        if self
+            .state
+            .replace_active_range(edit.replace_range, &edit.replacement)
+            .is_ok()
+        {
+            self.editor_selection.collapse(edit.selection.start);
+            self.editor_selection.select_to(edit.selection.end);
+            self.state.set_cursor(edit.selection.end);
+            self.selection_menu_mode = SelectionMenuMode::Formatting;
+            self.editor_marked_range = None;
+            self.restart_editor_cursor_blink(cx);
+            cx.notify();
+        }
+    }
+
+    fn open_selection_link(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let range = self.editor_selection.range();
+        let Some(text) = self.state.active_document().map(|document| document.text()) else {
+            return;
+        };
+        let existing = markdown_link_context(&text, range)
+            .map(|link| link.destination)
+            .unwrap_or_default();
+        self.selection_link_input.update(cx, |input, cx| {
+            input.set_value(existing, window, cx);
+        });
+        self.selection_menu_mode = SelectionMenuMode::Link;
+        window.focus(&self.selection_link_input.focus_handle(cx));
+        cx.notify();
+    }
+
+    fn apply_selection_link(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let range = self.editor_selection.range();
+        let Some(text) = self.state.active_document().map(|document| document.text()) else {
+            self.close_selection_submenu(window, cx);
+            return;
+        };
+        let input = self.selection_link_input.read(cx).value().trim().to_owned();
+        let context = markdown_link_context(&text, range.clone());
+        let selected = text
+            .chars()
+            .skip(range.start)
+            .take(range.len())
+            .collect::<String>();
+        let label = context
+            .as_ref()
+            .map_or(selected.as_str(), |link| link.label.as_str());
+        let replacement = if input.is_empty() {
+            label.to_owned()
+        } else {
+            let destination = normalize_markdown_link_destination(&input);
+            format!("[{label}]({destination})")
+        };
+        let replace_range = context.as_ref().map_or(range, |link| link.outer.clone());
+        let label_start = replace_range.start + usize::from(!input.is_empty());
+        if self
+            .state
+            .replace_active_range(replace_range, &replacement)
+            .is_ok()
+        {
+            let label_end = label_start + label.chars().count();
+            self.editor_selection.collapse(label_start);
+            self.editor_selection.select_to(label_end);
+            self.state.set_cursor(label_end);
+        }
+        self.close_selection_submenu(window, cx);
+    }
+
+    fn toggle_selection_ask(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.selection_menu_mode == SelectionMenuMode::AskAi {
+            self.close_selection_submenu(window, cx);
+            return;
+        }
+        self.selection_ask_input.update(cx, |input, cx| {
+            input.set_value("", window, cx);
+        });
+        self.selection_menu_mode = SelectionMenuMode::AskAi;
+        window.focus(&self.selection_ask_input.focus_handle(cx));
+        cx.notify();
+    }
+
+    fn close_selection_submenu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.selection_menu_mode = SelectionMenuMode::Formatting;
+        window.focus(&self.editor_focus);
+        cx.notify();
+    }
+
+    fn submit_selection_ask_placeholder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.selection_ask_input.read(cx).value().trim().is_empty() {
+            return;
+        }
+        self.close_selection_submenu(window, cx);
     }
 
     fn editor_char_for_position(&self, position: Point<Pixels>) -> Option<usize> {
@@ -2361,6 +2583,7 @@ impl SynapseApp {
             return;
         };
         self.editor_marked_range = None;
+        self.selection_menu_mode = SelectionMenuMode::Formatting;
         self.editor_selection
             .start_drag(cursor, event.modifiers.shift);
         self.state.set_cursor(cursor);
@@ -2387,8 +2610,9 @@ impl SynapseApp {
         }
     }
 
-    fn editor_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, _: &mut Context<Self>) {
+    fn editor_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
         self.editor_selection.finish_drag();
+        cx.notify();
     }
 
     fn set_editor_outline_hovered(&mut self, hovered_index: Option<usize>, cx: &mut Context<Self>) {
@@ -2428,6 +2652,33 @@ impl SynapseApp {
             }
         })
         .detach();
+    }
+
+    fn sync_writ_render_buffer(
+        &mut self,
+        previous_revision: u64,
+        range: Range<usize>,
+        replacement: &str,
+    ) {
+        let Some(cache) = self.editor_render_cache.as_mut() else {
+            return;
+        };
+        let Some(document) = self.state.active_document() else {
+            return;
+        };
+        if cache.source_mode
+            || cache.relative_path != document.relative_path()
+            || cache.writ_revision != previous_revision
+        {
+            self.editor_render_cache = None;
+            return;
+        }
+        let byte_start = cache.writ_buffer.rope().char_to_byte(range.start);
+        let byte_end = cache.writ_buffer.rope().char_to_byte(range.end);
+        cache
+            .writ_buffer
+            .replace(byte_start..byte_end, replacement, byte_start);
+        cache.writ_revision = document.revision();
     }
 }
 
@@ -2469,6 +2720,7 @@ struct TaskPreviewStyle {
     checked_background: Hsla,
     checked_foreground: Hsla,
     mono_font_family: SharedString,
+    inline_code_background: Hsla,
     cursor: Hsla,
     selection: Hsla,
 }
@@ -2479,6 +2731,7 @@ struct FootnotePreviewStyle {
     muted: Hsla,
     border: Hsla,
     mono_font_family: SharedString,
+    inline_code_background: Hsla,
     selection: Hsla,
     dark_mode: bool,
 }
@@ -3030,7 +3283,9 @@ fn render_task_row(
                             marker_color: preview_style.muted,
                             list_marker_color: preview_style.muted,
                             mono_font_family: preview_style.mono_font_family,
+                            inline_code_background_color: preview_style.inline_code_background,
                             cursor_color: preview_style.cursor,
+                            cursor_width: px(EDITOR_CURSOR_WIDTH),
                             selection_color: preview_style.selection,
                         })),
                 ),
@@ -3108,7 +3363,9 @@ fn render_footnote_definition_row(
                                 marker_color: preview_style.muted,
                                 list_marker_color: preview_style.muted,
                                 mono_font_family: preview_style.mono_font_family,
+                                inline_code_background_color: preview_style.inline_code_background,
                                 cursor_color: preview_style.foreground,
+                                cursor_width: px(EDITOR_CURSOR_WIDTH),
                                 selection_color: preview_style.selection,
                             }))
                         }),
@@ -3432,6 +3689,7 @@ fn render_editor_row(
                 muted: theme.muted_foreground,
                 border: theme.border,
                 mono_font_family: theme.mono_font_family.clone(),
+                inline_code_background: theme.list_hover,
                 selection: theme.selection,
                 dark_mode: theme.is_dark(),
             },
@@ -3449,6 +3707,7 @@ fn render_editor_row(
                 checked_background: theme.primary,
                 checked_foreground: theme.primary_foreground,
                 mono_font_family: theme.mono_font_family.clone(),
+                inline_code_background: theme.list_hover,
                 cursor: theme.caret,
                 selection: theme.selection,
             },
@@ -3540,6 +3799,7 @@ fn render_editor_row(
                             _ => px(EDITOR_BODY_LINE_HEIGHT),
                         })
                         .cursor(CursorStyle::IBeam)
+                        .font_family("Inter")
                         .text_color(if callout_header {
                             callout_color
                         } else {
@@ -3654,7 +3914,9 @@ fn render_editor_row(
                             marker_color: theme.muted_foreground,
                             list_marker_color,
                             mono_font_family: theme.mono_font_family.clone(),
+                            inline_code_background_color: theme.list_hover,
                             cursor_color: theme.caret,
+                            cursor_width: px(EDITOR_CURSOR_WIDTH),
                             selection_color: theme.selection,
                         }),
                 ),
@@ -3743,6 +4005,10 @@ impl Render for SynapseApp {
             let document_len = document.len_chars();
             let dark_mode = theme.is_dark();
             let source_mode = self.markdown_source_mode;
+            let previous_revision = self.editor_render_cache.as_ref().and_then(|cache| {
+                (cache.vault_root == vault_root && cache.relative_path == relative_path)
+                    .then_some(cache.revision)
+            });
             let cache_hit = self.editor_render_cache.as_ref().is_some_and(|cache| {
                 cache.matches(
                     &vault_root,
@@ -3816,11 +4082,34 @@ impl Render for SynapseApp {
                         )
                     })
                     .map(|cache| cache.image_previews.clone());
-                let text = document.text();
+                let cached_writ_buffer = self
+                    .editor_render_cache
+                    .take()
+                    .filter(|cache| {
+                        !source_mode
+                            && !cache.source_mode
+                            && cache.vault_root == vault_root
+                            && cache.relative_path == relative_path
+                            && cache.writ_revision == revision
+                    })
+                    .map(|cache| cache.writ_buffer);
+                let text = (source_mode || cached_writ_buffer.is_none()).then(|| document.text());
+                let mut writ_buffer = cached_writ_buffer.unwrap_or_else(|| {
+                    text.as_deref()
+                        .expect("a Writ cache miss requires document text")
+                        .parse()
+                        .expect("writ buffer parsing is infallible")
+                });
                 let parsed_lines = if source_mode {
-                    source_lines_with_mode(&text, cursor, dark_mode, true)
+                    source_lines_with_mode(
+                        text.as_deref()
+                            .expect("source mode requires the document text"),
+                        cursor,
+                        dark_mode,
+                        true,
+                    )
                 } else {
-                    source_lines(&text, cursor, dark_mode)
+                    source_lines_from_buffer(&mut writ_buffer, cursor, dark_mode)
                 };
                 let parsed = Rc::new(parsed_lines.into_iter().map(Rc::new).collect::<Vec<_>>());
                 if let Some(previous_lines) = previous_lines {
@@ -3839,8 +4128,13 @@ impl Render for SynapseApp {
                     self.editor_visible_range = 0..0;
                     self.editor_outline_hovered_index = None;
                 }
-                let outline = previous_outline
-                    .unwrap_or_else(|| Rc::new(build_document_outline(&text, dark_mode)));
+                let structural_edit = previous_revision.is_none_or(|previous| previous != revision);
+                let outline = if structural_edit {
+                    Rc::new(build_document_outline_from_lines(&parsed))
+                } else {
+                    previous_outline
+                        .unwrap_or_else(|| Rc::new(build_document_outline_from_lines(&parsed)))
+                };
                 let mermaid_previews = if source_mode {
                     Rc::new(BTreeMap::new())
                 } else {
@@ -3867,6 +4161,8 @@ impl Render for SynapseApp {
                     cursor,
                     dark_mode,
                     source_mode,
+                    writ_revision: revision,
+                    writ_buffer,
                     lines: parsed.clone(),
                     outline: outline.clone(),
                     mermaid_previews: mermaid_previews.clone(),
@@ -3969,6 +4265,295 @@ impl Render for SynapseApp {
                     .size_full(),
                 )
                 .when_some(outline_element, |editor, outline| editor.child(outline))
+                .when_some(self.selection_menu_anchor(), |editor, anchor| {
+                    let ask_app = app_entity.clone();
+                    let bold_app = app_entity.clone();
+                    let italic_app = app_entity.clone();
+                    let underline_app = app_entity.clone();
+                    let strike_app = app_entity.clone();
+                    let code_app = app_entity.clone();
+                    let link_app = app_entity.clone();
+                    let link_confirm_app = app_entity.clone();
+                    let ask_submit_app = app_entity.clone();
+                    let mode = self.selection_menu_mode;
+                    let bold_active = self.selected_inline_format_active(InlineFormat::Bold);
+                    let italic_active = self.selected_inline_format_active(InlineFormat::Italic);
+                    let underline_active =
+                        self.selected_inline_format_active(InlineFormat::Underline);
+                    let strike_active =
+                        self.selected_inline_format_active(InlineFormat::Strikethrough);
+                    let code_active = self.selected_inline_format_active(InlineFormat::Code);
+                    let link_active = self.state.active_document().is_some_and(|document| {
+                        markdown_link_context(&document.text(), self.editor_selection.range())
+                            .is_some()
+                    });
+                    let ask_value_empty =
+                        self.selection_ask_input.read(cx).value().trim().is_empty();
+                    let ask_submit_icon_color = if ask_value_empty {
+                        theme.muted_foreground
+                    } else {
+                        theme.background
+                    };
+                    let ask_button_style = ButtonCustomVariant::new(cx)
+                        .color(theme.foreground)
+                        .foreground(theme.background)
+                        .hover(theme.foreground.opacity(0.90))
+                        .active(theme.foreground.opacity(0.82));
+                    let formatting_menu = div()
+                        .h(px(SELECTION_MENU_HEIGHT))
+                        .w(px(SELECTION_MENU_WIDTH))
+                        .flex()
+                        .items_center()
+                        .p(px(2.0))
+                        .rounded(px(8.0))
+                        .border_1()
+                        .border_color(theme.border)
+                        .bg(theme.popover)
+                        .text_color(theme.popover_foreground)
+                        .shadow_lg()
+                        .child(
+                            Button::new("selection-ask-ai")
+                                .custom(ask_button_style)
+                                .rounded(ButtonRounded::Size(px(6.0)))
+                                .h(px(28.0))
+                                .flex_none()
+                                .px(px(8.0))
+                                .gap_1()
+                                .text_size(px(12.5))
+                                .font_weight(FontWeight::MEDIUM)
+                                .child(
+                                    Icon::Sparkles
+                                        .render(13.0)
+                                        .flex_none()
+                                        .text_color(theme.background),
+                                )
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .whitespace_nowrap()
+                                        .text_color(theme.background)
+                                        .child("Ask AI"),
+                                )
+                                .on_click(move |_, window, cx| {
+                                    ask_app.update(cx, |this, cx| {
+                                        this.toggle_selection_ask(window, cx)
+                                    });
+                                }),
+                        )
+                        .child(selection_menu_divider(&theme))
+                        .child(
+                            selection_menu_icon_button(
+                                "selection-bold",
+                                Icon::Bold,
+                                "Bold",
+                                bold_active,
+                                cx,
+                            )
+                            .on_click(move |_, _, cx| {
+                                bold_app.update(cx, |this, cx| {
+                                    this.toggle_selected_inline_format(InlineFormat::Bold, cx)
+                                });
+                            }),
+                        )
+                        .child(
+                            selection_menu_icon_button(
+                                "selection-italic",
+                                Icon::Italic,
+                                "Italic",
+                                italic_active,
+                                cx,
+                            )
+                            .on_click(move |_, _, cx| {
+                                italic_app.update(cx, |this, cx| {
+                                    this.toggle_selected_inline_format(InlineFormat::Italic, cx)
+                                });
+                            }),
+                        )
+                        .child(
+                            selection_menu_icon_button(
+                                "selection-underline",
+                                Icon::Underline,
+                                "Underline",
+                                underline_active,
+                                cx,
+                            )
+                            .on_click(move |_, _, cx| {
+                                underline_app.update(cx, |this, cx| {
+                                    this.toggle_selected_inline_format(InlineFormat::Underline, cx)
+                                });
+                            }),
+                        )
+                        .child(
+                            selection_menu_icon_button(
+                                "selection-strikethrough",
+                                Icon::Strikethrough,
+                                "Strikethrough",
+                                strike_active,
+                                cx,
+                            )
+                            .on_click(move |_, _, cx| {
+                                strike_app.update(cx, |this, cx| {
+                                    this.toggle_selected_inline_format(
+                                        InlineFormat::Strikethrough,
+                                        cx,
+                                    )
+                                });
+                            }),
+                        )
+                        .child(
+                            selection_menu_icon_button(
+                                "selection-code",
+                                Icon::Code,
+                                "Inline code",
+                                code_active,
+                                cx,
+                            )
+                            .on_click(move |_, _, cx| {
+                                code_app.update(cx, |this, cx| {
+                                    this.toggle_selected_inline_format(InlineFormat::Code, cx)
+                                });
+                            }),
+                        )
+                        .child(selection_menu_divider(&theme))
+                        .child(
+                            selection_menu_icon_button(
+                                "selection-link",
+                                Icon::Link,
+                                "Link",
+                                link_active,
+                                cx,
+                            )
+                            .on_click(move |_, window, cx| {
+                                link_app
+                                    .update(cx, |this, cx| this.open_selection_link(window, cx));
+                            }),
+                        );
+                    let link_menu = div()
+                        .h(px(SELECTION_MENU_HEIGHT))
+                        .w(px(SELECTION_LINK_MENU_WIDTH))
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .px(px(6.0))
+                        .rounded(px(8.0))
+                        .border_1()
+                        .border_color(theme.border)
+                        .bg(theme.popover)
+                        .text_color(theme.popover_foreground)
+                        .shadow_lg()
+                        .child(
+                            Input::new(&self.selection_link_input)
+                                .appearance(false)
+                                .focus_bordered(false)
+                                .h(px(28.0))
+                                .flex_1()
+                                .text_size(px(12.5)),
+                        )
+                        .child(
+                            Button::new("selection-link-set")
+                                .text()
+                                .rounded(ButtonRounded::Size(px(6.0)))
+                                .h(px(28.0))
+                                .px(px(8.0))
+                                .text_size(px(12.0))
+                                .font_weight(FontWeight::MEDIUM)
+                                .child(
+                                    div()
+                                        .whitespace_nowrap()
+                                        .text_color(theme.foreground)
+                                        .child("Set"),
+                                )
+                                .on_click(move |_, window, cx| {
+                                    link_confirm_app.update(cx, |this, cx| {
+                                        this.apply_selection_link(window, cx)
+                                    });
+                                }),
+                        );
+                    let ask_panel = (mode == SelectionMenuMode::AskAi).then(|| {
+                        div()
+                            .h(px(SELECTION_ASK_PANEL_HEIGHT))
+                            .w(px(SELECTION_ASK_PANEL_WIDTH))
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .p_2()
+                            .rounded(px(16.0))
+                            .bg(theme.popover)
+                            .text_color(theme.popover_foreground)
+                            .shadow_xl()
+                            .child(
+                                div().ml_2().flex_none().child(
+                                    Icon::Sparkles
+                                        .render(14.0)
+                                        .text_color(theme.muted_foreground),
+                                ),
+                            )
+                            .child(
+                                Input::new(&self.selection_ask_input)
+                                    .appearance(false)
+                                    .focus_bordered(false)
+                                    .h(px(40.0))
+                                    .flex_1()
+                                    .text_size(px(13.0)),
+                            )
+                            .child(
+                                Button::new("selection-ask-submit")
+                                    .custom(
+                                        ButtonCustomVariant::new(cx)
+                                            .color(theme.foreground)
+                                            .foreground(theme.background)
+                                            .hover(theme.foreground.opacity(0.90))
+                                            .active(theme.foreground.opacity(0.82)),
+                                    )
+                                    .rounded(ButtonRounded::Size(px(20.0)))
+                                    .size(px(40.0))
+                                    .disabled(ask_value_empty)
+                                    .tooltip("Send to AI")
+                                    .child(
+                                        Icon::ArrowUp
+                                            .render(13.5)
+                                            .text_color(ask_submit_icon_color),
+                                    )
+                                    .on_click(move |_, window, cx| {
+                                        ask_submit_app.update(cx, |this, cx| {
+                                            this.submit_selection_ask_placeholder(window, cx)
+                                        });
+                                    }),
+                            )
+                    });
+                    let surface = div()
+                        .id("editor-selection-menu")
+                        .flex()
+                        .flex_col()
+                        .items_start()
+                        .gap_2()
+                        .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                            cx.stop_propagation();
+                        })
+                        .when_some(ask_panel, |surface, panel| surface.child(panel))
+                        .child(if mode == SelectionMenuMode::Link {
+                            link_menu.into_any_element()
+                        } else {
+                            formatting_menu.into_any_element()
+                        });
+                    editor.child(deferred(
+                        anchored()
+                            .snap_to_window_with_margin(px(12.0))
+                            .anchor(Corner::TopLeft)
+                            .position(point(
+                                anchor.x
+                                    - px(if mode == SelectionMenuMode::AskAi {
+                                        SELECTION_ASK_PANEL_WIDTH
+                                    } else if mode == SelectionMenuMode::Link {
+                                        SELECTION_LINK_MENU_WIDTH
+                                    } else {
+                                        SELECTION_MENU_WIDTH
+                                    }) / 2.0,
+                                anchor.y,
+                            ))
+                            .child(surface),
+                    ))
+                })
                 .into_any_element()
         } else {
             let center_message =
@@ -5950,8 +6535,215 @@ fn menu_item_content(icon: Icon, label: &'static str, icon_color: Hsla) -> impl 
         .child(div().flex_1().min_w(px(0.0)).text_left().child(label))
 }
 
+fn selection_menu_icon_button(
+    id: impl Into<gpui::ElementId>,
+    icon: Icon,
+    label: &'static str,
+    active: bool,
+    cx: &App,
+) -> Button {
+    let theme = cx.theme();
+    let icon_color = if active {
+        theme.background
+    } else {
+        theme.muted_foreground
+    };
+    let style = ButtonCustomVariant::new(cx)
+        .color(if active {
+            theme.foreground
+        } else {
+            theme.transparent
+        })
+        .foreground(if active {
+            theme.background
+        } else {
+            theme.muted_foreground
+        })
+        .hover(theme.secondary_hover)
+        .active(theme.secondary_active);
+    Button::new(id)
+        .custom(style)
+        .rounded(ButtonRounded::Size(px(6.0)))
+        .size(px(SELECTION_MENU_BUTTON_SIZE))
+        .tooltip(label)
+        .child(icon.render(14.0).flex_none().text_color(icon_color))
+}
+
+fn selection_menu_divider(theme: &Theme) -> impl IntoElement {
+    div()
+        .mx(px(2.0))
+        .h(px(16.0))
+        .w(px(1.0))
+        .flex_none()
+        .bg(theme.border)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct InlineFormatEdit {
+    replace_range: Range<usize>,
+    replacement: String,
+    selection: Range<usize>,
+}
+
+fn inline_format_markers(format: InlineFormat) -> (&'static str, &'static str) {
+    match format {
+        InlineFormat::Bold => ("**", "**"),
+        InlineFormat::Italic => ("*", "*"),
+        InlineFormat::Underline => ("<u>", "</u>"),
+        InlineFormat::Strikethrough => ("~~", "~~"),
+        InlineFormat::Code => ("`", "`"),
+    }
+}
+
+fn inline_format_bounds(
+    text: &str,
+    selection: Range<usize>,
+    format: InlineFormat,
+) -> Option<(Range<usize>, Range<usize>)> {
+    if selection.is_empty() || selection.end > text.chars().count() {
+        return None;
+    }
+    let (opening, closing) = inline_format_markers(format);
+    let opening_len = opening.chars().count();
+    let closing_len = closing.chars().count();
+    let chars = text.chars().collect::<Vec<_>>();
+    let slice = |range: Range<usize>| chars[range].iter().collect::<String>();
+
+    let selected = slice(selection.clone());
+    let ambiguous_italic_selection =
+        format == InlineFormat::Italic && selected.starts_with("**") && selected.ends_with("**");
+    if !ambiguous_italic_selection
+        && selected.starts_with(opening)
+        && selected.ends_with(closing)
+        && selection.len() >= opening_len + closing_len
+    {
+        return Some((
+            selection.clone(),
+            selection.start + opening_len..selection.end - closing_len,
+        ));
+    }
+
+    if selection.start >= opening_len && selection.end + closing_len <= chars.len() {
+        let outer = selection.start - opening_len..selection.end + closing_len;
+        let ambiguous_italic_surrounding = format == InlineFormat::Italic
+            && ((outer.start > 0 && chars[outer.start - 1] == '*')
+                || (outer.end < chars.len() && chars[outer.end] == '*'));
+        if !ambiguous_italic_surrounding
+            && slice(outer.start..selection.start) == opening
+            && slice(selection.end..outer.end) == closing
+        {
+            return Some((outer, selection));
+        }
+    }
+    None
+}
+
+fn inline_format_is_active(text: &str, selection: Range<usize>, format: InlineFormat) -> bool {
+    inline_format_bounds(text, selection, format).is_some()
+}
+
+fn inline_format_edit(
+    text: &str,
+    selection: Range<usize>,
+    format: InlineFormat,
+) -> Option<InlineFormatEdit> {
+    if let Some((outer, inner)) = inline_format_bounds(text, selection.clone(), format) {
+        let replacement = text
+            .chars()
+            .skip(inner.start)
+            .take(inner.len())
+            .collect::<String>();
+        let start = outer.start;
+        let end = start + replacement.chars().count();
+        return Some(InlineFormatEdit {
+            replace_range: outer,
+            replacement,
+            selection: start..end,
+        });
+    }
+    if selection.is_empty() || selection.end > text.chars().count() {
+        return None;
+    }
+    let selected = text
+        .chars()
+        .skip(selection.start)
+        .take(selection.len())
+        .collect::<String>();
+    let (opening, closing) = inline_format_markers(format);
+    let replacement = format!("{opening}{selected}{closing}");
+    let opening_len = opening.chars().count();
+    Some(InlineFormatEdit {
+        replace_range: selection.clone(),
+        selection: selection.start + opening_len..selection.end + opening_len,
+        replacement,
+    })
+}
+
 fn normalize_clipboard_text(text: &str) -> String {
     text.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MarkdownLinkContext {
+    outer: Range<usize>,
+    label: String,
+    destination: String,
+}
+
+fn markdown_link_context(text: &str, selection: Range<usize>) -> Option<MarkdownLinkContext> {
+    if selection.is_empty() || selection.end > text.chars().count() {
+        return None;
+    }
+    let chars = text.chars().collect::<Vec<_>>();
+    let line_start = chars[..selection.start]
+        .iter()
+        .rposition(|character| *character == '\n')
+        .map_or(0, |index| index + 1);
+    let line_end = chars[selection.end..]
+        .iter()
+        .position(|character| *character == '\n')
+        .map_or(chars.len(), |index| selection.end + index);
+    let line = chars[line_start..line_end].iter().collect::<String>();
+    let mut cursor = 0;
+    while let Some(open_relative) = line[cursor..].find('[') {
+        let open_byte = cursor + open_relative;
+        let Some(separator_relative) = line[open_byte + 1..].find("](") else {
+            break;
+        };
+        let separator_byte = open_byte + 1 + separator_relative;
+        let Some(close_relative) = line[separator_byte + 2..].find(')') else {
+            break;
+        };
+        let close_byte = separator_byte + 2 + close_relative;
+        let outer_start = line_start + line[..open_byte].chars().count();
+        let outer_end = line_start + line[..=close_byte].chars().count();
+        let label_start = outer_start + 1;
+        let label_end = line_start + line[..separator_byte].chars().count();
+        if selection.start >= label_start && selection.end <= label_end {
+            return Some(MarkdownLinkContext {
+                outer: outer_start..outer_end,
+                label: line[open_byte + 1..separator_byte].to_owned(),
+                destination: line[separator_byte + 2..close_byte].to_owned(),
+            });
+        }
+        cursor = close_byte + 1;
+    }
+    None
+}
+
+fn normalize_markdown_link_destination(value: &str) -> String {
+    let value = value.trim();
+    if value.starts_with('#')
+        || value.starts_with('/')
+        || value.starts_with("./")
+        || value.starts_with("../")
+        || value.contains("://")
+        || value.starts_with("mailto:")
+    {
+        value.to_owned()
+    } else {
+        format!("https://{value}")
+    }
 }
 
 fn clipboard_image_timestamp() -> u128 {
@@ -6142,6 +6934,16 @@ fn main() {
                             .placeholder("编辑书签标题…")
                             .clean_on_escape()
                     });
+                    let selection_link_input = cx.new(|cx| {
+                        InputState::new(window, cx)
+                            .placeholder("Paste a link…")
+                            .clean_on_escape()
+                    });
+                    let selection_ask_input = cx.new(|cx| {
+                        InputState::new(window, cx)
+                            .placeholder("What should AI do with this selection?")
+                            .clean_on_escape()
+                    });
                     let editor_line_layouts = Rc::new(RefCell::new(Vec::new()));
                     let editor_list_state = ListState::new(0, ListAlignment::Top, px(320.0));
                     let app = cx.new(|cx| {
@@ -6236,6 +7038,32 @@ fn main() {
                                     }
                                 },
                             ),
+                            cx.subscribe_in(
+                                &selection_link_input,
+                                window,
+                                |this: &mut SynapseApp, _, event: &InputEvent, window, cx| {
+                                    match event {
+                                        InputEvent::PressEnter { secondary: false } => {
+                                            this.apply_selection_link(window, cx);
+                                        }
+                                        InputEvent::Change => cx.notify(),
+                                        _ => {}
+                                    }
+                                },
+                            ),
+                            cx.subscribe_in(
+                                &selection_ask_input,
+                                window,
+                                |this: &mut SynapseApp, _, event: &InputEvent, window, cx| {
+                                    match event {
+                                        InputEvent::PressEnter { secondary: false } => {
+                                            this.submit_selection_ask_placeholder(window, cx);
+                                        }
+                                        InputEvent::Change => cx.notify(),
+                                        _ => {}
+                                    }
+                                },
+                            ),
                         ];
                         SynapseApp {
                             state,
@@ -6256,6 +7084,8 @@ fn main() {
                             bookmark_query_input,
                             bookmark_tag_input,
                             bookmark_edit_input,
+                            selection_link_input,
+                            selection_ask_input,
                             bookmark_workspace,
                             bookmark_tag_editor_open: false,
                             bookmark_query_error: None,
@@ -6287,6 +7117,7 @@ fn main() {
                             collapsed_directories: BTreeSet::new(),
                             editor_marked_range: None,
                             editor_selection: EditorSelection::collapsed(0),
+                            selection_menu_mode: SelectionMenuMode::Formatting,
                             editor_line_layouts: editor_line_layouts.clone(),
                             editor_list_state: editor_list_state.clone(),
                             editor_visible_range: 0..0,
@@ -6351,26 +7182,87 @@ mod tests {
 
     use super::document_outline::{css_cubic_bezier_0201, document_outline_tick_style};
 
+    use super::editor_surface::source_lines;
     use super::{
         EDITOR_BODY_FONT_SIZE, EDITOR_BODY_LINE_HEIGHT, EDITOR_COMPACT_GUTTER,
         EDITOR_PAGE_MAX_WIDTH, EDITOR_REGULAR_GUTTER, EDITOR_RULE_BLOCK_HEIGHT,
-        EDITOR_RULE_THICKNESS, EDITOR_TOP_PADDING, EDITOR_WIDE_GUTTER, FileTreeRow,
-        MARKD_PANEL_SPRING_DAMPING, MARKD_PANEL_SPRING_MASS, MARKD_PANEL_SPRING_STIFFNESS,
-        MENU_ITEM_ICON_SIZE, MENU_ITEM_ICON_SLOT_SIZE, MarkdownImagePreview, PANEL_TRANSITION,
-        SIDEBAR_FOOTER_HEIGHT, SIDEBAR_SEARCH_CONTENT_WIDTH, SIDEBAR_SEARCH_INNER_PADDING,
-        SIDEBAR_SEARCH_OUTER_MARGIN, SIDEBAR_SHORTCUT_ACTION_WIDTH, SIDEBAR_TREE_FONT_FAMILY,
-        SIDEBAR_TREE_FONT_SIZE, SIDEBAR_TREE_ROW_HEIGHT, TABLE_CELL_HORIZONTAL_PADDING,
-        TABLE_CELL_VERTICAL_PADDING, TABLE_FONT_SIZE, TABLE_ROW_MIN_HEIGHT, TITLEBAR_HEIGHT,
-        ThemePreference, active_document_outline_index, build_document_outline,
-        build_file_tree_rows, build_image_previews, build_math_previews, build_mermaid_previews,
-        changed_line_span, clipboard_image_extension, code_block_edges,
-        command_palette_key_bindings, default_window_size, document_outline_horizontal_layout,
-        document_outline_is_visible, document_outline_layout, editor_horizontal_gutter,
-        editor_page_content_width, file_manager_reveal_command, is_tab_context_trigger,
-        markd_panel_spring_progress, normalize_clipboard_text, note_breadcrumb_parts,
-        persist_clipboard_image, resolve_markdown_image, source_lines, synapse_mermaid_theme,
-        synapse_theme_palette, synapse_titlebar_options, titlebar_left_inset,
+        EDITOR_RULE_THICKNESS, EDITOR_TOP_PADDING, EDITOR_WIDE_GUTTER, FileTreeRow, InlineFormat,
+        InlineFormatEdit, MARKD_PANEL_SPRING_DAMPING, MARKD_PANEL_SPRING_MASS,
+        MARKD_PANEL_SPRING_STIFFNESS, MENU_ITEM_ICON_SIZE, MENU_ITEM_ICON_SLOT_SIZE,
+        MarkdownImagePreview, PANEL_TRANSITION, SIDEBAR_FOOTER_HEIGHT,
+        SIDEBAR_SEARCH_CONTENT_WIDTH, SIDEBAR_SEARCH_INNER_PADDING, SIDEBAR_SEARCH_OUTER_MARGIN,
+        SIDEBAR_SHORTCUT_ACTION_WIDTH, SIDEBAR_TREE_FONT_FAMILY, SIDEBAR_TREE_FONT_SIZE,
+        SIDEBAR_TREE_ROW_HEIGHT, TABLE_CELL_HORIZONTAL_PADDING, TABLE_CELL_VERTICAL_PADDING,
+        TABLE_FONT_SIZE, TABLE_ROW_MIN_HEIGHT, TITLEBAR_HEIGHT, ThemePreference,
+        active_document_outline_index, build_document_outline, build_file_tree_rows,
+        build_image_previews, build_math_previews, build_mermaid_previews, changed_line_span,
+        clipboard_image_extension, code_block_edges, command_palette_key_bindings,
+        default_window_size, document_outline_horizontal_layout, document_outline_is_visible,
+        document_outline_layout, editor_horizontal_gutter, editor_page_content_width,
+        file_manager_reveal_command, inline_format_edit, inline_format_is_active,
+        is_tab_context_trigger, markd_panel_spring_progress, markdown_link_context,
+        normalize_clipboard_text, normalize_markdown_link_destination, note_breadcrumb_parts,
+        persist_clipboard_image, resolve_markdown_image, source_lines_from_buffer,
+        synapse_mermaid_theme, synapse_theme_palette, synapse_titlebar_options,
+        titlebar_left_inset,
     };
+
+    fn sfnt_table<'a>(font: &'a [u8], tag: &[u8; 4]) -> Option<&'a [u8]> {
+        let table_count = usize::from(u16::from_be_bytes(font.get(4..6)?.try_into().ok()?));
+        for index in 0..table_count {
+            let entry_start = 12usize.checked_add(index.checked_mul(16)?)?;
+            let entry = font.get(entry_start..entry_start.checked_add(16)?)?;
+            if entry.get(0..4)? != tag {
+                continue;
+            }
+            let offset =
+                usize::try_from(u32::from_be_bytes(entry.get(8..12)?.try_into().ok()?)).ok()?;
+            let length =
+                usize::try_from(u32::from_be_bytes(entry.get(12..16)?.try_into().ok()?)).ok()?;
+            return font.get(offset..offset.checked_add(length)?);
+        }
+        None
+    }
+
+    fn os2_weight_and_selection(font: &[u8]) -> (u16, u16) {
+        let os2 = sfnt_table(font, b"OS/2").expect("bundled Inter face must contain OS/2");
+        let weight = u16::from_be_bytes(os2.get(4..6).unwrap().try_into().unwrap());
+        let selection = u16::from_be_bytes(os2.get(62..64).unwrap().try_into().unwrap());
+        (weight, selection)
+    }
+
+    #[test]
+    fn bundled_inter_emphasis_faces_have_concrete_style_properties() {
+        const ITALIC: &[u8] = include_bytes!("../../../assets/fonts/Inter-Italic.ttf");
+        const BOLD: &[u8] = include_bytes!("../../../assets/fonts/Inter-Bold.ttf");
+        const BOLD_ITALIC: &[u8] = include_bytes!("../../../assets/fonts/Inter-BoldItalic.ttf");
+
+        let (italic_weight, italic_selection) = os2_weight_and_selection(ITALIC);
+        let (bold_weight, bold_selection) = os2_weight_and_selection(BOLD);
+        let (bold_italic_weight, bold_italic_selection) = os2_weight_and_selection(BOLD_ITALIC);
+
+        assert_eq!(italic_weight, 400);
+        assert_ne!(
+            italic_selection & 0x01,
+            0,
+            "Italic face must advertise italic"
+        );
+        assert_eq!(italic_selection & 0x20, 0, "Italic face must not be bold");
+        assert_eq!(bold_weight, 700);
+        assert_ne!(bold_selection & 0x20, 0, "Bold face must advertise bold");
+        assert_eq!(bold_selection & 0x01, 0, "Bold face must be upright");
+        assert_eq!(bold_italic_weight, 700);
+        assert_ne!(
+            bold_italic_selection & 0x20,
+            0,
+            "Bold Italic face must advertise bold"
+        );
+        assert_ne!(
+            bold_italic_selection & 0x01,
+            0,
+            "Bold Italic face must advertise italic"
+        );
+    }
 
     #[test]
     fn editor_typography_matches_the_centered_writing_layout() {
@@ -6385,6 +7277,68 @@ mod tests {
         assert_eq!(EDITOR_BODY_FONT_SIZE, 16.0);
         assert_eq!(EDITOR_BODY_LINE_HEIGHT, 26.4);
         assert_eq!(editor_page_content_width(900.0, true, 16.0), 620.0);
+    }
+
+    #[test]
+    fn selection_menu_inline_formats_preserve_unicode_selection_and_toggle_cleanly() {
+        let text = "前缀中文后缀";
+        let edit = inline_format_edit(text, 2..4, InlineFormat::Bold).unwrap();
+        assert_eq!(edit.replace_range, 2..4);
+        assert_eq!(edit.replacement, "**中文**");
+        assert_eq!(edit.selection, 4..6);
+
+        let formatted = "前缀**中文**后缀";
+        assert!(inline_format_is_active(formatted, 4..6, InlineFormat::Bold));
+        assert_eq!(
+            inline_format_edit(formatted, 4..6, InlineFormat::Bold),
+            Some(InlineFormatEdit {
+                replace_range: 2..8,
+                replacement: "中文".to_owned(),
+                selection: 2..4,
+            })
+        );
+        assert!(!inline_format_is_active(
+            formatted,
+            4..6,
+            InlineFormat::Italic
+        ));
+    }
+
+    #[test]
+    fn selection_menu_link_parser_and_destination_normalizer_are_predictable() {
+        assert_eq!(markdown_link_context("plain text", 0..5), None);
+        assert_eq!(
+            markdown_link_context("before [Synapse](docs/start.md) after", 8..15).map(|link| (
+                link.outer,
+                link.label,
+                link.destination
+            )),
+            Some((7..31, "Synapse".to_owned(), "docs/start.md".to_owned()))
+        );
+        assert_eq!(
+            normalize_markdown_link_destination("example.com/docs"),
+            "https://example.com/docs"
+        );
+        assert_eq!(
+            normalize_markdown_link_destination("../other.md"),
+            "../other.md"
+        );
+    }
+
+    #[test]
+    fn persistent_writ_buffer_applies_unicode_edits_incrementally() {
+        let before = "# 标题\n第一行中文\n第二行";
+        let mut buffer: writ::buffer::Buffer = before.parse().unwrap();
+        let range = 7..8;
+        let byte_start = buffer.rope().char_to_byte(range.start);
+        let byte_end = buffer.rope().char_to_byte(range.end);
+
+        buffer.replace(byte_start..byte_end, "内容", byte_start);
+
+        assert_eq!(buffer.text(), "# 标题\n第一内容中文\n第二行");
+        let lines = source_lines_from_buffer(&mut buffer, 9, false);
+        assert_eq!(lines.len(), 3);
+        assert!(lines[1].presentation.display.contains("内容"));
     }
 
     #[test]
@@ -6778,6 +7732,8 @@ mod tests {
             cursor: 1,
             dark_mode: true,
             source_mode: false,
+            writ_revision: 7,
+            writ_buffer: "".parse().unwrap(),
             lines: Rc::new(Vec::new()),
             outline: Rc::new(Vec::new()),
             mermaid_previews: Rc::new(Default::default()),
