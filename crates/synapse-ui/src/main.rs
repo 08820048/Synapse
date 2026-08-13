@@ -34,7 +34,7 @@ use gpui_component::{
     kbd::Kbd,
 };
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher as _};
-use synapse::ShellState;
+use synapse::{ShellState, trailing_fenced_code_block_paragraph_edit};
 use synapse_core::{VaultEntry, VaultEntryKind};
 
 mod bookmark_workspace;
@@ -2659,9 +2659,37 @@ impl SynapseApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(cursor) = self.editor_char_for_position(event.position) else {
+        let last_layout_bottom = self
+            .editor_line_layouts
+            .borrow()
+            .iter()
+            .flatten()
+            .last()
+            .map(|layout| layout.bounds.bottom());
+        let clicked_below_document =
+            last_layout_bottom.is_some_and(|bottom| event.position.y > bottom);
+        let Some(mut cursor) = self.editor_char_for_position(event.position) else {
             return;
         };
+        if clicked_below_document
+            && let Some(source) = self.state.active_document().map(|document| document.text())
+            && let Some(edit) = trailing_fenced_code_block_paragraph_edit(&source)
+        {
+            let previous_revision = self
+                .state
+                .active_document()
+                .map_or(0, |document| document.revision());
+            let range = edit.range.clone();
+            if self
+                .state
+                .replace_active_range(edit.range, &edit.replacement)
+                .is_ok()
+            {
+                self.sync_writ_render_buffer(previous_revision, range, &edit.replacement);
+                self.state.set_cursor(edit.cursor);
+                cursor = edit.cursor;
+            }
+        }
         self.editor_marked_range = None;
         self.selection_menu_mode = SelectionMenuMode::Formatting;
         self.editor_selection

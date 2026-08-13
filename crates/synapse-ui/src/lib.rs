@@ -12,7 +12,9 @@ use synapse_core::{
 
 mod markdown_command;
 
-pub use markdown_command::{MarkdownEdit, smart_enter_edit};
+pub use markdown_command::{
+    MarkdownEdit, smart_enter_edit, trailing_fenced_code_block_paragraph_edit,
+};
 
 #[derive(Debug)]
 struct OpenTab {
@@ -1183,6 +1185,35 @@ mod tests {
 
         assert_eq!(state.active_document().unwrap().text(), "```rust\n\n```");
         assert_eq!(state.cursor(), 8);
+    }
+
+    #[test]
+    fn fenced_code_block_third_enter_exits_into_a_following_paragraph() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join("note.md"),
+            "```rust\nfn main() {}\n```",
+        )
+        .unwrap();
+        let mut state =
+            ShellState::from_vault_argument(Some(OsString::from(directory.path().as_os_str())));
+        state.select_note(Path::new("note.md")).unwrap();
+        state.set_cursor(20);
+
+        state.smart_enter().unwrap();
+        state.smart_enter().unwrap();
+        state.smart_enter().unwrap();
+
+        assert_eq!(
+            state.active_document().unwrap().text(),
+            "```rust\nfn main() {}\n```\n"
+        );
+        assert_eq!(state.cursor(), 25);
+        state.insert_text("代码块外正文").unwrap();
+        assert_eq!(
+            state.active_document().unwrap().text(),
+            "```rust\nfn main() {}\n```\n代码块外正文"
+        );
     }
 
     #[test]

@@ -10,6 +10,9 @@ pub struct MarkdownEdit {
 }
 
 pub fn smart_enter_edit(source: &str, cursor_char: usize) -> MarkdownEdit {
+    if let Some(edit) = fenced_code_block_exit_edit(source, cursor_char) {
+        return edit;
+    }
     if let Some(edit) = fenced_code_block_enter_edit(source, cursor_char) {
         return edit;
     }
@@ -41,6 +44,117 @@ pub fn smart_enter_edit(source: &str, cursor_char: usize) -> MarkdownEdit {
         cursor: cursor_char + replacement.chars().count(),
         replacement,
     }
+}
+
+pub fn trailing_fenced_code_block_paragraph_edit(source: &str) -> Option<MarkdownEdit> {
+    if source.ends_with('\n') {
+        return None;
+    }
+    let closing_start = source.rfind('\n').map_or(0, |index| index + 1);
+    let closing = parse_closing_fence(&source[closing_start..])?;
+    matching_opening_fence_before(source, closing_start, closing)?;
+    Some(MarkdownEdit {
+        range: source.chars().count()..source.chars().count(),
+        replacement: "\n".to_owned(),
+        cursor: source.chars().count() + 1,
+    })
+}
+
+fn fenced_code_block_exit_edit(source: &str, cursor_char: usize) -> Option<MarkdownEdit> {
+    let chars = source.chars().collect::<Vec<_>>();
+    let cursor = cursor_char.min(chars.len());
+    if cursor < 2 || chars.get(cursor) != Some(&'\n') || chars[cursor - 2..cursor] != ['\n', '\n'] {
+        return None;
+    }
+
+    let closing_start = cursor + 1;
+    let closing_end = chars[closing_start..]
+        .iter()
+        .position(|character| *character == '\n')
+        .map_or(chars.len(), |offset| closing_start + offset);
+    let closing_line = chars[closing_start..closing_end].iter().collect::<String>();
+    let closing = parse_closing_fence(&closing_line)?;
+    let content_start = matching_opening_fence_before(source, cursor, closing)?;
+    if cursor < content_start + 2 {
+        return None;
+    }
+
+    let has_following_line = closing_end < chars.len();
+    let mut replacement = chars[cursor..closing_end].iter().collect::<String>();
+    if !has_following_line {
+        replacement.push('\n');
+    }
+    let range = cursor - 2..closing_end;
+    let replacement_len = replacement.chars().count();
+    Some(MarkdownEdit {
+        range: range.clone(),
+        replacement,
+        cursor: range.start + replacement_len + usize::from(has_following_line),
+    })
+}
+
+#[derive(Clone, Copy)]
+struct Fence {
+    marker: char,
+    length: usize,
+}
+
+fn parse_closing_fence(line: &str) -> Option<Fence> {
+    let indentation = line
+        .chars()
+        .take_while(|character| *character == ' ')
+        .count();
+    if indentation > 3 {
+        return None;
+    }
+    let rest = &line[indentation..];
+    let marker = rest.chars().next()?;
+    if !matches!(marker, '`' | '~') {
+        return None;
+    }
+    let length = rest
+        .chars()
+        .take_while(|character| *character == marker)
+        .count();
+    (length >= 3 && rest.chars().all(|character| character == marker))
+        .then_some(Fence { marker, length })
+}
+
+fn matching_opening_fence_before(
+    source: &str,
+    before_char: usize,
+    closing: Fence,
+) -> Option<usize> {
+    let prefix = source.chars().take(before_char).collect::<String>();
+    let mut start_char = 0;
+    let mut matching_content_start = None;
+    for segment in prefix.split_inclusive('\n') {
+        let line = segment.strip_suffix('\n').unwrap_or(segment);
+        let indentation = line
+            .chars()
+            .take_while(|character| *character == ' ')
+            .count();
+        if indentation > 3 {
+            start_char += segment.chars().count();
+            continue;
+        }
+        let rest = &line[indentation..];
+        let length = rest
+            .chars()
+            .take_while(|character| *character == closing.marker)
+            .count();
+        if length < closing.length {
+            start_char += segment.chars().count();
+            continue;
+        }
+        let info = rest.chars().skip(length).collect::<String>();
+        if (closing.marker != '`' || !info.contains('`')) && !info.chars().any(char::is_whitespace)
+        {
+            matching_content_start = Some(start_char + segment.chars().count());
+        }
+        start_char += segment.chars().count();
+    }
+    matching_content_start
 }
 
 fn fenced_code_block_enter_edit(source: &str, cursor_char: usize) -> Option<MarkdownEdit> {
@@ -158,7 +272,7 @@ fn byte_to_char(text: &str, byte_offset: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::smart_enter_edit;
+    use super::{smart_enter_edit, trailing_fenced_code_block_paragraph_edit};
 
     fn apply(source: &str, cursor: usize) -> (String, usize) {
         let edit = smart_enter_edit(source, cursor);
@@ -211,5 +325,52 @@ mod tests {
     fn markdown_fence_enter_rejects_inline_or_incomplete_markers() {
         assert_eq!(apply("text ```rust", 12), ("text ```rust\n".to_owned(), 13));
         assert_eq!(apply("``rust", 6), ("``rust\n".to_owned(), 7));
+    }
+
+    #[test]
+    fn third_enter_exits_a_fenced_code_block_and_removes_the_two_blank_lines() {
+        let source = "```rust\nfn main() {}\n\n\n```";
+        let cursor = source.rfind("\n```").unwrap();
+        assert_eq!(
+            apply(source, cursor),
+            ("```rust\nfn main() {}\n```\n".to_owned(), 25)
+        );
+
+        let source = "```rust\nfn main() {}\n\n\n```\n下一段";
+        let cursor = source.rfind("\n```").unwrap();
+        assert_eq!(
+            apply(source, cursor),
+            ("```rust\nfn main() {}\n```\n下一段".to_owned(), 25)
+        );
+    }
+
+    #[test]
+    fn first_and_second_code_block_enters_remain_inside_the_block() {
+        let (after_first, cursor) = apply("```rust\nfn main() {}\n```", 20);
+        assert_eq!(after_first, "```rust\nfn main() {}\n\n```");
+        assert_eq!(cursor, 21);
+
+        let (after_second, cursor) = apply(&after_first, cursor);
+        assert_eq!(after_second, "```rust\nfn main() {}\n\n\n```");
+        assert_eq!(cursor, 22);
+
+        assert_eq!(
+            apply(&after_second, cursor),
+            ("```rust\nfn main() {}\n```\n".to_owned(), 25)
+        );
+    }
+
+    #[test]
+    fn clicking_below_a_final_fenced_block_can_create_a_real_paragraph() {
+        assert_eq!(
+            trailing_fenced_code_block_paragraph_edit("```rust\ncode\n```"),
+            Some(super::MarkdownEdit {
+                range: 16..16,
+                replacement: "\n".to_owned(),
+                cursor: 17,
+            })
+        );
+        assert!(trailing_fenced_code_block_paragraph_edit("普通段落").is_none());
+        assert!(trailing_fenced_code_block_paragraph_edit("```rust\ncode").is_none());
     }
 }
