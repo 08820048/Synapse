@@ -19,3 +19,7 @@ instead of locally drawn strokes.
 The editor selection toolbar adds `sparkles`, `bold`, `italic`, `underline`,
 `strikethrough`, `link`, and `arrow-up`. These files keep the Lucide 1.27.0
 artwork unchanged; only whitespace is compacted.
+
+The native slash-command menu adds `heading-1`, `heading-2`, `heading-3`,
+`list`, `list-ordered`, `text-quote`, and `table`; the existing `link`,
+`pilcrow`, `list-todo`, `code-2`, and `minus` artwork is reused.

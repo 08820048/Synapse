@@ -25,11 +25,12 @@ use futures::StreamExt as _;
 use gpui::{
     AnyElement, AnyWindowHandle, App, Application, Bounds, ClickEvent, ClipboardEntry,
     ClipboardItem, Context, Corner, CursorStyle, ElementInputHandler, Entity, FocusHandle,
-    Focusable, FontWeight, Hsla, Image, ImageFormat, ImageSource, KeyBinding, ListAlignment,
-    ListOffset, ListState, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit,
-    PathPromptOptions, Pixels, Point, SharedString, StyledImage as _, Subscription,
-    TitlebarOptions, Window, WindowBounds, WindowControlArea, WindowKind, WindowOptions, actions,
-    anchored, canvas, deferred, div, hsla, img, list, point, prelude::*, px, rgb, rgba, size,
+    Focusable, FontWeight, Hsla, Image, ImageFormat, ImageSource, KeyBinding, KeyDownEvent,
+    ListAlignment, ListOffset, ListState, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, ObjectFit, PathPromptOptions, Pixels, Point, ScrollHandle, SharedString,
+    StyledImage as _, Subscription, TitlebarOptions, Window, WindowBounds, WindowControlArea,
+    WindowKind, WindowOptions, actions, anchored, canvas, deferred, div, hsla, img, list, point,
+    prelude::*, px, rgb, rgba, size,
 };
 use gpui_animation::{
     animation::TransitionExt,
@@ -59,6 +60,7 @@ mod http_client;
 mod icons;
 mod inline_rename;
 mod math_renderer;
+mod slash_command;
 mod todo_workspace;
 
 use bookmark_workspace::{
@@ -82,6 +84,7 @@ use http_client::SynapseHttpClient;
 use icons::{Icon, SynapseAssets};
 use inline_rename::{InlineRenameEvent, InlineRenameInput};
 use math_renderer::{MathPreview, render_math_preview};
+use slash_command::{SlashCommand, note_link_markdown, slash_command_edit, slash_trigger};
 use todo_workspace::{
     TodoTagPicker, TodoToggleOutcome, TodoWorkspace, TodoWorkspaceRenderState,
     render_todo_quick_picker, render_todo_workspace,
@@ -155,6 +158,14 @@ const SELECTION_LINK_MENU_WIDTH: f32 = 264.0;
 const SELECTION_ASK_PANEL_WIDTH: f32 = 340.0;
 const SELECTION_ASK_PANEL_HEIGHT: f32 = 56.0;
 const SELECTION_ASK_PANEL_GAP: f32 = 8.0;
+const SLASH_MENU_WIDTH: f32 = 208.0;
+const SLASH_MENU_MAX_HEIGHT: f32 = 264.0;
+const SLASH_MENU_ROW_HEIGHT: f32 = 32.0;
+const SLASH_MENU_OFFSET: f32 = 6.0;
+const NOTE_LINK_PICKER_WIDTH: f32 = 268.0;
+const SLASH_MENU_REVEAL_DELAY: Duration = Duration::from_millis(16);
+const SLASH_MENU_ENTER_TRANSITION: Duration = Duration::from_millis(120);
+const SLASH_MENU_EXIT_TRANSITION: Duration = Duration::from_millis(100);
 static APP_ALERT_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -788,6 +799,117 @@ fn build_file_tree_rows(
     rows
 }
 
+fn slash_command_label(language: AppLanguage, command: SlashCommand) -> &'static str {
+    match command {
+        SlashCommand::NoteLink => language.text("链接到笔记", "Link to note"),
+        SlashCommand::Text => language.text("正文", "Text"),
+        SlashCommand::Heading1 => language.text("一级标题", "Heading 1"),
+        SlashCommand::Heading2 => language.text("二级标题", "Heading 2"),
+        SlashCommand::Heading3 => language.text("三级标题", "Heading 3"),
+        SlashCommand::BulletList => language.text("无序列表", "Bullet list"),
+        SlashCommand::OrderedList => language.text("有序列表", "Numbered list"),
+        SlashCommand::TaskList => language.text("任务列表", "Task list"),
+        SlashCommand::Quote => language.text("引用", "Quote"),
+        SlashCommand::CodeBlock => language.text("代码块", "Code block"),
+        SlashCommand::Divider => language.text("分割线", "Divider"),
+        SlashCommand::Table => language.text("表格", "Table"),
+    }
+}
+
+fn slash_command_keywords(command: SlashCommand) -> &'static str {
+    match command {
+        SlashCommand::NoteLink => "page link reference mention connect note 笔记 链接 引用",
+        SlashCommand::Text => "paragraph plain text 正文 段落 文本",
+        SlashCommand::Heading1 => "heading title big h1 一级 标题",
+        SlashCommand::Heading2 => "heading subtitle section h2 二级 标题",
+        SlashCommand::Heading3 => "heading subheading h3 三级 标题",
+        SlashCommand::BulletList => "bullet unordered ul 无序 列表",
+        SlashCommand::OrderedList => "numbered ordered ol 有序 列表",
+        SlashCommand::TaskList => "task todo checkbox check 任务 待办 列表",
+        SlashCommand::Quote => "quote blockquote 引用",
+        SlashCommand::CodeBlock => "code snippet pre fence 代码 块",
+        SlashCommand::Divider => "divider rule hr line separator 分割线",
+        SlashCommand::Table => "table grid rows columns 表格",
+    }
+}
+
+fn slash_command_icon(command: SlashCommand) -> Icon {
+    match command {
+        SlashCommand::NoteLink => Icon::Link,
+        SlashCommand::Text => Icon::RichText,
+        SlashCommand::Heading1 => Icon::Heading1,
+        SlashCommand::Heading2 => Icon::Heading2,
+        SlashCommand::Heading3 => Icon::Heading3,
+        SlashCommand::BulletList => Icon::List,
+        SlashCommand::OrderedList => Icon::ListOrdered,
+        SlashCommand::TaskList => Icon::Todo,
+        SlashCommand::Quote => Icon::TextQuote,
+        SlashCommand::CodeBlock => Icon::Code,
+        SlashCommand::Divider => Icon::Minus,
+        SlashCommand::Table => Icon::Table,
+    }
+}
+
+fn filtered_slash_commands(
+    query: &str,
+    language: AppLanguage,
+    allow_note_links: bool,
+) -> Vec<SlashCommand> {
+    let query = query.trim().to_lowercase();
+    SlashCommand::ALL
+        .into_iter()
+        .filter(|command| allow_note_links || *command != SlashCommand::NoteLink)
+        .filter(|command| {
+            query.is_empty()
+                || format!(
+                    "{} {}",
+                    slash_command_label(language, *command),
+                    slash_command_keywords(*command)
+                )
+                .to_lowercase()
+                .contains(&query)
+        })
+        .collect()
+}
+
+fn note_link_candidates(
+    entries: &[VaultEntry],
+    current_path: Option<&Path>,
+    query: &str,
+) -> Vec<NoteLinkCandidate> {
+    let query = query.trim().to_lowercase();
+    entries
+        .iter()
+        .filter(|entry| entry.kind == VaultEntryKind::Note)
+        .filter(|entry| current_path != Some(entry.relative_path.as_path()))
+        .filter(|entry| {
+            query.is_empty()
+                || entry
+                    .relative_path
+                    .to_string_lossy()
+                    .to_lowercase()
+                    .contains(&query)
+        })
+        .take(8)
+        .map(|entry| NoteLinkCandidate {
+            relative_path: entry.relative_path.clone(),
+            title: entry.relative_path.file_stem().map_or_else(
+                || entry.name.clone(),
+                |stem| stem.to_string_lossy().into_owned(),
+            ),
+            folder: entry.relative_path.parent().and_then(|parent| {
+                (!parent.as_os_str().is_empty()).then(|| {
+                    parent
+                        .components()
+                        .map(|component| component.as_os_str().to_string_lossy())
+                        .collect::<Vec<_>>()
+                        .join(" / ")
+                })
+            }),
+        })
+        .collect()
+}
+
 fn is_tab_context_trigger(button: MouseButton) -> bool {
     button == MouseButton::Right
 }
@@ -1082,6 +1204,8 @@ actions!(
         ToggleCodeBlock,
         InsertNewline,
         InsertRawNewline,
+        AcceptSlashCommand,
+        DismissSlashMenu,
         OpenCommandPalette,
     ]
 );
@@ -1092,6 +1216,28 @@ enum WorkspaceView {
     Note,
     Todo,
     Bookmark,
+}
+
+#[derive(Clone, Debug)]
+struct SlashMenuState {
+    query: String,
+    range: Range<usize>,
+    selected: usize,
+    anchor: Option<(Point<Pixels>, bool)>,
+}
+
+#[derive(Clone, Debug)]
+struct NoteLinkPickerState {
+    range: Range<usize>,
+    selected: usize,
+    anchor: Option<(Point<Pixels>, bool)>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct NoteLinkCandidate {
+    relative_path: PathBuf,
+    title: String,
+    folder: Option<String>,
 }
 
 struct SynapseApp {
@@ -1119,6 +1265,7 @@ struct SynapseApp {
     bookmark_edit_input: Entity<InputState>,
     selection_link_input: Entity<InputState>,
     selection_ask_input: Entity<InputState>,
+    note_link_input: Entity<InputState>,
     bookmark_workspace: BookmarkWorkspace,
     bookmark_tag_editor_open: bool,
     bookmark_query_error: Option<String>,
@@ -1155,6 +1302,13 @@ struct SynapseApp {
     editor_marked_range: Option<Range<usize>>,
     editor_selection: EditorSelection,
     selection_menu_mode: SelectionMenuMode,
+    slash_menu: Option<SlashMenuState>,
+    note_link_picker: Option<NoteLinkPickerState>,
+    slash_menu_visible: bool,
+    note_link_picker_visible: bool,
+    slash_menu_generation: u64,
+    note_link_picker_generation: u64,
+    slash_menu_scroll: ScrollHandle,
     editor_line_layouts: Rc<RefCell<Vec<Option<EditorLineLayout>>>>,
     editor_list_state: ListState,
     editor_visible_range: Range<usize>,
@@ -1621,6 +1775,7 @@ impl SynapseApp {
     fn open_bookmark_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.workspace_view = WorkspaceView::Bookmark;
         self.selection_menu_mode = SelectionMenuMode::Formatting;
+        self.clear_slash_surfaces_immediately();
         self.dismiss_command_palette(cx);
         self.dismiss_context_menus(cx);
         window.focus(&self.bookmark_query_input.focus_handle(cx));
@@ -1941,6 +2096,7 @@ impl SynapseApp {
     fn open_todo_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.workspace_view = WorkspaceView::Todo;
         self.selection_menu_mode = SelectionMenuMode::Formatting;
+        self.clear_slash_surfaces_immediately();
         self.dismiss_command_palette(cx);
         self.dismiss_context_menus(cx);
         window.focus(&self.todo_item_input.focus_handle(cx));
@@ -2593,6 +2749,10 @@ impl SynapseApp {
                     "What should AI do with this selection?",
                 ),
             ),
+            (
+                &self.note_link_input,
+                language.text("链接到笔记…", "Link to note…"),
+            ),
         ];
         for (input, placeholder) in placeholders {
             input.update(cx, |input, cx| {
@@ -2717,6 +2877,7 @@ impl SynapseApp {
         self.editor_selection.collapse(self.state.cursor());
         self.editor_marked_range = None;
         self.selection_menu_mode = SelectionMenuMode::Formatting;
+        self.clear_slash_surfaces_immediately();
         self.tab_context_menu = None;
         self.tree_context_menu = None;
         window.focus(&self.editor_focus);
@@ -2730,6 +2891,7 @@ impl SynapseApp {
         self.editor_selection.collapse(self.state.cursor());
         self.editor_marked_range = None;
         self.selection_menu_mode = SelectionMenuMode::Formatting;
+        self.clear_slash_surfaces_immediately();
         self.tab_context_menu = None;
         self.tree_context_menu = None;
         window.focus(&self.editor_focus);
@@ -2771,6 +2933,7 @@ impl SynapseApp {
 
     fn open_command_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.command_palette_open = true;
+        self.clear_slash_surfaces_immediately();
         self.command_palette_closing = false;
         self.command_palette_generation = self.command_palette_generation.wrapping_add(1);
         self.tab_context_menu = None;
@@ -2841,6 +3004,7 @@ impl SynapseApp {
     fn toggle_markdown_source_mode(&mut self, cx: &mut Context<Self>) {
         self.markdown_source_mode = !self.markdown_source_mode;
         self.selection_menu_mode = SelectionMenuMode::Formatting;
+        self.clear_slash_surfaces_immediately();
         self.editor_render_cache = None;
         self.dismiss_context_menus(cx);
         cx.notify();
@@ -3057,6 +3221,7 @@ impl SynapseApp {
             self.sync_writ_render_buffer(previous_revision, range, "");
         }
         self.editor_selection.collapse(self.state.cursor());
+        self.refresh_slash_menu(cx);
         self.restart_editor_cursor_blink(cx);
         cx.stop_propagation();
         cx.notify();
@@ -3085,6 +3250,7 @@ impl SynapseApp {
             self.sync_writ_render_buffer(previous_revision, range, "");
         }
         self.editor_selection.collapse(self.state.cursor());
+        self.refresh_slash_menu(cx);
         self.restart_editor_cursor_blink(cx);
         cx.stop_propagation();
         cx.notify();
@@ -3098,6 +3264,7 @@ impl SynapseApp {
             self.state.set_cursor(self.editor_selection.range().start);
         }
         self.editor_selection.collapse(self.state.cursor());
+        self.refresh_slash_menu(cx);
         self.restart_editor_cursor_blink(cx);
         cx.stop_propagation();
         cx.notify();
@@ -3111,24 +3278,35 @@ impl SynapseApp {
             self.state.set_cursor(self.editor_selection.range().end);
         }
         self.editor_selection.collapse(self.state.cursor());
+        self.refresh_slash_menu(cx);
         self.restart_editor_cursor_blink(cx);
         cx.stop_propagation();
         cx.notify();
     }
 
     fn move_up(&mut self, _: &MoveUp, _: &mut Window, cx: &mut Context<Self>) {
+        if self.move_slash_selection(-1, cx) {
+            cx.stop_propagation();
+            return;
+        }
         self.editor_marked_range = None;
         self.state.move_up();
         self.editor_selection.collapse(self.state.cursor());
+        self.refresh_slash_menu(cx);
         self.restart_editor_cursor_blink(cx);
         cx.stop_propagation();
         cx.notify();
     }
 
     fn move_down(&mut self, _: &MoveDown, _: &mut Window, cx: &mut Context<Self>) {
+        if self.move_slash_selection(1, cx) {
+            cx.stop_propagation();
+            return;
+        }
         self.editor_marked_range = None;
         self.state.move_down();
         self.editor_selection.collapse(self.state.cursor());
+        self.refresh_slash_menu(cx);
         self.restart_editor_cursor_blink(cx);
         cx.stop_propagation();
         cx.notify();
@@ -3138,6 +3316,7 @@ impl SynapseApp {
         self.editor_marked_range = None;
         self.state.move_home();
         self.editor_selection.collapse(self.state.cursor());
+        self.refresh_slash_menu(cx);
         self.restart_editor_cursor_blink(cx);
         cx.stop_propagation();
         cx.notify();
@@ -3147,6 +3326,7 @@ impl SynapseApp {
         self.editor_marked_range = None;
         self.state.move_end();
         self.editor_selection.collapse(self.state.cursor());
+        self.refresh_slash_menu(cx);
         self.restart_editor_cursor_blink(cx);
         cx.stop_propagation();
         cx.notify();
@@ -3192,6 +3372,8 @@ impl SynapseApp {
         };
         self.editor_marked_range = None;
         self.editor_selection.select_all(len_chars);
+        self.begin_close_slash_menu(cx);
+        self.begin_close_note_link_picker(cx);
         self.state.set_cursor(len_chars);
         self.restart_editor_cursor_blink(cx);
         cx.stop_propagation();
@@ -3212,6 +3394,7 @@ impl SynapseApp {
                 .state
                 .replace_active_range(self.editor_selection.range(), "");
             self.editor_selection.collapse(self.state.cursor());
+            self.refresh_slash_menu(cx);
             self.restart_editor_cursor_blink(cx);
             cx.notify();
         }
@@ -3247,6 +3430,7 @@ impl SynapseApp {
                         .replace_active_range(self.editor_selection.range(), &markdown);
                     self.editor_selection.collapse(self.state.cursor());
                     self.editor_marked_range = None;
+                    self.refresh_slash_menu(cx);
                     self.restart_editor_cursor_blink(cx);
                     cx.notify();
                 }
@@ -3261,6 +3445,7 @@ impl SynapseApp {
                 .replace_active_range(self.editor_selection.range(), &text);
             self.editor_selection.collapse(self.state.cursor());
             self.editor_marked_range = None;
+            self.refresh_slash_menu(cx);
             self.restart_editor_cursor_blink(cx);
             cx.notify();
         }
@@ -3283,7 +3468,11 @@ impl SynapseApp {
         cx.stop_propagation();
     }
 
-    fn insert_newline(&mut self, _: &InsertNewline, _: &mut Window, cx: &mut Context<Self>) {
+    fn insert_newline(&mut self, _: &InsertNewline, window: &mut Window, cx: &mut Context<Self>) {
+        if self.execute_selected_slash_command(window, cx) {
+            cx.stop_propagation();
+            return;
+        }
         self.editor_marked_range = None;
         if self.editor_selection.is_empty() {
             let _ = self.state.smart_enter();
@@ -3293,6 +3482,7 @@ impl SynapseApp {
                 .replace_active_range(self.editor_selection.range(), "\n");
         }
         self.editor_selection.collapse(self.state.cursor());
+        self.begin_close_slash_menu(cx);
         self.restart_editor_cursor_blink(cx);
         cx.stop_propagation();
         cx.notify();
@@ -3304,6 +3494,7 @@ impl SynapseApp {
             .state
             .replace_active_range(self.editor_selection.range(), "\n");
         self.editor_selection.collapse(self.state.cursor());
+        self.begin_close_slash_menu(cx);
         self.restart_editor_cursor_blink(cx);
         cx.stop_propagation();
         cx.notify();
@@ -3313,6 +3504,8 @@ impl SynapseApp {
         self.editor_marked_range = None;
         self.editor_selection.select_to(self.state.cursor());
         self.selection_menu_mode = SelectionMenuMode::Formatting;
+        self.begin_close_slash_menu(cx);
+        self.begin_close_note_link_picker(cx);
         self.restart_editor_cursor_blink(cx);
         cx.stop_propagation();
         cx.notify();
@@ -3325,6 +3518,370 @@ impl SynapseApp {
         }
         let text = self.state.active_document()?.text();
         Some(text.chars().skip(range.start).take(range.len()).collect())
+    }
+
+    fn clear_slash_surfaces_immediately(&mut self) {
+        self.slash_menu_generation = self.slash_menu_generation.wrapping_add(1);
+        self.note_link_picker_generation = self.note_link_picker_generation.wrapping_add(1);
+        self.slash_menu = None;
+        self.note_link_picker = None;
+        self.slash_menu_visible = false;
+        self.note_link_picker_visible = false;
+    }
+
+    fn reveal_slash_menu(&mut self, cx: &mut Context<Self>) {
+        self.slash_menu_generation = self.slash_menu_generation.wrapping_add(1);
+        let generation = self.slash_menu_generation;
+        self.slash_menu_visible = false;
+        let timer = cx.background_executor().timer(SLASH_MENU_REVEAL_DELAY);
+        cx.spawn(async move |this, cx| {
+            timer.await;
+            let _ = this.update(cx, |this, cx| {
+                if this.slash_menu.is_some() && this.slash_menu_generation == generation {
+                    this.slash_menu_visible = true;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn reveal_note_link_picker(&mut self, cx: &mut Context<Self>) {
+        self.note_link_picker_generation = self.note_link_picker_generation.wrapping_add(1);
+        let generation = self.note_link_picker_generation;
+        self.note_link_picker_visible = false;
+        let timer = cx.background_executor().timer(SLASH_MENU_REVEAL_DELAY);
+        cx.spawn(async move |this, cx| {
+            timer.await;
+            let _ = this.update(cx, |this, cx| {
+                if this.note_link_picker.is_some() && this.note_link_picker_generation == generation
+                {
+                    this.note_link_picker_visible = true;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn begin_close_slash_menu(&mut self, cx: &mut Context<Self>) {
+        if self.slash_menu.is_none() {
+            return;
+        }
+        if !self.slash_menu_visible {
+            self.slash_menu_generation = self.slash_menu_generation.wrapping_add(1);
+            self.slash_menu = None;
+            cx.notify();
+            return;
+        }
+        self.slash_menu_visible = false;
+        self.slash_menu_generation = self.slash_menu_generation.wrapping_add(1);
+        let generation = self.slash_menu_generation;
+        let timer = cx.background_executor().timer(SLASH_MENU_EXIT_TRANSITION);
+        cx.spawn(async move |this, cx| {
+            timer.await;
+            let _ = this.update(cx, |this, cx| {
+                if !this.slash_menu_visible && this.slash_menu_generation == generation {
+                    this.slash_menu = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn begin_close_note_link_picker(&mut self, cx: &mut Context<Self>) {
+        if self.note_link_picker.is_none() {
+            return;
+        }
+        if !self.note_link_picker_visible {
+            self.note_link_picker_generation = self.note_link_picker_generation.wrapping_add(1);
+            self.note_link_picker = None;
+            cx.notify();
+            return;
+        }
+        self.note_link_picker_visible = false;
+        self.note_link_picker_generation = self.note_link_picker_generation.wrapping_add(1);
+        let generation = self.note_link_picker_generation;
+        let timer = cx.background_executor().timer(SLASH_MENU_EXIT_TRANSITION);
+        cx.spawn(async move |this, cx| {
+            timer.await;
+            let _ = this.update(cx, |this, cx| {
+                if !this.note_link_picker_visible && this.note_link_picker_generation == generation
+                {
+                    this.note_link_picker = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn refresh_slash_menu(&mut self, cx: &mut Context<Self>) {
+        if self.markdown_source_mode
+            || self.workspace_view != WorkspaceView::Note
+            || !self.editor_selection.is_empty()
+            || self.note_link_picker.is_some()
+        {
+            self.begin_close_slash_menu(cx);
+            return;
+        }
+        let Some(trigger) = self
+            .state
+            .active_document()
+            .and_then(|document| slash_trigger(&document.text(), self.state.cursor()))
+        else {
+            self.begin_close_slash_menu(cx);
+            return;
+        };
+        let allow_note_links = self.state.vault_root().is_some();
+        let command_count =
+            filtered_slash_commands(&trigger.query, self.language, allow_note_links).len();
+        let preserve_selection = self.slash_menu.as_ref().is_some_and(|menu| {
+            menu.range.start == trigger.range.start && menu.query == trigger.query
+        });
+        let selected = if preserve_selection {
+            self.slash_menu
+                .as_ref()
+                .map_or(0, |menu| menu.selected.min(command_count.saturating_sub(1)))
+        } else {
+            self.slash_menu_scroll.scroll_to_item(0);
+            0
+        };
+        let anchor = self.slash_menu.as_ref().and_then(|menu| menu.anchor);
+        let needs_reveal = self.slash_menu.is_none() || !self.slash_menu_visible;
+        self.slash_menu = Some(SlashMenuState {
+            query: trigger.query,
+            range: trigger.range,
+            selected,
+            anchor,
+        });
+        if needs_reveal {
+            self.reveal_slash_menu(cx);
+        }
+    }
+
+    fn dismiss_slash_surfaces(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.slash_menu.is_none() && self.note_link_picker.is_none() {
+            return;
+        }
+        self.begin_close_slash_menu(cx);
+        self.begin_close_note_link_picker(cx);
+        window.focus(&self.editor_focus);
+    }
+
+    fn slash_surface_anchor(
+        &self,
+        range: &Range<usize>,
+        surface_height: f32,
+        viewport_height: f32,
+    ) -> Option<(Point<Pixels>, bool)> {
+        let layouts = self.editor_line_layouts.borrow();
+        let layout = layouts
+            .iter()
+            .flatten()
+            .find(|layout| layout.contains_source_char(range.end))?;
+        let caret = layout.point_for_source_char(range.end);
+        let below =
+            viewport_height - f32::from(caret.y + layout.line_height) > surface_height + 16.0;
+        let top = if below {
+            caret.y + layout.line_height + px(SLASH_MENU_OFFSET)
+        } else {
+            caret.y - px(surface_height + SLASH_MENU_OFFSET)
+        };
+        Some((point(caret.x, top.max(px(12.0))), below))
+    }
+
+    fn move_slash_selection(&mut self, direction: isize, cx: &mut Context<Self>) -> bool {
+        if !self.slash_menu_visible {
+            return false;
+        }
+        let Some(menu) = self.slash_menu.as_mut() else {
+            return false;
+        };
+        let commands = filtered_slash_commands(
+            &menu.query,
+            self.language,
+            self.state.vault_root().is_some(),
+        );
+        if commands.is_empty() {
+            return true;
+        }
+        menu.selected =
+            (menu.selected as isize + direction).rem_euclid(commands.len() as isize) as usize;
+        self.slash_menu_scroll.scroll_to_item(menu.selected);
+        cx.notify();
+        true
+    }
+
+    fn execute_selected_slash_command(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.slash_menu_visible {
+            return false;
+        }
+        let Some(menu) = self.slash_menu.clone() else {
+            return false;
+        };
+        let commands = filtered_slash_commands(
+            &menu.query,
+            self.language,
+            self.state.vault_root().is_some(),
+        );
+        let Some(command) = commands.get(menu.selected).copied() else {
+            return true;
+        };
+        self.execute_slash_command(command, menu.range, window, cx);
+        true
+    }
+
+    fn execute_slash_command(
+        &mut self,
+        command: SlashCommand,
+        trigger_range: Range<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if command == SlashCommand::NoteLink {
+            self.note_link_input.update(cx, |input, cx| {
+                input.set_value("", window, cx);
+            });
+            let anchor = self.slash_menu.as_ref().and_then(|menu| menu.anchor);
+            self.note_link_picker = Some(NoteLinkPickerState {
+                range: trigger_range,
+                selected: 0,
+                anchor,
+            });
+            self.reveal_note_link_picker(cx);
+            self.begin_close_slash_menu(cx);
+            window.focus(&self.note_link_input.focus_handle(cx));
+            return;
+        }
+
+        let Some(source) = self.state.active_document().map(|document| document.text()) else {
+            return;
+        };
+        let Some(edit) = slash_command_edit(&source, trigger_range, command) else {
+            return;
+        };
+        let previous_revision = self
+            .state
+            .active_document()
+            .map_or(0, |document| document.revision());
+        let cache_range = edit.range.clone();
+        if self
+            .state
+            .replace_active_range(edit.range, &edit.replacement)
+            .is_ok()
+        {
+            self.sync_writ_render_buffer(previous_revision, cache_range, &edit.replacement);
+            self.state.set_cursor(edit.cursor);
+            self.editor_selection.collapse(edit.cursor);
+            self.editor_marked_range = None;
+            self.begin_close_slash_menu(cx);
+            self.begin_close_note_link_picker(cx);
+            window.focus(&self.editor_focus);
+            self.restart_editor_cursor_blink(cx);
+            cx.notify();
+        }
+    }
+
+    fn current_note_link_candidates(&self, cx: &App) -> Vec<NoteLinkCandidate> {
+        let query = self.note_link_input.read(cx).value();
+        let current_path = self
+            .state
+            .active_document()
+            .map(|document| document.relative_path());
+        note_link_candidates(&self.state.entries, current_path, &query)
+    }
+
+    fn choose_note_link(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(picker) = self.note_link_picker.clone() else {
+            return;
+        };
+        let candidates = self.current_note_link_candidates(cx);
+        let Some(candidate) = candidates.get(index) else {
+            return;
+        };
+        let replacement = note_link_markdown(&candidate.title, &candidate.relative_path);
+        let previous_revision = self
+            .state
+            .active_document()
+            .map_or(0, |document| document.revision());
+        let range = picker.range;
+        if self
+            .state
+            .replace_active_range(range.clone(), &replacement)
+            .is_ok()
+        {
+            self.sync_writ_render_buffer(previous_revision, range, &replacement);
+            self.editor_selection.collapse(self.state.cursor());
+            self.editor_marked_range = None;
+            self.begin_close_note_link_picker(cx);
+            window.focus(&self.editor_focus);
+            self.restart_editor_cursor_blink(cx);
+            cx.notify();
+        }
+    }
+
+    fn note_link_picker_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let key = event.keystroke.key.as_str();
+        if key == "escape" {
+            self.dismiss_slash_surfaces(window, cx);
+            cx.stop_propagation();
+            return;
+        }
+        let count = self.current_note_link_candidates(cx).len();
+        let Some(picker) = self.note_link_picker.as_mut() else {
+            return;
+        };
+        match key {
+            "down" if count > 0 => {
+                picker.selected = (picker.selected + 1) % count;
+                cx.stop_propagation();
+                cx.notify();
+            }
+            "up" if count > 0 => {
+                picker.selected = (picker.selected + count - 1) % count;
+                cx.stop_propagation();
+                cx.notify();
+            }
+            _ => {}
+        }
+    }
+
+    fn accept_slash_command(
+        &mut self,
+        _: &AcceptSlashCommand,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.execute_selected_slash_command(window, cx) {
+            cx.stop_propagation();
+        }
+    }
+
+    fn dismiss_slash_menu_action(
+        &mut self,
+        _: &DismissSlashMenu,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.slash_menu.is_some() || self.note_link_picker.is_some() {
+            self.dismiss_slash_surfaces(window, cx);
+            cx.stop_propagation();
+        }
     }
 
     fn selection_menu_anchor(&self) -> Option<Point<Pixels>> {
@@ -3588,8 +4145,20 @@ impl SynapseApp {
                 cursor = edit.cursor;
             }
         }
+        let linked_note = self
+            .state
+            .active_document()
+            .and_then(|document| markdown_link_context(&document.text(), cursor..cursor))
+            .and_then(|link| linked_vault_note(&link.destination, &self.state.entries));
+        if let Some(relative_path) = linked_note {
+            self.select_note(relative_path, window, cx);
+            cx.stop_propagation();
+            return;
+        }
         self.editor_marked_range = None;
         self.selection_menu_mode = SelectionMenuMode::Formatting;
+        self.begin_close_slash_menu(cx);
+        self.begin_close_note_link_picker(cx);
         self.editor_selection
             .start_drag(cursor, event.modifiers.shift);
         self.state.set_cursor(cursor);
@@ -4872,7 +5441,7 @@ fn render_editor_row(
                                     | MarkdownBlockKind::Code
                                     | MarkdownBlockKind::Source
                             ),
-                            |style| {
+                            move |style| {
                                 style
                                     .text_size(px(EDITOR_BODY_FONT_SIZE))
                                     .line_height(px(EDITOR_BODY_LINE_HEIGHT))
@@ -5574,6 +6143,45 @@ impl Render for SynapseApp {
                     cx,
                 )
             });
+            let slash_surface = self.slash_menu.clone().and_then(|menu| {
+                let commands = filtered_slash_commands(
+                    &menu.query,
+                    self.language,
+                    self.state.vault_root().is_some(),
+                );
+                if commands.is_empty() {
+                    return None;
+                }
+                let height = (commands.len() as f32 * SLASH_MENU_ROW_HEIGHT + 8.0)
+                    .min(SLASH_MENU_MAX_HEIGHT);
+                let positioned = self
+                    .slash_surface_anchor(&menu.range, height, viewport_height)
+                    .or(menu.anchor);
+                if let Some(anchor) = positioned {
+                    if let Some(current) = self.slash_menu.as_mut() {
+                        current.anchor = Some(anchor);
+                    }
+                    Some((menu, commands, anchor.0, anchor.1))
+                } else {
+                    None
+                }
+            });
+            let note_link_surface = self.note_link_picker.clone().and_then(|picker| {
+                let candidates = self.current_note_link_candidates(cx);
+                let height = (48.0 + candidates.len().max(1) as f32 * SLASH_MENU_ROW_HEIGHT)
+                    .min(SLASH_MENU_MAX_HEIGHT + 40.0);
+                let positioned = self
+                    .slash_surface_anchor(&picker.range, height, viewport_height)
+                    .or(picker.anchor);
+                if let Some(anchor) = positioned {
+                    if let Some(current) = self.note_link_picker.as_mut() {
+                        current.anchor = Some(anchor);
+                    }
+                    Some((picker, candidates, anchor.0, anchor.1))
+                } else {
+                    None
+                }
+            });
             div()
                 .id("editor-content")
                 .relative()
@@ -5609,6 +6217,8 @@ impl Render for SynapseApp {
                 .on_action(cx.listener(Self::toggle_code_block))
                 .on_action(cx.listener(Self::insert_newline))
                 .on_action(cx.listener(Self::insert_raw_newline))
+                .on_action(cx.listener(Self::accept_slash_command))
+                .on_action(cx.listener(Self::dismiss_slash_menu_action))
                 .on_mouse_down(MouseButton::Left, cx.listener(Self::editor_mouse_down))
                 .on_mouse_move(cx.listener(Self::editor_mouse_move))
                 .on_mouse_up(MouseButton::Left, cx.listener(Self::editor_mouse_up))
@@ -5637,6 +6247,256 @@ impl Render for SynapseApp {
                     .size_full(),
                 )
                 .when_some(outline_element, |editor, outline| editor.child(outline))
+                .when_some(slash_surface, |editor, (menu, commands, anchor, below)| {
+                    let scroll_handle = self.slash_menu_scroll.clone();
+                    let language = self.language;
+                    let rows = commands.into_iter().enumerate().map(|(index, command)| {
+                        let selected = index == menu.selected;
+                        let icon_color = if selected {
+                            theme.foreground
+                        } else {
+                            theme.muted_foreground
+                        };
+                        let click_app = app_entity.clone();
+                        let trigger_range = menu.range.clone();
+                        div()
+                            .id(("slash-command-row", index))
+                            .h(px(SLASH_MENU_ROW_HEIGHT))
+                            .w_full()
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .gap(px(10.0))
+                            .px_2()
+                            .rounded(px(6.0))
+                            .cursor_pointer()
+                            .text_size(px(13.0))
+                            .when(selected, |row| {
+                                row.bg(theme.secondary).text_color(theme.foreground)
+                            })
+                            .when(!selected, |row| {
+                                row.text_color(theme.muted_foreground).hover(|style| {
+                                    style.bg(theme.secondary).text_color(theme.foreground)
+                                })
+                            })
+                            .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                                if *hovered
+                                    && let Some(menu) = this.slash_menu.as_mut()
+                                    && menu.selected != index
+                                {
+                                    menu.selected = index;
+                                    cx.notify();
+                                }
+                            }))
+                            .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                                cx.stop_propagation();
+                                click_app.update(cx, |this, cx| {
+                                    this.execute_slash_command(
+                                        command,
+                                        trigger_range.clone(),
+                                        window,
+                                        cx,
+                                    );
+                                });
+                            })
+                            .child(
+                                div()
+                                    .w(px(MENU_ITEM_ICON_SLOT_SIZE))
+                                    .h_full()
+                                    .flex_none()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .child(
+                                        slash_command_icon(command)
+                                            .render(14.5)
+                                            .text_color(icon_color),
+                                    ),
+                            )
+                            .child(slash_command_label(language, command))
+                    });
+                    let slash_menu_visible = self.slash_menu_visible;
+                    let surface = div()
+                        .id("editor-slash-menu")
+                        .w(px(SLASH_MENU_WIDTH))
+                        .max_h(px(SLASH_MENU_MAX_HEIGHT))
+                        .overflow_y_scroll()
+                        .track_scroll(&scroll_handle)
+                        .p_1()
+                        .rounded(px(8.0))
+                        .border_1()
+                        .border_color(theme.border)
+                        .bg(theme.popover)
+                        .text_color(theme.popover_foreground)
+                        .shadow_lg()
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .children(rows)
+                        .with_transition("editor-slash-menu-enter")
+                        .transition_when_else(
+                            slash_menu_visible,
+                            if slash_menu_visible {
+                                SLASH_MENU_ENTER_TRANSITION
+                            } else {
+                                SLASH_MENU_EXIT_TRANSITION
+                            },
+                            EaseOutQuad,
+                            |style| style.opacity(1.0).top(px(0.0)),
+                            move |style| {
+                                style
+                                    .opacity(0.0)
+                                    .top(if below { px(-4.0) } else { px(4.0) })
+                            },
+                        );
+                    editor.child(deferred(
+                        anchored()
+                            .snap_to_window_with_margin(px(12.0))
+                            .anchor(Corner::TopLeft)
+                            .position(anchor)
+                            .child(surface),
+                    ))
+                })
+                .when_some(
+                    note_link_surface,
+                    |editor, (picker, candidates, anchor, below)| {
+                        let language = self.language;
+                        let note_link_picker_visible = self.note_link_picker_visible;
+                        let rows =
+                            candidates
+                                .iter()
+                                .cloned()
+                                .enumerate()
+                                .map(|(index, candidate)| {
+                                    let selected = index == picker.selected;
+                                    let click_app = app_entity.clone();
+                                    div()
+                                        .id(("note-link-candidate", index))
+                                        .h(px(SLASH_MENU_ROW_HEIGHT))
+                                        .w_full()
+                                        .flex_none()
+                                        .flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .px_2()
+                                        .rounded(px(6.0))
+                                        .cursor_pointer()
+                                        .text_size(px(13.0))
+                                        .when(selected, |row| {
+                                            row.bg(theme.secondary).text_color(theme.foreground)
+                                        })
+                                        .when(!selected, |row| {
+                                            row.text_color(theme.muted_foreground).hover(|style| {
+                                                style
+                                                    .bg(theme.secondary)
+                                                    .text_color(theme.foreground)
+                                            })
+                                        })
+                                        .on_hover(cx.listener(
+                                            move |this, hovered: &bool, _, cx| {
+                                                if *hovered
+                                                    && let Some(picker) =
+                                                        this.note_link_picker.as_mut()
+                                                    && picker.selected != index
+                                                {
+                                                    picker.selected = index;
+                                                    cx.notify();
+                                                }
+                                            },
+                                        ))
+                                        .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                                            cx.stop_propagation();
+                                            click_app.update(cx, |this, cx| {
+                                                this.choose_note_link(index, window, cx)
+                                            });
+                                        })
+                                        .child(
+                                            Icon::FileText
+                                                .render(14.0)
+                                                .flex_none()
+                                                .text_color(theme.muted_foreground),
+                                        )
+                                        .child(
+                                            div()
+                                                .min_w(px(0.0))
+                                                .flex_1()
+                                                .truncate()
+                                                .child(candidate.title),
+                                        )
+                                        .when_some(candidate.folder, |row, folder| {
+                                            row.child(
+                                                div()
+                                                    .max_w(px(104.0))
+                                                    .flex_none()
+                                                    .truncate()
+                                                    .text_size(px(11.0))
+                                                    .text_color(theme.muted_foreground)
+                                                    .child(folder),
+                                            )
+                                        })
+                                });
+                        let empty = candidates.is_empty().then(|| {
+                            div()
+                                .h(px(48.0))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .text_size(px(12.5))
+                                .text_color(theme.muted_foreground)
+                                .child(language.text("没有匹配的笔记", "No matching notes"))
+                        });
+                        let surface = div()
+                            .id("editor-note-link-picker")
+                            .w(px(NOTE_LINK_PICKER_WIDTH))
+                            .max_h(px(SLASH_MENU_MAX_HEIGHT + 40.0))
+                            .p_1()
+                            .rounded(px(8.0))
+                            .border_1()
+                            .border_color(theme.border)
+                            .bg(theme.popover)
+                            .text_color(theme.popover_foreground)
+                            .shadow_lg()
+                            .on_key_down(cx.listener(Self::note_link_picker_key_down))
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .child(
+                                Input::new(&self.note_link_input)
+                                    .appearance(false)
+                                    .focus_bordered(false)
+                                    .h(px(36.0))
+                                    .px_2()
+                                    .text_size(px(13.0)),
+                            )
+                            .child(
+                                div()
+                                    .id("note-link-candidates")
+                                    .max_h(px(SLASH_MENU_MAX_HEIGHT - 4.0))
+                                    .overflow_y_scroll()
+                                    .children(rows)
+                                    .children(empty),
+                            )
+                            .with_transition("editor-note-link-picker-enter")
+                            .transition_when_else(
+                                note_link_picker_visible,
+                                if note_link_picker_visible {
+                                    SLASH_MENU_ENTER_TRANSITION
+                                } else {
+                                    SLASH_MENU_EXIT_TRANSITION
+                                },
+                                EaseOutQuad,
+                                |style| style.opacity(1.0).top(px(0.0)),
+                                move |style| {
+                                    style
+                                        .opacity(0.0)
+                                        .top(if below { px(-4.0) } else { px(4.0) })
+                                },
+                            );
+                        editor.child(deferred(
+                            anchored()
+                                .snap_to_window_with_margin(px(12.0))
+                                .anchor(Corner::TopLeft)
+                                .position(anchor)
+                                .child(surface),
+                        ))
+                    },
+                )
                 .when_some(self.selection_menu_anchor(), |editor, anchor| {
                     let ask_app = app_entity.clone();
                     let bold_app = app_entity.clone();
@@ -8031,7 +8891,7 @@ struct MarkdownLinkContext {
 }
 
 fn markdown_link_context(text: &str, selection: Range<usize>) -> Option<MarkdownLinkContext> {
-    if selection.is_empty() || selection.end > text.chars().count() {
+    if selection.end > text.chars().count() {
         return None;
     }
     let chars = text.chars().collect::<Vec<_>>();
@@ -8084,6 +8944,50 @@ fn normalize_markdown_link_destination(value: &str) -> String {
     } else {
         format!("https://{value}")
     }
+}
+
+fn internal_note_destination(destination: &str) -> Option<PathBuf> {
+    let destination = destination.trim();
+    if destination.is_empty()
+        || destination.starts_with('#')
+        || destination.starts_with('/')
+        || destination.starts_with('\\')
+        || destination.contains("://")
+        || destination
+            .split(['/', '\\', '?', '#'])
+            .next()
+            .is_some_and(|prefix| prefix.contains(':'))
+    {
+        return None;
+    }
+    let path = destination.split(['?', '#']).next()?.trim();
+    let decoded = percent_decode_path(path).ok()?;
+    let mut relative = PathBuf::new();
+    for component in Path::new(&decoded).components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(part) => relative.push(part),
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    if relative.as_os_str().is_empty() {
+        return None;
+    }
+    if relative.extension().is_none() {
+        relative.set_extension("md");
+    }
+    Some(relative)
+}
+
+fn linked_vault_note(destination: &str, entries: &[VaultEntry]) -> Option<PathBuf> {
+    let relative_path = internal_note_destination(destination)?;
+    entries
+        .iter()
+        .any(|entry| {
+            entry.kind == VaultEntryKind::Note
+                && entry.relative_path.as_path() == relative_path.as_path()
+        })
+        .then_some(relative_path)
 }
 
 fn clipboard_image_timestamp() -> u128 {
@@ -8292,6 +9196,8 @@ fn main() {
                 KeyBinding::new("ctrl-alt-c", ToggleCodeBlock, Some("SynapseEditor")),
                 KeyBinding::new("enter", InsertNewline, Some("SynapseEditor")),
                 KeyBinding::new("shift-enter", InsertRawNewline, Some("SynapseEditor")),
+                KeyBinding::new("tab", AcceptSlashCommand, Some("SynapseEditor")),
+                KeyBinding::new("escape", DismissSlashMenu, Some("SynapseEditor")),
             ]);
 
             let bounds = Bounds::centered(None, default_window_size(), cx);
@@ -8354,6 +9260,10 @@ fn main() {
                                 "What should AI do with this selection?",
                             ))
                             .clean_on_escape()
+                    });
+                    let note_link_input = cx.new(|cx| {
+                        InputState::new(window, cx)
+                            .placeholder(language.text("链接到笔记…", "Link to note…"))
                     });
                     let editor_line_layouts = Rc::new(RefCell::new(Vec::new()));
                     let editor_list_state = ListState::new(0, ListAlignment::Top, px(320.0));
@@ -8475,6 +9385,30 @@ fn main() {
                                     }
                                 },
                             ),
+                            cx.subscribe_in(
+                                &note_link_input,
+                                window,
+                                |this: &mut SynapseApp, _, event: &InputEvent, window, cx| {
+                                    match event {
+                                        InputEvent::Change => {
+                                            if let Some(picker) = this.note_link_picker.as_mut() {
+                                                picker.selected = 0;
+                                            }
+                                            cx.notify();
+                                        }
+                                        InputEvent::PressEnter { secondary: false } => {
+                                            if let Some(index) = this
+                                                .note_link_picker
+                                                .as_ref()
+                                                .map(|picker| picker.selected)
+                                            {
+                                                this.choose_note_link(index, window, cx);
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                },
+                            ),
                         ];
                         SynapseApp {
                             state,
@@ -8501,6 +9435,7 @@ fn main() {
                             bookmark_edit_input,
                             selection_link_input,
                             selection_ask_input,
+                            note_link_input,
                             bookmark_workspace,
                             bookmark_tag_editor_open: false,
                             bookmark_query_error: None,
@@ -8537,6 +9472,13 @@ fn main() {
                             editor_marked_range: None,
                             editor_selection: EditorSelection::collapsed(0),
                             selection_menu_mode: SelectionMenuMode::Formatting,
+                            slash_menu: None,
+                            note_link_picker: None,
+                            slash_menu_visible: false,
+                            note_link_picker_visible: false,
+                            slash_menu_generation: 0,
+                            note_link_picker_generation: 0,
+                            slash_menu_scroll: ScrollHandle::new(),
                             editor_line_layouts: editor_line_layouts.clone(),
                             editor_list_state: editor_list_state.clone(),
                             editor_visible_range: 0..0,
@@ -8612,25 +9554,26 @@ mod tests {
         SETTINGS_WINDOW_MIN_HEIGHT, SETTINGS_WINDOW_MIN_WIDTH, SIDEBAR_FOOTER_HEIGHT,
         SIDEBAR_SEARCH_CONTENT_WIDTH, SIDEBAR_SEARCH_INNER_PADDING, SIDEBAR_SEARCH_OUTER_MARGIN,
         SIDEBAR_SHORTCUT_ACTION_WIDTH, SIDEBAR_TREE_FONT_FAMILY, SIDEBAR_TREE_FONT_SIZE,
-        SIDEBAR_TREE_ROW_HEIGHT, TABLE_CELL_HORIZONTAL_PADDING, TABLE_CELL_VERTICAL_PADDING,
-        TABLE_FONT_SIZE, TABLE_ROW_MIN_HEIGHT, TITLEBAR_HEIGHT, TODO_AUTO_CLEAR_COMPLETED_HOLD,
-        TODO_AUTO_CLEAR_EXIT, TODO_AUTO_CLEAR_EXIT_OFFSET, ThemePreference, TreeTarget,
-        active_document_outline_index, build_document_outline, build_file_tree_rows,
-        build_image_previews, build_math_previews, build_mermaid_previews, changed_line_span,
-        clipboard_image_extension, code_block_edges, command_palette_key_bindings,
-        default_window_size, document_outline_horizontal_layout, document_outline_is_visible,
-        document_outline_layout, editor_backtick_key_bindings, editor_horizontal_gutter,
-        editor_page_content_width, fenced_code_block_edit, file_manager_reveal_command,
-        inline_format_edit, inline_format_is_active, is_tab_context_trigger,
+        SIDEBAR_TREE_ROW_HEIGHT, SLASH_MENU_ENTER_TRANSITION, SLASH_MENU_EXIT_TRANSITION,
+        SLASH_MENU_REVEAL_DELAY, SlashCommand, TABLE_CELL_HORIZONTAL_PADDING,
+        TABLE_CELL_VERTICAL_PADDING, TABLE_FONT_SIZE, TABLE_ROW_MIN_HEIGHT, TITLEBAR_HEIGHT,
+        TODO_AUTO_CLEAR_COMPLETED_HOLD, TODO_AUTO_CLEAR_EXIT, TODO_AUTO_CLEAR_EXIT_OFFSET,
+        ThemePreference, TreeTarget, active_document_outline_index, build_document_outline,
+        build_file_tree_rows, build_image_previews, build_math_previews, build_mermaid_previews,
+        changed_line_span, clipboard_image_extension, code_block_edges,
+        command_palette_key_bindings, default_window_size, document_outline_horizontal_layout,
+        document_outline_is_visible, document_outline_layout, editor_backtick_key_bindings,
+        editor_horizontal_gutter, editor_page_content_width, fenced_code_block_edit,
+        file_manager_reveal_command, filtered_slash_commands, inline_format_edit,
+        inline_format_is_active, is_tab_context_trigger, linked_vault_note,
         markd_panel_spring_progress, markdown_link_context, normalize_clipboard_text,
-        normalize_markdown_link_destination, note_breadcrumb_parts, parse_boolean_preference,
-        persist_clipboard_image, resolve_markdown_image, select_startup_vault_path,
-        settings_language_indicator_left, settings_spring_progress, settings_theme_indicator_left,
-        settings_titlebar_options, settings_window_options, source_lines_from_buffer,
-        synapse_mermaid_theme, synapse_theme_palette, synapse_titlebar_options,
-        titlebar_left_inset,
+        normalize_markdown_link_destination, note_breadcrumb_parts, note_link_candidates,
+        parse_boolean_preference, persist_clipboard_image, resolve_markdown_image,
+        select_startup_vault_path, settings_language_indicator_left, settings_spring_progress,
+        settings_theme_indicator_left, settings_titlebar_options, settings_window_options,
+        source_lines_from_buffer, synapse_mermaid_theme, synapse_theme_palette,
+        synapse_titlebar_options, titlebar_left_inset,
     };
-
     fn sfnt_table<'a>(font: &'a [u8], tag: &[u8; 4]) -> Option<&'a [u8]> {
         let table_count = usize::from(u16::from_be_bytes(font.get(4..6)?.try_into().ok()?));
         for index in 0..table_count {
@@ -8787,6 +9730,40 @@ mod tests {
             normalize_markdown_link_destination("../other.md"),
             "../other.md"
         );
+    }
+
+    #[test]
+    fn rendered_internal_note_links_resolve_only_to_existing_vault_notes() {
+        let entries = vec![VaultEntry {
+            relative_path: PathBuf::from("产品规划/需求文档.md"),
+            name: "需求文档".to_owned(),
+            kind: VaultEntryKind::Note,
+        }];
+        let source = "参见 [需求文档](%E4%BA%A7%E5%93%81%E8%A7%84%E5%88%92/%E9%9C%80%E6%B1%82%E6%96%87%E6%A1%A3.md)";
+        let link = markdown_link_context(source, 4..4).expect("cursor is inside link label");
+
+        assert_eq!(
+            linked_vault_note(&link.destination, &entries),
+            Some(PathBuf::from("产品规划/需求文档.md"))
+        );
+        assert_eq!(
+            linked_vault_note("产品规划/需求文档", &entries),
+            Some(entries[0].relative_path.clone())
+        );
+        assert_eq!(
+            linked_vault_note("https://example.com/note.md", &entries),
+            None
+        );
+        assert_eq!(linked_vault_note("../需求文档.md", &entries), None);
+        assert_eq!(linked_vault_note("不存在.md", &entries), None);
+    }
+
+    #[test]
+    fn slash_surfaces_use_a_shorter_exit_transition() {
+        assert_eq!(SLASH_MENU_REVEAL_DELAY, Duration::from_millis(16));
+        assert_eq!(SLASH_MENU_ENTER_TRANSITION, Duration::from_millis(120));
+        assert_eq!(SLASH_MENU_EXIT_TRANSITION, Duration::from_millis(100));
+        assert!(SLASH_MENU_EXIT_TRANSITION < SLASH_MENU_ENTER_TRANSITION);
     }
 
     #[test]
@@ -9592,5 +10569,47 @@ mod tests {
                 .contains("folder")
         );
         assert!(note.copy(AppLanguage::English).description.contains("note"));
+    }
+
+    #[test]
+    fn slash_menu_filters_localized_labels_and_reference_keywords() {
+        assert_eq!(
+            filtered_slash_commands("一级", AppLanguage::SimplifiedChinese, true),
+            vec![SlashCommand::Heading1]
+        );
+        assert_eq!(
+            filtered_slash_commands("ordered", AppLanguage::English, true),
+            vec![SlashCommand::BulletList, SlashCommand::OrderedList]
+        );
+        assert!(
+            !filtered_slash_commands("", AppLanguage::English, false)
+                .contains(&SlashCommand::NoteLink)
+        );
+    }
+
+    #[test]
+    fn note_link_picker_searches_paths_and_excludes_the_current_note() {
+        let entries = vec![
+            VaultEntry {
+                relative_path: PathBuf::from("产品/规划.md"),
+                name: "规划".to_owned(),
+                kind: VaultEntryKind::Note,
+            },
+            VaultEntry {
+                relative_path: PathBuf::from("产品/当前.md"),
+                name: "当前".to_owned(),
+                kind: VaultEntryKind::Note,
+            },
+            VaultEntry {
+                relative_path: PathBuf::from("产品/归档"),
+                name: "归档".to_owned(),
+                kind: VaultEntryKind::Directory,
+            },
+        ];
+
+        let candidates = note_link_candidates(&entries, Some(Path::new("产品/当前.md")), "规划");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].title, "规划");
+        assert_eq!(candidates[0].folder.as_deref(), Some("产品"));
     }
 }

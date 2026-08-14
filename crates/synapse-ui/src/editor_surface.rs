@@ -2499,6 +2499,7 @@ impl EntityInputHandler for SynapseApp {
             self.sync_writ_render_buffer(previous_revision, range_for_cache, text);
             self.editor_marked_range = None;
             self.editor_selection.collapse(self.state.cursor());
+            self.refresh_slash_menu(cx);
             self.restart_editor_cursor_blink(cx);
             cx.notify();
         }
@@ -2541,6 +2542,7 @@ impl EntityInputHandler for SynapseApp {
                 .set_cursor(start + utf16_offset_to_char(new_text, selection.end));
         }
         self.editor_selection.collapse(self.state.cursor());
+        self.refresh_slash_menu(cx);
         self.restart_editor_cursor_blink(cx);
         cx.notify();
     }
