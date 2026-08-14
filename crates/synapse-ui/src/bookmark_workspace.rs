@@ -20,7 +20,7 @@ use gpui_component::{
 use super::todo_workspace::{
     TAG_PILL_TRANSITION, TAG_ROW_GAP, TAG_ROW_HEIGHT, TagPillSpring, tag_color,
 };
-use super::{Icon, SynapseApp, SynapseThemePalette};
+use super::{AppLanguage, Icon, SynapseApp, SynapseThemePalette};
 
 const CONTENT_MAX_WIDTH: f32 = 940.0;
 const TAG_COLUMN_WIDTH: f32 = 168.0;
@@ -83,6 +83,7 @@ pub(super) struct BookmarkWorkspaceRenderState<'a> {
     pub(super) edit_error: Option<&'a str>,
     pub(super) fetching_ids: &'a std::collections::BTreeSet<u64>,
     pub(super) theme: SynapseThemePalette,
+    pub(super) language: AppLanguage,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -97,15 +98,25 @@ pub(super) enum BookmarkInputError {
 }
 
 impl BookmarkInputError {
-    pub(super) fn message(self) -> &'static str {
+    pub(super) fn message(self, language: AppLanguage) -> &'static str {
         match self {
-            Self::Empty => "链接不能为空",
-            Self::InvalidUrl => "请输入有效的 HTTP 或 HTTPS 链接",
-            Self::Duplicate => "这个链接已经保存为书签",
-            Self::EmptyTitle => "书签标题不能为空",
-            Self::EmptyTag => "标签名称不能为空",
-            Self::DuplicateTag => "已经存在同名标签",
-            Self::TagTooLong => "标签名称不能超过 48 个字符",
+            Self::Empty => language.text("链接不能为空", "Link cannot be empty"),
+            Self::InvalidUrl => language.text(
+                "请输入有效的 HTTP 或 HTTPS 链接",
+                "Enter a valid HTTP or HTTPS link",
+            ),
+            Self::Duplicate => {
+                language.text("这个链接已经保存为书签", "This link is already bookmarked")
+            }
+            Self::EmptyTitle => language.text("书签标题不能为空", "Bookmark title cannot be empty"),
+            Self::EmptyTag => language.text("标签名称不能为空", "Tag name cannot be empty"),
+            Self::DuplicateTag => {
+                language.text("已经存在同名标签", "A tag with this name already exists")
+            }
+            Self::TagTooLong => language.text(
+                "标签名称不能超过 48 个字符",
+                "Tag name cannot exceed 48 characters",
+            ),
         }
     }
 }
@@ -865,6 +876,7 @@ pub(super) fn render_bookmark_workspace(
         edit_error,
         fetching_ids,
         theme,
+        language,
     } = render_state;
     let app = cx.entity();
     let query = query_input.read(cx).value().to_string();
@@ -921,7 +933,7 @@ pub(super) fn render_bookmark_workspace(
                                 .pb_2()
                                 .text_size(px(11.5))
                                 .text_color(theme.muted)
-                                .child("标签"),
+                                .child(language.text("标签", "Tags")),
                         )
                         .child(
                             div()
@@ -951,10 +963,11 @@ pub(super) fn render_bookmark_workspace(
                                 .child(bookmark_filter_row(
                                     None,
                                     None,
-                                    "全部".to_owned(),
+                                    language.text("全部", "All").to_owned(),
                                     total_count,
                                     selected_tag_id.is_none(),
                                     theme,
+                                    language,
                                     app.clone(),
                                 ))
                                 .children(workspace.tags().iter().map(|tag| {
@@ -965,6 +978,7 @@ pub(super) fn render_bookmark_workspace(
                                         workspace.tag_usage_count(tag.id),
                                         selected_tag_id == Some(tag.id),
                                         theme,
+                                        language,
                                         app.clone(),
                                     )
                                 })),
@@ -978,7 +992,7 @@ pub(super) fn render_bookmark_workspace(
                                     .items_center()
                                     .text_size(px(12.0))
                                     .text_color(theme.faint)
-                                    .child("暂无标签"),
+                                    .child(language.text("暂无标签", "No tags")),
                             )
                         }),
                 )
@@ -986,12 +1000,12 @@ pub(super) fn render_bookmark_workspace(
                     div()
                         .flex_1()
                         .min_w(px(0.0))
-                        .child(
-                            div()
-                                .text_size(px(13.0))
-                                .text_color(theme.muted)
-                                .child("把链接放在这里，不必再依赖记忆。"),
-                        )
+                        .child(div().text_size(px(13.0)).text_color(theme.muted).child(
+                            language.text(
+                                "把链接放在这里，不必再依赖记忆。",
+                                "Keep links here so you don't have to remember them.",
+                            ),
+                        ))
                         .child(
                             div()
                                 .mt_4()
@@ -1016,7 +1030,7 @@ pub(super) fn render_bookmark_workspace(
                                             .flex_none()
                                             .text_size(px(11.5))
                                             .text_color(theme.faint)
-                                            .child("按 ↵ 保存"),
+                                            .child(language.text("按 ↵ 保存", "Press ↵ to save")),
                                     )
                                 }),
                         )
@@ -1054,16 +1068,39 @@ pub(super) fn render_bookmark_workspace(
                                         edit_error,
                                         fetching_ids,
                                         theme,
+                                        language,
                                         app.clone(),
                                     )
                                 }))
                                 .when(visible.is_empty(), |list| {
                                     let message = if workspace.total_count() == 0 {
-                                        "在上方粘贴链接即可保存。".to_owned()
+                                        language
+                                            .text(
+                                                "在上方粘贴链接即可保存。",
+                                                "Paste a link above to save it.",
+                                            )
+                                            .to_owned()
                                     } else if let Some(tag) = selected_tag_name.as_deref() {
-                                        format!("没有带有 #{tag} 标签的书签。")
+                                        match language {
+                                            AppLanguage::SimplifiedChinese => {
+                                                format!("没有带有 #{tag} 标签的书签。")
+                                            }
+                                            AppLanguage::English => {
+                                                format!("No bookmarks tagged #{tag}.")
+                                            }
+                                        }
                                     } else {
-                                        format!("没有匹配“{}”的书签。", query_trimmed)
+                                        match language {
+                                            AppLanguage::SimplifiedChinese => {
+                                                format!("没有匹配“{}”的书签。", query_trimmed)
+                                            }
+                                            AppLanguage::English => {
+                                                format!(
+                                                    "No bookmarks matching \"{}\".",
+                                                    query_trimmed
+                                                )
+                                            }
+                                        }
                                     };
                                     list.child(
                                         div()
@@ -1143,7 +1180,10 @@ pub(super) fn render_bookmark_workspace(
                             .py_2()
                             .text_size(px(12.0))
                             .text_color(theme.faint)
-                            .child("还没有标签，请先从顶部新建标签。"),
+                            .child(language.text(
+                                "还没有标签，请先从顶部新建标签。",
+                                "No tags yet. Create one from the toolbar first.",
+                            )),
                     )
                 });
             content.child(deferred(
@@ -1157,6 +1197,7 @@ pub(super) fn render_bookmark_workspace(
         .into_any_element()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn bookmark_filter_row(
     tag_id: Option<u64>,
     color_index: Option<usize>,
@@ -1164,6 +1205,7 @@ fn bookmark_filter_row(
     count: usize,
     selected: bool,
     theme: SynapseThemePalette,
+    language: AppLanguage,
     app: Entity<SynapseApp>,
 ) -> AnyElement {
     let delete_app = app.clone();
@@ -1248,7 +1290,7 @@ fn bookmark_filter_row(
                     .opacity(0.0)
                     .invisible()
                     .group_hover(hover_group, |button| button.visible().opacity(1.0))
-                    .tooltip("删除标签")
+                    .tooltip(language.text("删除标签", "Delete tag"))
                     .child(Icon::Close.render(12.0).text_color(theme.faint))
                     .on_click(move |_, _, cx| {
                         cx.stop_propagation();
@@ -1270,6 +1312,7 @@ fn render_bookmark_row(
     edit_error: Option<&str>,
     fetching_ids: &std::collections::BTreeSet<u64>,
     theme: SynapseThemePalette,
+    language: AppLanguage,
     app: Entity<SynapseApp>,
 ) -> AnyElement {
     let id = bookmark.id;
@@ -1418,7 +1461,7 @@ fn render_bookmark_row(
                         .ghost()
                         .size(px(40.0))
                         .p_0()
-                        .tooltip("分配标签")
+                        .tooltip(language.text("分配标签", "Assign tags"))
                         .child(Icon::Tag.render(14.0).text_color(theme.muted))
                         .on_click(move |event, _, cx| {
                             cx.stop_propagation();
@@ -1434,7 +1477,7 @@ fn render_bookmark_row(
                         .ghost()
                         .size(px(40.0))
                         .p_0()
-                        .tooltip("复制链接")
+                        .tooltip(language.text("复制链接", "Copy link"))
                         .child(Icon::Copy.render(14.0).text_color(theme.muted))
                         .on_click(move |_, _, cx| {
                             cx.stop_propagation();
@@ -1448,7 +1491,7 @@ fn render_bookmark_row(
                         .ghost()
                         .size(px(40.0))
                         .p_0()
-                        .tooltip("删除书签")
+                        .tooltip(language.text("删除书签", "Delete bookmark"))
                         .child(Icon::Close.render(14.0).text_color(theme.muted))
                         .on_click(move |_, _, cx| {
                             cx.stop_propagation();
@@ -1516,6 +1559,7 @@ pub(super) fn render_bookmark_quick_picker(
     workspace: &BookmarkWorkspace,
     expanded: bool,
     theme: SynapseThemePalette,
+    language: AppLanguage,
     cx: &mut Context<SynapseApp>,
 ) -> AnyElement {
     let app = cx.entity();
@@ -1546,7 +1590,7 @@ pub(super) fn render_bookmark_quick_picker(
                             .py_2()
                             .text_size(px(11.5))
                             .text_color(theme.faint)
-                            .child("还没有书签"),
+                            .child(language.text("还没有书签", "No bookmarks")),
                     )
                 })
                 .children(bookmarks.into_iter().map(|bookmark| {

@@ -16,7 +16,7 @@ use gpui_component::InteractiveElementExt;
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputState};
 
-use super::{Icon, SynapseApp, SynapseThemePalette};
+use super::{AppLanguage, Icon, SynapseApp, SynapseThemePalette};
 
 const CONTENT_MAX_WIDTH: f32 = 900.0;
 const TAG_COLUMN_WIDTH: f32 = 168.0;
@@ -103,6 +103,9 @@ pub(super) struct TodoWorkspaceRenderState<'a> {
     pub(super) todo_editing_id: Option<u64>,
     pub(super) todo_edit_error: Option<&'a str>,
     pub(super) theme: SynapseThemePalette,
+    pub(super) language: AppLanguage,
+    pub(super) auto_clear_pending: &'a std::collections::BTreeSet<u64>,
+    pub(super) auto_clear_exiting: &'a std::collections::BTreeSet<u64>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -112,6 +115,13 @@ pub(super) struct TodoWorkspace {
     selected_tag_id: Option<u64>,
     next_tag_id: u64,
     next_todo_id: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum TodoToggleOutcome {
+    Missing,
+    Updated,
+    Removed,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -128,20 +138,28 @@ pub(super) enum TodoTextError {
 }
 
 impl TodoTextError {
-    pub(super) fn message(self) -> &'static str {
+    pub(super) fn message(self, language: AppLanguage) -> &'static str {
         match self {
-            Self::Empty => "待办内容不能为空",
-            Self::TooLong => "待办内容不能超过 500 个字符",
+            Self::Empty => language.text("待办内容不能为空", "Todo text cannot be empty"),
+            Self::TooLong => language.text(
+                "待办内容不能超过 500 个字符",
+                "Todo text cannot exceed 500 characters",
+            ),
         }
     }
 }
 
 impl AddTodoTagError {
-    pub(super) fn message(self) -> &'static str {
+    pub(super) fn message(self, language: AppLanguage) -> &'static str {
         match self {
-            Self::Empty => "标签名称不能为空",
-            Self::Duplicate => "已经存在同名标签",
-            Self::TooLong => "标签名称不能超过 48 个字符",
+            Self::Empty => language.text("标签名称不能为空", "Tag name cannot be empty"),
+            Self::Duplicate => {
+                language.text("已经存在同名标签", "A tag with this name already exists")
+            }
+            Self::TooLong => language.text(
+                "标签名称不能超过 48 个字符",
+                "Tag name cannot exceed 48 characters",
+            ),
         }
     }
 }
@@ -253,12 +271,33 @@ impl TodoWorkspace {
             .map(|todo| todo.text.clone())
     }
 
+    pub(super) fn todo_is_done(&self, todo_id: u64) -> Option<bool> {
+        self.todos
+            .iter()
+            .find(|todo| todo.id == todo_id)
+            .map(|todo| todo.done)
+    }
+
+    #[cfg(test)]
     pub(super) fn toggle_todo(&mut self, todo_id: u64) -> bool {
-        let Some(todo) = self.todos.iter_mut().find(|todo| todo.id == todo_id) else {
-            return false;
+        self.toggle_todo_with_auto_clear(todo_id, false) == TodoToggleOutcome::Updated
+    }
+
+    pub(super) fn toggle_todo_with_auto_clear(
+        &mut self,
+        todo_id: u64,
+        auto_clear_completed: bool,
+    ) -> TodoToggleOutcome {
+        let Some(index) = self.todos.iter().position(|todo| todo.id == todo_id) else {
+            return TodoToggleOutcome::Missing;
         };
-        todo.done = !todo.done;
-        true
+        if auto_clear_completed && !self.todos[index].done {
+            self.todos.remove(index);
+            TodoToggleOutcome::Removed
+        } else {
+            self.todos[index].done = !self.todos[index].done;
+            TodoToggleOutcome::Updated
+        }
     }
 
     pub(super) fn toggle_todo_tag(&mut self, todo_id: u64, tag_id: u64) -> bool {
@@ -592,6 +631,9 @@ pub(super) fn render_todo_workspace(
         todo_editing_id,
         todo_edit_error,
         theme,
+        language,
+        auto_clear_pending,
+        auto_clear_exiting,
     } = render_state;
     let app = cx.entity();
     let selected_tag_id = workspace.selected_tag_id();
@@ -656,7 +698,7 @@ pub(super) fn render_todo_workspace(
                                 .pb_2()
                                 .text_size(px(11.5))
                                 .text_color(theme.muted)
-                                .child("标签"),
+                                .child(language.text("标签", "Tags")),
                         )
                         .child(
                             div()
@@ -710,7 +752,7 @@ pub(super) fn render_todo_workspace(
                                                         .border_1()
                                                         .border_color(theme.muted),
                                                 )
-                                                .child(div().flex_1().text_left().child("全部"))
+                                                .child(div().flex_1().text_left().child(language.text("全部", "All")))
                                                 .child(
                                                     div()
                                                         .w(px(28.0))
@@ -833,7 +875,7 @@ pub(super) fn render_todo_workspace(
                                             .group_hover(hover_group, |button| {
                                                 button.visible().opacity(1.0)
                                             })
-                                            .tooltip("删除标签")
+                                            .tooltip(language.text("删除标签", "Delete tag"))
                                             .child(
                                                 Icon::Close
                                                     .render(12.0)
@@ -857,7 +899,7 @@ pub(super) fn render_todo_workspace(
                                     .items_center()
                                     .text_size(px(12.0))
                                     .text_color(theme.faint)
-                                    .child("暂无标签"),
+                                    .child(language.text("暂无标签", "No tags")),
                             )
                         }),
                 )
@@ -879,7 +921,10 @@ pub(super) fn render_todo_workspace(
                                         .min_w(px(0.0))
                                         .text_size(px(13.0))
                                         .text_color(theme.muted)
-                                        .child("把那些总会完成的事情先记在这里。"),
+                                        .child(language.text(
+                                            "把那些总会完成的事情先记在这里。",
+                                            "Keep the things you'll eventually finish here.",
+                                        )),
                                 )
                                 .when(completed_count > 0, |header| {
                                     header.child(
@@ -892,9 +937,14 @@ pub(super) fn render_todo_workspace(
                                                 div()
                                                     .text_size(px(12.0))
                                                     .text_color(theme.faint)
-                                                    .child(format!(
-                                                        "清除已完成 · {completed_count}"
-                                                    )),
+                                                    .child(match language {
+                                                        AppLanguage::SimplifiedChinese => format!(
+                                                            "清除已完成 · {completed_count}"
+                                                        ),
+                                                        AppLanguage::English => format!(
+                                                            "Clear completed · {completed_count}"
+                                                        ),
+                                                    }),
                                             )
                                             .on_click(move |_, _, cx| {
                                                 clear_completed_app.update(cx, |this, cx| {
@@ -971,15 +1021,33 @@ pub(super) fn render_todo_workspace(
                             let picker_open = tag_picker
                                 .is_some_and(|picker| picker.todo_id == todo_id);
                             let editing = todo_editing_id == Some(todo_id);
+                            let auto_clear_pending = auto_clear_pending.contains(&todo_id);
+                            let auto_clear_exiting = auto_clear_exiting.contains(&todo_id);
                             let hover_group = SharedString::from(format!("todo-row-{todo_id}"));
                             div()
                                 .id(SharedString::from(format!("todo-row-{todo_id}")))
+                                .relative()
                                 .group(hover_group.clone())
                                 .min_h(px(64.0))
                                 .px_1()
                                 .py_2()
                                 .flex()
                                 .items_start()
+                                .when(auto_clear_pending, |row| row.opacity(1.0))
+                                .with_transition(SharedString::from(format!(
+                                    "todo-auto-clear-exit-{todo_id}"
+                                )))
+                                .transition_when_else(
+                                    auto_clear_exiting,
+                                    super::TODO_AUTO_CLEAR_EXIT,
+                                    EaseOutQuad,
+                                    |style| {
+                                        style
+                                            .translate_x(px(super::TODO_AUTO_CLEAR_EXIT_OFFSET))
+                                            .opacity(0.0)
+                                    },
+                                    |style| style.translate_x(px(0.0)).opacity(1.0),
+                                )
                                 .child(
                                     Button::new(SharedString::from(format!(
                                         "todo-checkbox-{todo_id}"
@@ -1103,7 +1171,7 @@ pub(super) fn render_todo_workspace(
                                                                     .w(px(20.0))
                                                                     .h(px(20.0))
                                                                     .p_0()
-                                                                    .tooltip("取消分配标签")
+                                                                    .tooltip(language.text("取消分配标签", "Remove tag"))
                                                                     .child(
                                                                         Icon::Close
                                                                             .render(10.0)
@@ -1153,7 +1221,7 @@ pub(super) fn render_todo_workspace(
                                             .w(px(40.0))
                                             .h(px(40.0))
                                             .p_0()
-                                            .tooltip("分配标签")
+                                            .tooltip(language.text("分配标签", "Assign tags"))
                                             .child(
                                                 Icon::Tag
                                                     .render(14.0)
@@ -1180,7 +1248,7 @@ pub(super) fn render_todo_workspace(
                                             .w(px(40.0))
                                             .h(px(40.0))
                                             .p_0()
-                                            .tooltip("复制")
+                                            .tooltip(language.text("复制", "Copy"))
                                             .child(
                                                 Icon::Copy
                                                     .render(14.0)
@@ -1201,7 +1269,7 @@ pub(super) fn render_todo_workspace(
                                             .w(px(40.0))
                                             .h(px(40.0))
                                             .p_0()
-                                            .tooltip("删除")
+                                            .tooltip(language.text("删除", "Delete"))
                                             .child(
                                                 Icon::Close
                                                     .render(14.0)
@@ -1225,7 +1293,7 @@ pub(super) fn render_todo_workspace(
                                     .justify_center()
                                     .text_size(px(12.0))
                                     .text_color(theme.faint)
-                                    .child("当前还没有待办事项"),
+                                    .child(language.text("当前还没有待办事项", "No todos yet")),
                             )
                         }),
                 ),
@@ -1303,7 +1371,10 @@ pub(super) fn render_todo_workspace(
                             .py_2()
                             .text_size(px(12.0))
                             .text_color(theme.faint)
-                            .child("还没有标签，请先从顶部新建标签。"),
+                            .child(language.text(
+                                "还没有标签，请先从顶部新建标签。",
+                                "No tags yet. Create one from the toolbar first.",
+                            )),
                     )
                 });
             content.child(deferred(
@@ -1323,6 +1394,8 @@ pub(super) fn render_todo_quick_picker(
     workspace: &TodoWorkspace,
     expanded: bool,
     theme: SynapseThemePalette,
+    language: AppLanguage,
+    auto_clear_exiting: &std::collections::BTreeSet<u64>,
     cx: &mut Context<SynapseApp>,
 ) -> AnyElement {
     let app = cx.entity();
@@ -1355,14 +1428,16 @@ pub(super) fn render_todo_quick_picker(
                             .text_size(px(11.5))
                             .line_height(px(16.0))
                             .text_color(theme.faint)
-                            .child("还没有待办"),
+                            .child(language.text("还没有待办", "No todos")),
                     )
                 })
                 .children(todos.into_iter().map(|todo| {
                     let todo_id = todo.id;
                     let toggle_app = app.clone();
+                    let auto_clear_exiting = auto_clear_exiting.contains(&todo_id);
                     div()
                         .id(SharedString::from(format!("quick-todo-{todo_id}")))
+                        .relative()
                         .w_full()
                         .min_h(px(TODO_QUICK_ROW_HEIGHT))
                         .flex()
@@ -1372,6 +1447,20 @@ pub(super) fn render_todo_quick_picker(
                         .py(px(4.0))
                         .cursor_pointer()
                         .hover(move |style| style.bg(theme.hover).text_color(theme.foreground))
+                        .with_transition(SharedString::from(format!(
+                            "quick-todo-auto-clear-exit-{todo_id}"
+                        )))
+                        .transition_when_else(
+                            auto_clear_exiting,
+                            super::TODO_AUTO_CLEAR_EXIT,
+                            EaseOutQuad,
+                            |style| {
+                                style
+                                    .translate_x(px(super::TODO_AUTO_CLEAR_EXIT_OFFSET))
+                                    .opacity(0.0)
+                            },
+                            |style| style.translate_x(px(0.0)).opacity(1.0),
+                        )
                         .child(
                             div()
                                 .mt(px(2.0))
@@ -1430,7 +1519,8 @@ mod tests {
 
     use super::{
         AddTodoTagError, TAG_PILL_SPRING_DAMPING, TAG_PILL_SPRING_MASS, TAG_PILL_SPRING_STIFFNESS,
-        TAG_PILL_TRANSITION, TodoTextError, TodoWorkspace, tag_pill_spring_progress,
+        TAG_PILL_TRANSITION, TodoTextError, TodoToggleOutcome, TodoWorkspace,
+        tag_pill_spring_progress,
     };
 
     #[test]
@@ -1516,6 +1606,32 @@ mod tests {
         assert!(!sidebar_todos[0].done);
         assert_eq!(sidebar_todos[1].id, first_id);
         assert!(sidebar_todos[1].done);
+    }
+
+    #[test]
+    fn auto_clear_removes_only_a_newly_completed_todo() {
+        let mut workspace = TodoWorkspace::default();
+        let todo_id = workspace.add_todo("完成后自动清理").unwrap();
+
+        assert_eq!(
+            workspace.toggle_todo_with_auto_clear(todo_id, true),
+            TodoToggleOutcome::Removed
+        );
+        assert!(!workspace.contains_todo(todo_id));
+    }
+
+    #[test]
+    fn auto_clear_keeps_legacy_completed_todos_available_for_reopening() {
+        let mut workspace = TodoWorkspace::default();
+        let todo_id = workspace.add_todo("旧的已完成待办").unwrap();
+        assert!(workspace.toggle_todo(todo_id));
+
+        assert_eq!(
+            workspace.toggle_todo_with_auto_clear(todo_id, true),
+            TodoToggleOutcome::Updated
+        );
+        assert!(workspace.contains_todo(todo_id));
+        assert!(!workspace.visible_todos()[0].done);
     }
 
     #[test]

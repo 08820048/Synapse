@@ -39,6 +39,7 @@ use gpui_component::{
     input::{Input, InputEvent, InputState},
     kbd::Kbd,
     setting::{SettingField, SettingGroup, SettingItem, SettingPage, Settings},
+    switch::Switch,
 };
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher as _};
 use synapse::{ShellState, trailing_fenced_code_block_paragraph_edit};
@@ -76,8 +77,8 @@ use icons::{Icon, SynapseAssets};
 use inline_rename::{InlineRenameEvent, InlineRenameInput};
 use math_renderer::{MathPreview, render_math_preview};
 use todo_workspace::{
-    TodoTagPicker, TodoWorkspace, TodoWorkspaceRenderState, render_todo_quick_picker,
-    render_todo_workspace,
+    TodoTagPicker, TodoToggleOutcome, TodoWorkspace, TodoWorkspaceRenderState,
+    render_todo_quick_picker, render_todo_workspace,
 };
 
 const WINDOW_DEFAULT_WIDTH: f32 = 1809.0;
@@ -99,6 +100,9 @@ const SETTINGS_THEME_TRANSITION: Duration = Duration::from_millis(260);
 const SETTINGS_SIDEBAR_WIDTH: f32 = 240.0;
 const SETTINGS_THEME_CONTROL_WIDTH: f32 = 252.0;
 const SETTINGS_THEME_CONTROL_PADDING: f32 = 4.0;
+const TODO_AUTO_CLEAR_COMPLETED_HOLD: Duration = Duration::from_millis(420);
+const TODO_AUTO_CLEAR_EXIT: Duration = Duration::from_millis(220);
+const TODO_AUTO_CLEAR_EXIT_OFFSET: f32 = 84.0;
 const SETTINGS_WINDOW_WIDTH: f32 = 1000.0;
 const SETTINGS_WINDOW_HEIGHT: f32 = 700.0;
 const SETTINGS_WINDOW_MIN_WIDTH: f32 = 760.0;
@@ -240,11 +244,11 @@ impl ThemePreference {
         }
     }
 
-    fn label(self) -> &'static str {
+    fn label(self, language: AppLanguage) -> &'static str {
         match self {
-            Self::System => "System",
-            Self::Light => "Light",
-            Self::Dark => "Dark",
+            Self::System => language.text("系统", "System"),
+            Self::Light => language.text("浅色", "Light"),
+            Self::Dark => language.text("深色", "Dark"),
         }
     }
 
@@ -253,6 +257,50 @@ impl ThemePreference {
             Self::System => IconName::Palette,
             Self::Light => IconName::Sun,
             Self::Dark => IconName::Moon,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum AppLanguage {
+    #[default]
+    SimplifiedChinese,
+    English,
+}
+
+impl AppLanguage {
+    const ALL: [Self; 2] = [Self::SimplifiedChinese, Self::English];
+
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "zh-cn" | "zh_cn" | "zh" => Some(Self::SimplifiedChinese),
+            "en" | "en-us" | "en_us" => Some(Self::English),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::SimplifiedChinese => "zh-CN",
+            Self::English => "en",
+        }
+    }
+
+    pub(crate) fn text(
+        self,
+        simplified_chinese: &'static str,
+        english: &'static str,
+    ) -> &'static str {
+        match self {
+            Self::SimplifiedChinese => simplified_chinese,
+            Self::English => english,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::SimplifiedChinese => "简体中文",
+            Self::English => "English",
         }
     }
 }
@@ -420,6 +468,14 @@ fn theme_preference_path() -> Option<PathBuf> {
     synapse_config_directory().map(|directory| directory.join("theme"))
 }
 
+fn language_preference_path() -> Option<PathBuf> {
+    synapse_config_directory().map(|directory| directory.join("language"))
+}
+
+fn auto_clear_completed_todos_preference_path() -> Option<PathBuf> {
+    synapse_config_directory().map(|directory| directory.join("todo-auto-clear-completed"))
+}
+
 fn vault_preference_path() -> Option<PathBuf> {
     synapse_config_directory().map(|directory| directory.join("vault"))
 }
@@ -526,6 +582,16 @@ fn settings_theme_indicator_left(preference: ThemePreference) -> f32 {
             }
 }
 
+fn settings_language_indicator_left(language: AppLanguage) -> f32 {
+    let segment_width = (SETTINGS_THEME_CONTROL_WIDTH - SETTINGS_THEME_CONTROL_PADDING * 2.0) / 2.0;
+    SETTINGS_THEME_CONTROL_PADDING
+        + segment_width
+            * match language {
+                AppLanguage::SimplifiedChinese => 0.0,
+                AppLanguage::English => 1.0,
+            }
+}
+
 fn settings_spring_progress(progress: f32) -> f32 {
     let stiffness = 420.0_f32;
     let damping = 40.0_f32;
@@ -564,6 +630,46 @@ fn save_theme_preference(preference: ThemePreference) -> io::Result<()> {
         fs::create_dir_all(parent)?;
     }
     fs::write(path, format!("{}\n", preference.as_str()))
+}
+
+fn load_language_preference() -> AppLanguage {
+    language_preference_path()
+        .and_then(|path| fs::read_to_string(path).ok())
+        .and_then(|value| AppLanguage::parse(&value))
+        .unwrap_or_default()
+}
+
+fn save_language_preference(language: AppLanguage) -> io::Result<()> {
+    let path = language_preference_path()
+        .ok_or_else(|| io::Error::other("unable to locate the user configuration directory"))?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, format!("{}\n", language.as_str()))
+}
+
+fn parse_boolean_preference(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "on" => Some(true),
+        "false" | "0" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+fn load_auto_clear_completed_todos_preference() -> bool {
+    auto_clear_completed_todos_preference_path()
+        .and_then(|path| fs::read_to_string(path).ok())
+        .and_then(|value| parse_boolean_preference(&value))
+        .unwrap_or(false)
+}
+
+fn save_auto_clear_completed_todos_preference(enabled: bool) -> io::Result<()> {
+    let path = auto_clear_completed_todos_preference_path()
+        .ok_or_else(|| io::Error::other("unable to locate the user configuration directory"))?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, if enabled { "true\n" } else { "false\n" })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -755,6 +861,10 @@ struct SynapseApp {
     todo_edit_error: Option<String>,
     todo_tag_picker: Option<TodoTagPicker>,
     todo_quick_open: bool,
+    todo_auto_clear_pending: BTreeSet<u64>,
+    todo_auto_clear_exiting: BTreeSet<u64>,
+    todo_auto_clear_generations: BTreeMap<u64, u64>,
+    todo_auto_clear_generation: u64,
     bookmark_query_input: Entity<InputState>,
     bookmark_tag_input: Entity<InputState>,
     bookmark_edit_input: Entity<InputState>,
@@ -775,6 +885,10 @@ struct SynapseApp {
     _input_subscriptions: Vec<Subscription>,
     theme_preference: ThemePreference,
     theme_persistence_error: Option<String>,
+    language: AppLanguage,
+    language_persistence_error: Option<String>,
+    auto_clear_completed_todos: bool,
+    todo_preference_persistence_error: Option<String>,
     vault_persistence_error: Option<String>,
     settings_window: Option<AnyWindowHandle>,
     settings_window_opening: bool,
@@ -1285,24 +1399,36 @@ impl SynapseApp {
         let input = self.bookmark_query_input.read(cx).value().to_string();
         if !is_bookmark_url_candidate(&input) {
             if input.contains("://") {
-                self.bookmark_query_error = Some("请输入有效的 HTTP 或 HTTPS 链接".to_owned());
+                self.bookmark_query_error = Some(
+                    self.language
+                        .text(
+                            "请输入有效的 HTTP 或 HTTPS 链接",
+                            "Enter a valid HTTP or HTTPS link",
+                        )
+                        .to_owned(),
+                );
                 cx.notify();
             }
             return;
         }
         match self.bookmark_workspace.add_bookmark(&input) {
             Ok(bookmark_id) => {
-                self.bookmark_query_error = self
-                    .bookmark_workspace
-                    .save_default()
-                    .err()
-                    .map(|error| format!("书签已添加，但无法保存：{error}"));
+                self.bookmark_query_error =
+                    self.bookmark_workspace.save_default().err().map(|error| {
+                        format!(
+                            "{}: {error}",
+                            self.language.text(
+                                "书签已添加，但无法保存",
+                                "Bookmark added but could not be saved"
+                            )
+                        )
+                    });
                 self.bookmark_query_input.update(cx, |input, cx| {
                     input.set_value("", window, cx);
                 });
                 self.fetch_bookmark_metadata(bookmark_id, cx);
             }
-            Err(error) => self.bookmark_query_error = Some(error.message().to_owned()),
+            Err(error) => self.bookmark_query_error = Some(error.message(self.language).to_owned()),
         }
         window.focus(&self.bookmark_query_input.focus_handle(cx));
         cx.notify();
@@ -1337,7 +1463,13 @@ impl SynapseApp {
                     }
                 }
                 if let Err(error) = this.bookmark_workspace.save_default() {
-                    this.bookmark_query_error = Some(format!("元数据已更新，但无法保存：{error}"));
+                    this.bookmark_query_error = Some(format!(
+                        "{}: {error}",
+                        this.language.text(
+                            "元数据已更新，但无法保存",
+                            "Metadata updated but could not be saved"
+                        )
+                    ));
                 }
                 cx.notify();
             });
@@ -1369,17 +1501,20 @@ impl SynapseApp {
         match self.bookmark_workspace.add_tag(&name) {
             Ok(_) => {
                 self.bookmark_tag_editor_open = false;
-                self.bookmark_tag_error = self
-                    .bookmark_workspace
-                    .save_default()
-                    .err()
-                    .map(|error| format!("标签已添加，但无法保存：{error}"));
+                self.bookmark_tag_error =
+                    self.bookmark_workspace.save_default().err().map(|error| {
+                        format!(
+                            "{}: {error}",
+                            self.language
+                                .text("标签已添加，但无法保存", "Tag added but could not be saved")
+                        )
+                    });
                 self.bookmark_tag_input.update(cx, |input, cx| {
                     input.set_value("", window, cx);
                 });
             }
             Err(error) => {
-                self.bookmark_tag_error = Some(error.message().to_owned());
+                self.bookmark_tag_error = Some(error.message(self.language).to_owned());
                 window.focus(&self.bookmark_tag_input.focus_handle(cx));
             }
         }
@@ -1417,15 +1552,20 @@ impl SynapseApp {
             Ok(changed) => {
                 self.bookmark_editing_id = None;
                 if changed {
-                    self.bookmark_edit_error = self
-                        .bookmark_workspace
-                        .save_default()
-                        .err()
-                        .map(|error| format!("书签已更新，但无法保存：{error}"));
+                    self.bookmark_edit_error =
+                        self.bookmark_workspace.save_default().err().map(|error| {
+                            format!(
+                                "{}: {error}",
+                                self.language.text(
+                                    "书签已更新，但无法保存",
+                                    "Bookmark updated but could not be saved"
+                                )
+                            )
+                        });
                 }
             }
             Err(error) => {
-                self.bookmark_edit_error = Some(error.message().to_owned());
+                self.bookmark_edit_error = Some(error.message(self.language).to_owned());
                 window.focus(&self.bookmark_edit_input.focus_handle(cx));
             }
         }
@@ -1467,22 +1607,30 @@ impl SynapseApp {
 
     fn toggle_bookmark_tag(&mut self, bookmark_id: u64, tag_id: u64, cx: &mut Context<Self>) {
         if self.bookmark_workspace.toggle_tag(bookmark_id, tag_id) {
-            self.bookmark_query_error = self
-                .bookmark_workspace
-                .save_default()
-                .err()
-                .map(|error| format!("标签分配已更新，但无法保存：{error}"));
+            self.bookmark_query_error = self.bookmark_workspace.save_default().err().map(|error| {
+                format!(
+                    "{}: {error}",
+                    self.language.text(
+                        "标签分配已更新，但无法保存",
+                        "Tag assignment updated but could not be saved"
+                    )
+                )
+            });
             cx.notify();
         }
     }
 
     fn remove_bookmark_tag(&mut self, bookmark_id: u64, tag_id: u64, cx: &mut Context<Self>) {
         if self.bookmark_workspace.remove_tag(bookmark_id, tag_id) {
-            self.bookmark_query_error = self
-                .bookmark_workspace
-                .save_default()
-                .err()
-                .map(|error| format!("标签已取消分配，但无法保存：{error}"));
+            self.bookmark_query_error = self.bookmark_workspace.save_default().err().map(|error| {
+                format!(
+                    "{}: {error}",
+                    self.language.text(
+                        "标签已取消分配，但无法保存",
+                        "Tag removed but could not be saved"
+                    )
+                )
+            });
             cx.notify();
         }
     }
@@ -1490,11 +1638,15 @@ impl SynapseApp {
     fn delete_bookmark_tag(&mut self, tag_id: u64, cx: &mut Context<Self>) {
         if self.bookmark_workspace.delete_tag(tag_id) {
             self.bookmark_tag_picker = None;
-            self.bookmark_tag_error = self
-                .bookmark_workspace
-                .save_default()
-                .err()
-                .map(|error| format!("标签已删除，但无法保存：{error}"));
+            self.bookmark_tag_error = self.bookmark_workspace.save_default().err().map(|error| {
+                format!(
+                    "{}: {error}",
+                    self.language.text(
+                        "标签已删除，但无法保存",
+                        "Tag deleted but could not be saved"
+                    )
+                )
+            });
             cx.notify();
         }
     }
@@ -1524,11 +1676,15 @@ impl SynapseApp {
             {
                 self.bookmark_tag_picker = None;
             }
-            self.bookmark_query_error = self
-                .bookmark_workspace
-                .save_default()
-                .err()
-                .map(|error| format!("书签已删除，但无法保存：{error}"));
+            self.bookmark_query_error = self.bookmark_workspace.save_default().err().map(|error| {
+                format!(
+                    "{}: {error}",
+                    self.language.text(
+                        "书签已删除，但无法保存",
+                        "Bookmark deleted but could not be saved"
+                    )
+                )
+            });
             cx.notify();
         }
     }
@@ -1547,8 +1703,14 @@ impl SynapseApp {
             Ok(Ok(Some(path))) => {
                 if let Err(error) = fs::write(&path, markdown) {
                     let _ = this.update(cx, |this, cx| {
-                        this.bookmark_query_error =
-                            Some(format!("无法导出书签到 {}：{error}", path.display()));
+                        this.bookmark_query_error = Some(match this.language {
+                            AppLanguage::SimplifiedChinese => {
+                                format!("无法导出书签到 {}：{error}", path.display())
+                            }
+                            AppLanguage::English => {
+                                format!("Could not export bookmarks to {}: {error}", path.display())
+                            }
+                        });
                         cx.notify();
                     });
                 }
@@ -1556,13 +1718,23 @@ impl SynapseApp {
             Ok(Ok(None)) => {}
             Ok(Err(error)) => {
                 let _ = this.update(cx, |this, cx| {
-                    this.bookmark_query_error = Some(format!("无法打开导出对话框：{error}"));
+                    this.bookmark_query_error = Some(format!(
+                        "{}: {error}",
+                        this.language
+                            .text("无法打开导出对话框", "Could not open the export dialog")
+                    ));
                     cx.notify();
                 });
             }
             Err(error) => {
                 let _ = this.update(cx, |this, cx| {
-                    this.bookmark_query_error = Some(format!("导出对话框意外关闭：{error}"));
+                    this.bookmark_query_error = Some(format!(
+                        "{}: {error}",
+                        this.language.text(
+                            "导出对话框意外关闭",
+                            "The export dialog closed unexpectedly"
+                        )
+                    ));
                     cx.notify();
                 });
             }
@@ -1591,17 +1763,21 @@ impl SynapseApp {
         let text = self.todo_item_input.read(cx).value().to_string();
         match self.todo_workspace.add_todo(&text) {
             Ok(_) => {
-                self.todo_item_error = self
-                    .todo_workspace
-                    .save_default()
-                    .err()
-                    .map(|error| format!("待办已添加，但无法保存：{error}"));
+                self.todo_item_error = self.todo_workspace.save_default().err().map(|error| {
+                    format!(
+                        "{}: {error}",
+                        self.language.text(
+                            "待办已添加，但无法保存",
+                            "Todo added but could not be saved"
+                        )
+                    )
+                });
                 self.todo_item_input.update(cx, |input, cx| {
                     input.set_value("", window, cx);
                 });
             }
             Err(error) => {
-                self.todo_item_error = Some(error.message().to_owned());
+                self.todo_item_error = Some(error.message(self.language).to_owned());
             }
         }
         window.focus(&self.todo_item_input.focus_handle(cx));
@@ -1609,14 +1785,7 @@ impl SynapseApp {
     }
 
     fn toggle_todo_item(&mut self, todo_id: u64, cx: &mut Context<Self>) {
-        if self.todo_workspace.toggle_todo(todo_id) {
-            self.todo_item_error = self
-                .todo_workspace
-                .save_default()
-                .err()
-                .map(|error| format!("待办状态已更新，但无法保存：{error}"));
-            cx.notify();
-        }
+        self.apply_todo_toggle(todo_id, cx);
     }
 
     fn begin_edit_todo(&mut self, todo_id: u64, window: &mut Window, cx: &mut Context<Self>) {
@@ -1641,18 +1810,22 @@ impl SynapseApp {
         match self.todo_workspace.update_todo_text(todo_id, &text) {
             Ok(true) => {
                 self.todo_editing_id = None;
-                self.todo_edit_error = self
-                    .todo_workspace
-                    .save_default()
-                    .err()
-                    .map(|error| format!("待办已更新，但无法保存：{error}"));
+                self.todo_edit_error = self.todo_workspace.save_default().err().map(|error| {
+                    format!(
+                        "{}: {error}",
+                        self.language.text(
+                            "待办已更新，但无法保存",
+                            "Todo updated but could not be saved"
+                        )
+                    )
+                });
             }
             Ok(false) => {
                 // 文本未变化或待办已不存在：直接结束编辑
                 self.todo_editing_id = None;
             }
             Err(error) => {
-                self.todo_edit_error = Some(error.message().to_owned());
+                self.todo_edit_error = Some(error.message(self.language).to_owned());
                 window.focus(&self.todo_edit_input.focus_handle(cx));
             }
         }
@@ -1699,45 +1872,152 @@ impl SynapseApp {
     }
 
     fn toggle_todo_from_quick_picker(&mut self, todo_id: u64, cx: &mut Context<Self>) {
-        if self.todo_workspace.toggle_todo(todo_id) {
-            self.todo_item_error = self
+        self.apply_todo_toggle(todo_id, cx);
+    }
+
+    fn apply_todo_toggle(&mut self, todo_id: u64, cx: &mut Context<Self>) {
+        if self.todo_auto_clear_generations.remove(&todo_id).is_some() {
+            self.todo_auto_clear_pending.remove(&todo_id);
+            self.todo_auto_clear_exiting.remove(&todo_id);
+            if self
                 .todo_workspace
-                .save_default()
-                .err()
-                .map(|error| format!("待办状态已更新，但无法保存：{error}"));
-            cx.notify();
+                .toggle_todo_with_auto_clear(todo_id, false)
+                == TodoToggleOutcome::Updated
+            {
+                self.persist_todo_toggle(cx);
+            }
+            return;
         }
+
+        let should_animate_auto_clear = self.auto_clear_completed_todos
+            && self.todo_workspace.todo_is_done(todo_id) == Some(false);
+        let outcome = self
+            .todo_workspace
+            .toggle_todo_with_auto_clear(todo_id, false);
+        if outcome == TodoToggleOutcome::Missing {
+            return;
+        }
+        self.persist_todo_toggle(cx);
+        if should_animate_auto_clear {
+            self.begin_todo_auto_clear_animation(todo_id, cx);
+        }
+    }
+
+    fn persist_todo_toggle(&mut self, cx: &mut Context<Self>) {
+        self.todo_item_error = self.todo_workspace.save_default().err().map(|error| {
+            format!(
+                "{}: {error}",
+                self.language.text(
+                    "待办状态已更新，但无法保存",
+                    "The todo changed but could not be saved"
+                )
+            )
+        });
+        cx.notify();
+    }
+
+    fn begin_todo_auto_clear_animation(&mut self, todo_id: u64, cx: &mut Context<Self>) {
+        self.todo_auto_clear_generation = self.todo_auto_clear_generation.wrapping_add(1);
+        let generation = self.todo_auto_clear_generation;
+        self.todo_auto_clear_generations.insert(todo_id, generation);
+        self.todo_auto_clear_pending.insert(todo_id);
+        self.todo_auto_clear_exiting.remove(&todo_id);
+        if self
+            .todo_tag_picker
+            .is_some_and(|picker| picker.todo_id == todo_id)
+        {
+            self.todo_tag_picker = None;
+        }
+        if self.todo_editing_id == Some(todo_id) {
+            self.todo_editing_id = None;
+        }
+
+        let executor = cx.background_executor().clone();
+        let hold_timer = executor.timer(TODO_AUTO_CLEAR_COMPLETED_HOLD);
+        cx.spawn(async move |this, cx| {
+            hold_timer.await;
+            let should_exit = this
+                .update(cx, |this, cx| {
+                    if this.todo_auto_clear_generations.get(&todo_id) != Some(&generation) {
+                        return false;
+                    }
+                    this.todo_auto_clear_pending.remove(&todo_id);
+                    this.todo_auto_clear_exiting.insert(todo_id);
+                    cx.notify();
+                    true
+                })
+                .unwrap_or(false);
+            if !should_exit {
+                return;
+            }
+
+            executor.timer(TODO_AUTO_CLEAR_EXIT).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.todo_auto_clear_generations.get(&todo_id) != Some(&generation) {
+                    return;
+                }
+                this.todo_auto_clear_generations.remove(&todo_id);
+                this.todo_auto_clear_pending.remove(&todo_id);
+                this.todo_auto_clear_exiting.remove(&todo_id);
+                if this.todo_workspace.delete_todo(todo_id) {
+                    this.todo_item_error = this.todo_workspace.save_default().err().map(|error| {
+                        format!(
+                            "{}: {error}",
+                            this.language.text(
+                                "完成的待办已移除，但无法保存",
+                                "The completed todo was removed but could not be saved"
+                            )
+                        )
+                    });
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
     }
 
     fn toggle_todo_tag_assignment(&mut self, todo_id: u64, tag_id: u64, cx: &mut Context<Self>) {
         if self.todo_workspace.toggle_todo_tag(todo_id, tag_id) {
-            self.todo_item_error = self
-                .todo_workspace
-                .save_default()
-                .err()
-                .map(|error| format!("标签分配已更新，但无法保存：{error}"));
+            self.todo_item_error = self.todo_workspace.save_default().err().map(|error| {
+                format!(
+                    "{}: {error}",
+                    self.language.text(
+                        "标签分配已更新，但无法保存",
+                        "Tag assignment updated but could not be saved"
+                    )
+                )
+            });
             cx.notify();
         }
     }
 
     fn remove_todo_tag_assignment(&mut self, todo_id: u64, tag_id: u64, cx: &mut Context<Self>) {
         if self.todo_workspace.remove_todo_tag(todo_id, tag_id) {
-            self.todo_item_error = self
-                .todo_workspace
-                .save_default()
-                .err()
-                .map(|error| format!("标签已取消分配，但无法保存：{error}"));
+            self.todo_item_error = self.todo_workspace.save_default().err().map(|error| {
+                format!(
+                    "{}: {error}",
+                    self.language.text(
+                        "标签已取消分配，但无法保存",
+                        "Tag removed but could not be saved"
+                    )
+                )
+            });
             cx.notify();
         }
     }
 
     fn delete_todo_tag(&mut self, tag_id: u64, cx: &mut Context<Self>) {
         if self.todo_workspace.delete_tag(tag_id) {
-            self.todo_tag_error = self
-                .todo_workspace
-                .save_default()
-                .err()
-                .map(|error| format!("标签已删除，但无法保存：{error}"));
+            self.todo_tag_error = self.todo_workspace.save_default().err().map(|error| {
+                format!(
+                    "{}: {error}",
+                    self.language.text(
+                        "标签已删除，但无法保存",
+                        "Tag deleted but could not be saved"
+                    )
+                )
+            });
             cx.notify();
         }
     }
@@ -1750,17 +2030,24 @@ impl SynapseApp {
 
     fn delete_todo_item(&mut self, todo_id: u64, cx: &mut Context<Self>) {
         if self.todo_workspace.delete_todo(todo_id) {
+            self.todo_auto_clear_generations.remove(&todo_id);
+            self.todo_auto_clear_pending.remove(&todo_id);
+            self.todo_auto_clear_exiting.remove(&todo_id);
             if self
                 .todo_tag_picker
                 .is_some_and(|picker| picker.todo_id == todo_id)
             {
                 self.todo_tag_picker = None;
             }
-            self.todo_item_error = self
-                .todo_workspace
-                .save_default()
-                .err()
-                .map(|error| format!("待办已删除，但无法保存：{error}"));
+            self.todo_item_error = self.todo_workspace.save_default().err().map(|error| {
+                format!(
+                    "{}: {error}",
+                    self.language.text(
+                        "待办已删除，但无法保存",
+                        "Todo deleted but could not be saved"
+                    )
+                )
+            });
             cx.notify();
         }
     }
@@ -1775,11 +2062,21 @@ impl SynapseApp {
         {
             self.todo_tag_picker = None;
         }
-        self.todo_item_error = self
-            .todo_workspace
-            .save_default()
-            .err()
-            .map(|error| format!("已清除完成项，但无法保存：{error}"));
+        self.todo_auto_clear_generations
+            .retain(|todo_id, _| self.todo_workspace.contains_todo(*todo_id));
+        self.todo_auto_clear_pending
+            .retain(|todo_id| self.todo_workspace.contains_todo(*todo_id));
+        self.todo_auto_clear_exiting
+            .retain(|todo_id| self.todo_workspace.contains_todo(*todo_id));
+        self.todo_item_error = self.todo_workspace.save_default().err().map(|error| {
+            format!(
+                "{}: {error}",
+                self.language.text(
+                    "已清除完成项，但无法保存",
+                    "Completed todos cleared but could not be saved"
+                )
+            )
+        });
         cx.notify();
     }
 
@@ -1807,17 +2104,19 @@ impl SynapseApp {
         match self.todo_workspace.add_tag(&name) {
             Ok(_) => {
                 self.todo_tag_editor_open = false;
-                self.todo_tag_error = self
-                    .todo_workspace
-                    .save_default()
-                    .err()
-                    .map(|error| format!("标签已添加，但无法保存：{error}"));
+                self.todo_tag_error = self.todo_workspace.save_default().err().map(|error| {
+                    format!(
+                        "{}: {error}",
+                        self.language
+                            .text("标签已添加，但无法保存", "Tag added but could not be saved")
+                    )
+                });
                 self.todo_tag_input.update(cx, |input, cx| {
                     input.set_value("", window, cx);
                 });
             }
             Err(error) => {
-                self.todo_tag_error = Some(error.message().to_owned());
+                self.todo_tag_error = Some(error.message(self.language).to_owned());
                 window.focus(&self.todo_tag_input.focus_handle(cx));
             }
         }
@@ -1872,6 +2171,7 @@ impl SynapseApp {
 
         let app = cx.entity();
         let preference = self.theme_preference;
+        let language = self.language;
         // `open_window` draws its first frame synchronously. Defer until this entity update has
         // unwound so the Settings view can safely read the shared SynapseApp state on that frame.
         cx.defer(move |cx| {
@@ -1880,7 +2180,7 @@ impl SynapseApp {
                 size(px(SETTINGS_WINDOW_WIDTH), px(SETTINGS_WINDOW_HEIGHT)),
                 cx,
             );
-            let result = cx.open_window(settings_window_options(bounds), {
+            let result = cx.open_window(settings_window_options(bounds, language), {
                 let app = app.clone();
                 move |window, cx| {
                     apply_synapse_theme(preference, Some(window), cx);
@@ -1913,6 +2213,80 @@ impl SynapseApp {
         self.theme_persistence_error = save_theme_preference(preference)
             .err()
             .map(|error| format!("Theme preference could not be saved: {error}"));
+        cx.notify();
+    }
+
+    fn set_language(&mut self, language: AppLanguage, window: &mut Window, cx: &mut Context<Self>) {
+        if self.language == language {
+            return;
+        }
+        self.language = language;
+        gpui_component::set_locale(language.as_str());
+        self.language_persistence_error = save_language_preference(language)
+            .err()
+            .map(|error| format!("Language preference could not be saved: {error}"));
+
+        let placeholders = [
+            (
+                &self.command_search,
+                language.text("搜索笔记和命令…", "Search notes and commands…"),
+            ),
+            (&self.todo_tag_input, language.text("标签名称", "Tag name")),
+            (
+                &self.todo_item_input,
+                language.text("添加待办…", "Add todo…"),
+            ),
+            (
+                &self.todo_edit_input,
+                language.text("编辑待办…", "Edit todo…"),
+            ),
+            (
+                &self.bookmark_query_input,
+                language.text(
+                    "搜索书签，或粘贴链接…",
+                    "Search bookmarks, or paste a link…",
+                ),
+            ),
+            (
+                &self.bookmark_tag_input,
+                language.text("标签名称", "Tag name"),
+            ),
+            (
+                &self.bookmark_edit_input,
+                language.text("编辑书签标题…", "Edit bookmark title…"),
+            ),
+            (
+                &self.selection_link_input,
+                language.text("粘贴链接…", "Paste a link…"),
+            ),
+            (
+                &self.selection_ask_input,
+                language.text(
+                    "希望 AI 如何处理所选内容？",
+                    "What should AI do with this selection?",
+                ),
+            ),
+        ];
+        for (input, placeholder) in placeholders {
+            input.update(cx, |input, cx| {
+                input.set_placeholder(placeholder, window, cx)
+            });
+        }
+        window.refresh();
+        cx.notify();
+    }
+
+    fn set_auto_clear_completed_todos(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.auto_clear_completed_todos = enabled;
+        if !enabled {
+            self.todo_auto_clear_pending.clear();
+            self.todo_auto_clear_exiting.clear();
+            self.todo_auto_clear_generations.clear();
+        }
+        self.todo_preference_persistence_error =
+            save_auto_clear_completed_todos_preference(enabled)
+                .err()
+                .map(|error| format!("Todo preference could not be saved: {error}"));
         cx.notify();
     }
 
@@ -2976,6 +3350,7 @@ struct EditorRowContext {
     mermaid_previews: Rc<BTreeMap<usize, MermaidPreview>>,
     math_previews: Rc<BTreeMap<usize, MathPreview>>,
     image_previews: Rc<BTreeMap<usize, MarkdownImagePreview>>,
+    language: AppLanguage,
 }
 
 #[derive(Clone, Copy)]
@@ -3184,7 +3559,11 @@ fn render_mermaid_preview_row(
             .px_4()
             .text_size(px(13.0))
             .text_color(style.danger)
-            .child("Unable to render Mermaid diagram")
+            .child(
+                row_context
+                    .language
+                    .text("无法渲染 Mermaid 图表", "Unable to render Mermaid diagram"),
+            )
             .child(
                 div()
                     .font_family(".SystemUIFont")
@@ -3201,7 +3580,11 @@ fn render_mermaid_preview_row(
             .px_4()
             .text_size(px(13.0))
             .text_color(style.muted)
-            .child("Mermaid preview unavailable")
+            .child(
+                row_context
+                    .language
+                    .text("Mermaid 预览不可用", "Mermaid preview unavailable"),
+            )
             .into_any_element(),
     };
 
@@ -3281,7 +3664,11 @@ fn render_math_block_row(
             .px_4()
             .text_size(px(13.0))
             .text_color(danger)
-            .child("Unable to render formula")
+            .child(
+                row_context
+                    .language
+                    .text("无法渲染公式", "Unable to render formula"),
+            )
             .child(div().text_xs().text_color(muted).child(message.clone()))
             .into_any_element(),
         None => div()
@@ -3292,7 +3679,11 @@ fn render_math_block_row(
             .justify_center()
             .text_size(px(13.0))
             .text_color(muted)
-            .child("Formula preview unavailable")
+            .child(
+                row_context
+                    .language
+                    .text("公式预览不可用", "Formula preview unavailable"),
+            )
             .into_any_element(),
     };
 
@@ -4210,22 +4601,34 @@ impl SettingsWindow {
 
 impl Render for SettingsWindow {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let (vault_path, persistence_error, vault_error) = {
+        let (vault_path, language, preference_errors) = {
             let app = self.app.read(cx);
             (
                 app.state
                     .vault_root()
                     .map(|path| path.display().to_string())
-                    .unwrap_or_else(|| "No workspace available".to_owned()),
-                app.theme_persistence_error.clone(),
-                app.vault_persistence_error.clone(),
+                    .unwrap_or_else(|| {
+                        app.language
+                            .text("没有可用的工作区", "No workspace available")
+                            .to_owned()
+                    }),
+                app.language,
+                [
+                    app.theme_persistence_error.clone(),
+                    app.language_persistence_error.clone(),
+                    app.todo_preference_persistence_error.clone(),
+                    app.vault_persistence_error.clone(),
+                ]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>(),
             )
         };
         render_settings_content(
             self.app.clone(),
             vault_path,
-            persistence_error,
-            vault_error,
+            language,
+            preference_errors,
             cx.theme().danger,
             cx.theme().background,
         )
@@ -4235,8 +4638,8 @@ impl Render for SettingsWindow {
 fn render_settings_content(
     app_entity: Entity<SynapseApp>,
     vault_path: String,
-    persistence_error: Option<String>,
-    vault_error: Option<String>,
+    language: AppLanguage,
+    preference_errors: Vec<String>,
     danger: Hsla,
     background: Hsla,
 ) -> AnyElement {
@@ -4244,7 +4647,9 @@ fn render_settings_content(
     let theme_field_app = app_entity.clone();
     let theme_field =
         SettingField::render(move |_options, _window, cx| {
-            let selected_preference = theme_field_app.read(cx).theme_preference;
+            let app_state = theme_field_app.read(cx);
+            let selected_preference = app_state.theme_preference;
+            let language = app_state.language;
             let theme = cx.theme().clone();
             let indicator_left = settings_theme_indicator_left(selected_preference);
             div()
@@ -4306,7 +4711,7 @@ fn render_settings_content(
                             })
                             .active(|style| style.opacity(0.72))
                             .child(gpui_component::Icon::new(preference.icon()).xsmall())
-                            .child(preference.label())
+                            .child(preference.label(language))
                             .on_click(move |_, window, cx| {
                                 app.update(cx, |this, cx| {
                                     this.set_theme_preference(preference, window, cx);
@@ -4315,6 +4720,97 @@ fn render_settings_content(
                     }),
                 ))
         });
+    let language_field_app = app_entity.clone();
+    let language_field = SettingField::render(move |_options, _window, cx| {
+        let selected_language = language_field_app.read(cx).language;
+        let theme = cx.theme().clone();
+        let segment_width =
+            (SETTINGS_THEME_CONTROL_WIDTH - SETTINGS_THEME_CONTROL_PADDING * 2.0) / 2.0;
+        let indicator_left = settings_language_indicator_left(selected_language);
+        div()
+            .id("settings-language-segments")
+            .relative()
+            .w(px(SETTINGS_THEME_CONTROL_WIDTH))
+            .h(px(40.0))
+            .p(px(SETTINGS_THEME_CONTROL_PADDING))
+            .rounded_xl()
+            .bg(theme.accordion)
+            .child(
+                div()
+                    .id("settings-language-indicator-motion")
+                    .absolute()
+                    .top(px(SETTINGS_THEME_CONTROL_PADDING))
+                    .w(px(segment_width))
+                    .h(px(32.0))
+                    .left(px(indicator_left))
+                    .child(div().size_full().rounded_lg().bg(theme.foreground))
+                    .with_transition("settings-language-indicator-transition")
+                    .transition_when_else(
+                        true,
+                        SETTINGS_THEME_TRANSITION,
+                        SettingsSpring,
+                        move |style| style.left(px(indicator_left)),
+                        move |style| style.left(px(indicator_left)),
+                    ),
+            )
+            .child(
+                div()
+                    .relative()
+                    .flex()
+                    .h_full()
+                    .children(AppLanguage::ALL.into_iter().map(|language| {
+                        let app = language_field_app.clone();
+                        let selected = language == selected_language;
+                        div()
+                            .id(SharedString::from(format!(
+                                "language-preference-{}",
+                                language.as_str()
+                            )))
+                            .w(px(segment_width))
+                            .h(px(32.0))
+                            .rounded_lg()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .text_size(px(12.0))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(if selected {
+                                theme.background
+                            } else {
+                                theme.muted_foreground
+                            })
+                            .hover(|style| {
+                                style.text_color(if selected {
+                                    theme.background
+                                } else {
+                                    theme.foreground
+                                })
+                            })
+                            .active(|style| style.opacity(0.72))
+                            .child(language.label())
+                            .on_click(move |_, window, cx| {
+                                app.update(cx, |this, cx| {
+                                    this.set_language(language, window, cx);
+                                });
+                            })
+                    })),
+            )
+    });
+    let auto_clear_field_app = app_entity.clone();
+    let auto_clear_field = SettingField::render(move |_options, _window, cx| {
+        let enabled = auto_clear_field_app.read(cx).auto_clear_completed_todos;
+        Switch::new("settings-auto-clear-completed-todos")
+            .checked(enabled)
+            .on_click({
+                let app = auto_clear_field_app.clone();
+                move |checked, _, cx| {
+                    app.update(cx, |this, cx| {
+                        this.set_auto_clear_completed_todos(*checked, cx);
+                    });
+                }
+            })
+    });
     let vault_field_app = app_entity.clone();
     let vault_field = SettingField::render(move |options, _window, _cx| {
         let app = vault_field_app.clone();
@@ -4337,7 +4833,7 @@ fn render_settings_content(
                     .h(px(40.0))
                     .with_size(options.size)
                     .icon(IconName::FolderOpen)
-                    .label("Change")
+                    .label(language.text("更换", "Change"))
                     .on_click(move |_, _, cx| {
                         app.update(cx, |this, cx| {
                             this.prompt_for_vault(cx);
@@ -4345,23 +4841,51 @@ fn render_settings_content(
                     }),
             )
     });
-    let settings = Settings::new("synapse-settings-workspace")
+    let settings = Settings::new(SharedString::from(format!(
+        "synapse-settings-workspace-{}",
+        language.as_str()
+    )))
         .sidebar_width(px(SETTINGS_SIDEBAR_WIDTH))
         .with_group_variant(GroupBoxVariant::Outline)
         .page(
-            SettingPage::new("General")
+            SettingPage::new(language.text("常规", "General"))
                 .default_open(true)
                 .resettable(false)
-                .description("Appearance and workspace preferences")
+                .description(language.text("外观、行为与工作区偏好", "Appearance, behavior and workspace preferences"))
                 .groups([
-                    SettingGroup::new().title("Appearance").item(
-                        SettingItem::new("Theme", theme_field)
-                            .description("Choose a global theme or follow the system appearance."),
-                    ),
                     SettingGroup::new()
-                        .title("Workspace")
-                        .item(SettingItem::new("Vault location", vault_field).description(
-                            "Synapse opens this folder automatically when it starts.",
+                        .title(language.text("外观", "Appearance"))
+                        .items([
+                            SettingItem::new(language.text("主题", "Theme"), theme_field)
+                                .description(language.text(
+                                    "选择全局主题，或跟随系统外观。",
+                                    "Choose a global theme or follow the system appearance.",
+                                )),
+                            SettingItem::new(language.text("界面语言", "App language"), language_field)
+                                .description(language.text(
+                                    "切换 Synapse 的界面显示语言。",
+                                    "Choose the language used throughout Synapse.",
+                                )),
+                        ]),
+                    SettingGroup::new()
+                        .title(language.text("行为", "Behavior"))
+                        .item(
+                            SettingItem::new(
+                                language.text("完成的待办自动清除", "Automatically clear completed todos"),
+                                auto_clear_field,
+                            )
+                            .description(language.text(
+                                "开启后，将待办标记为完成时会立即从列表中移除。",
+                                "When enabled, a todo is removed immediately after it is marked complete.",
+                            )),
+                        ),
+                    SettingGroup::new()
+                        .title(language.text("工作区", "Workspace"))
+                        .item(SettingItem::new(language.text("Vault 位置", "Vault location"), vault_field).description(
+                            language.text(
+                                "Synapse 启动时会自动打开这个文件夹。",
+                                "Synapse opens this folder automatically when it starts.",
+                            ),
                         )),
                 ]),
         );
@@ -4375,26 +4899,14 @@ fn render_settings_content(
         .flex_col()
         .bg(background)
         .child(settings)
-        .when_some(persistence_error, |workspace, error| {
-            workspace.child(
-                div()
-                    .px_4()
-                    .pb_3()
-                    .text_xs()
-                    .text_color(danger)
-                    .child(error),
-            )
-        })
-        .when_some(vault_error, |workspace, error| {
-            workspace.child(
-                div()
-                    .px_4()
-                    .pb_3()
-                    .text_xs()
-                    .text_color(danger)
-                    .child(error),
-            )
-        })
+        .children(preference_errors.into_iter().map(|error| {
+            div()
+                .px_4()
+                .pb_3()
+                .text_xs()
+                .text_color(danger)
+                .child(error)
+        }))
         .into_any_element()
 }
 
@@ -4449,6 +4961,9 @@ impl Render for SynapseApp {
                     todo_editing_id: self.todo_editing_id,
                     todo_edit_error: self.todo_edit_error.as_deref(),
                     theme: synapse_theme_palette(theme.is_dark()),
+                    language: self.language,
+                    auto_clear_pending: &self.todo_auto_clear_pending,
+                    auto_clear_exiting: &self.todo_auto_clear_exiting,
                 },
                 cx,
             )
@@ -4465,6 +4980,7 @@ impl Render for SynapseApp {
                     edit_error: self.bookmark_edit_error.as_deref(),
                     fetching_ids: &self.bookmark_fetching_ids,
                     theme: synapse_theme_palette(theme.is_dark()),
+                    language: self.language,
                 },
                 cx,
             )
@@ -4736,6 +5252,7 @@ impl Render for SynapseApp {
                             mermaid_previews,
                             math_previews,
                             image_previews,
+                            language: self.language,
                         };
                         move |index, _, cx| {
                             render_editor_row(index, lines[index].clone(), &row_context, cx)
@@ -4811,7 +5328,7 @@ impl Render for SynapseApp {
                                         .flex_none()
                                         .whitespace_nowrap()
                                         .text_color(theme.background)
-                                        .child("Ask AI"),
+                                        .child(self.language.text("询问 AI", "Ask AI")),
                                 )
                                 .on_click(move |_, window, cx| {
                                     ask_app.update(cx, |this, cx| {
@@ -4940,7 +5457,7 @@ impl Render for SynapseApp {
                                     div()
                                         .whitespace_nowrap()
                                         .text_color(theme.foreground)
-                                        .child("Set"),
+                                        .child(self.language.text("设置", "Set")),
                                 )
                                 .on_click(move |_, window, cx| {
                                     link_confirm_app.update(cx, |this, cx| {
@@ -4987,7 +5504,7 @@ impl Render for SynapseApp {
                                     .rounded(ButtonRounded::Size(px(20.0)))
                                     .size(px(40.0))
                                     .disabled(ask_value_empty)
-                                    .tooltip("Send to AI")
+                                    .tooltip(self.language.text("发送给 AI", "Send to AI"))
                                     .child(
                                         Icon::ArrowUp
                                             .render(13.5)
@@ -5070,7 +5587,7 @@ impl Render for SynapseApp {
                                 Button::new("open-vault-empty-state")
                                     .primary()
                                     .large()
-                                    .label("Open Vault")
+                                    .label(self.language.text("打开 Vault", "Open Vault"))
                                     .on_click(move |_, _, cx| {
                                         app.update(cx, |this, cx| {
                                             this.prompt_for_vault(cx);
@@ -5198,7 +5715,7 @@ impl Render for SynapseApp {
                             .ghost()
                             .xsmall()
                             .size(px(40.0))
-                            .tooltip("Close tab")
+                            .tooltip(self.language.text("关闭页签", "Close tab"))
                             .child(Icon::Close.render(14.0).text_color(tab_muted))
                             .on_click(move |event: &ClickEvent, _, cx| {
                                 cx.stop_propagation();
@@ -5290,7 +5807,10 @@ impl Render for SynapseApp {
                                                 .h(px(24.0))
                                                 .p_0()
                                                 .rounded_full()
-                                                .tooltip("完成新建标签")
+                                                .tooltip(
+                                                    self.language
+                                                        .text("完成新建标签", "Create tag"),
+                                                )
                                                 .child(
                                                     Icon::Check
                                                         .render(13.0)
@@ -5309,7 +5829,9 @@ impl Render for SynapseApp {
                                                 .h(px(24.0))
                                                 .p_0()
                                                 .rounded_full()
-                                                .tooltip("取消新建标签")
+                                                .tooltip(
+                                                    self.language.text("取消新建标签", "Cancel"),
+                                                )
                                                 .child(
                                                     Icon::Close
                                                         .render(13.0)
@@ -5349,7 +5871,7 @@ impl Render for SynapseApp {
                         .h_full()
                         .px_3()
                         .child(Icon::Tag.render(15.0).text_color(theme.muted_foreground))
-                        .child("新建标签")
+                        .child(self.language.text("新建标签", "New tag"))
                         .on_click(move |_, window, cx| {
                             start_app.update(cx, |this, cx| {
                                 this.begin_new_todo_tag(window, cx);
@@ -5380,7 +5902,7 @@ impl Render for SynapseApp {
                             .flex_1()
                             .text_size(px(13.5))
                             .font_weight(FontWeight::SEMIBOLD)
-                            .child("待办"),
+                            .child(self.language.text("待办", "Todos")),
                     )
                     .child(tag_action)
                     .child(new_tag_button)
@@ -5422,7 +5944,10 @@ impl Render for SynapseApp {
                                                 .ghost()
                                                 .size(px(24.0))
                                                 .p_0()
-                                                .tooltip("完成新建标签")
+                                                .tooltip(
+                                                    self.language
+                                                        .text("完成新建标签", "Create tag"),
+                                                )
                                                 .child(
                                                     Icon::Check
                                                         .render(13.0)
@@ -5439,7 +5964,9 @@ impl Render for SynapseApp {
                                                 .ghost()
                                                 .size(px(24.0))
                                                 .p_0()
-                                                .tooltip("取消新建标签")
+                                                .tooltip(
+                                                    self.language.text("取消新建标签", "Cancel"),
+                                                )
                                                 .child(
                                                     Icon::Close
                                                         .render(13.0)
@@ -5478,7 +6005,7 @@ impl Render for SynapseApp {
                         .h_full()
                         .px_3()
                         .child(Icon::Tag.render(15.0).text_color(theme.muted_foreground))
-                        .child("新建标签")
+                        .child(self.language.text("新建标签", "New tag"))
                         .on_click(move |_, window, cx| {
                             start_app
                                 .update(cx, |this, cx| this.begin_new_bookmark_tag(window, cx));
@@ -5507,7 +6034,7 @@ impl Render for SynapseApp {
                             .flex_1()
                             .text_size(px(13.5))
                             .font_weight(FontWeight::SEMIBOLD)
-                            .child("书签"),
+                            .child(self.language.text("书签", "Bookmarks")),
                     )
                     .child(
                         Button::new("export-bookmarks")
@@ -5519,7 +6046,7 @@ impl Render for SynapseApp {
                                     .render(15.0)
                                     .text_color(theme.muted_foreground),
                             )
-                            .child("导出")
+                            .child(self.language.text("导出", "Export"))
                             .on_click(move |_, _, cx| {
                                 export_app.update(cx, |this, cx| this.export_bookmarks(cx));
                             }),
@@ -5618,7 +6145,7 @@ impl Render for SynapseApp {
                             .text()
                             .rounded(ButtonRounded::None)
                             .size(px(40.0))
-                            .tooltip("Note actions")
+                            .tooltip(self.language.text("笔记操作", "Note actions"))
                             .child(
                                 Icon::MoreVertical
                                     .render(15.0)
@@ -5675,7 +6202,7 @@ impl Render for SynapseApp {
                                     .flex_1()
                                     .text_left()
                                     .text_color(theme.muted_foreground)
-                                    .child("Search any..."),
+                                    .child(self.language.text("搜索任意内容…", "Search any...")),
                             )
                             .children(command_kbd.clone()),
                     )
@@ -5691,7 +6218,7 @@ impl Render for SynapseApp {
                     .px_3()
                     .text_xs()
                     .text_color(theme.muted_foreground)
-                    .child("MY NOTES"),
+                    .child(self.language.text("我的笔记", "MY NOTES")),
             )
             .child({
                 let shortcut_app = app_entity.clone();
@@ -5743,7 +6270,7 @@ impl Render for SynapseApp {
                                             .whitespace_nowrap()
                                             .font_weight(FontWeight::MEDIUM)
                                             .text_size(px(13.0))
-                                            .child("待办"),
+                                            .child(self.language.text("待办", "Todos")),
                                     )
                                     .on_click(move |_, window, cx| {
                                         shortcut_app.update(cx, |this, cx| {
@@ -5787,6 +6314,8 @@ impl Render for SynapseApp {
                         &self.todo_workspace,
                         todo_quick_open,
                         synapse_theme_palette(theme.is_dark()),
+                        self.language,
+                        &self.todo_auto_clear_exiting,
                         cx,
                     ))
             })
@@ -5842,7 +6371,7 @@ impl Render for SynapseApp {
                                             .whitespace_nowrap()
                                             .font_weight(FontWeight::MEDIUM)
                                             .text_size(px(13.0))
-                                            .child("书签"),
+                                            .child(self.language.text("书签", "Bookmarks")),
                                     )
                                     .on_click(move |_, window, cx| {
                                         shortcut_app.update(cx, |this, cx| {
@@ -5886,6 +6415,7 @@ impl Render for SynapseApp {
                         &self.bookmark_workspace,
                         bookmark_quick_open,
                         palette,
+                        self.language,
                         cx,
                     ))
             })
@@ -5906,14 +6436,14 @@ impl Render for SynapseApp {
                     .px_3()
                     .text_xs()
                     .text_color(theme.muted_foreground)
-                    .child(div().flex_1().child("NOTES"))
+                    .child(div().flex_1().child(self.language.text("笔记", "NOTES")))
                     .child({
                         let app = app_entity.clone();
                         Button::new("new-note-control")
                             .ghost()
                             .xsmall()
                             .size(px(28.0))
-                            .tooltip("New note")
+                            .tooltip(self.language.text("新建笔记", "New note"))
                             .child(
                                 Icon::FilePlus
                                     .render(16.0)
@@ -5931,7 +6461,7 @@ impl Render for SynapseApp {
                             .ghost()
                             .xsmall()
                             .size(px(28.0))
-                            .tooltip("New folder")
+                            .tooltip(self.language.text("新建文件夹", "New folder"))
                             .child(
                                 Icon::FolderPlus
                                     .render(16.0)
@@ -6204,7 +6734,7 @@ impl Render for SynapseApp {
                                 .pr_2()
                                 .text_xs()
                                 .text_color(theme.muted_foreground)
-                                .child("空文件夹")
+                                .child(self.language.text("空文件夹", "Empty folder"))
                                 .into_any_element(),
                         }
                     })),
@@ -6224,7 +6754,7 @@ impl Render for SynapseApp {
                             .justify_start()
                             .child(menu_item_content(
                                 Icon::Settings,
-                                "Settings",
+                                self.language.text("设置", "Settings"),
                                 theme.muted_foreground,
                             ))
                             .on_click(move |_, _, cx| {
@@ -6278,7 +6808,7 @@ impl Render for SynapseApp {
                         .justify_start()
                         .child(menu_item_content(
                             Icon::Close,
-                            "Close",
+                            self.language.text("关闭", "Close"),
                             theme.muted_foreground,
                         ))
                         .on_click(move |_, _, cx| {
@@ -6295,7 +6825,7 @@ impl Render for SynapseApp {
                         .justify_start()
                         .child(menu_item_content(
                             Icon::PanelLeft,
-                            "Close Left",
+                            self.language.text("关闭左侧页签", "Close Left"),
                             theme.muted_foreground,
                         ))
                         .on_click(move |_, _, cx| {
@@ -6312,7 +6842,7 @@ impl Render for SynapseApp {
                         .justify_start()
                         .child(menu_item_content(
                             Icon::PanelRight,
-                            "Close Right",
+                            self.language.text("关闭右侧页签", "Close Right"),
                             theme.muted_foreground,
                         ))
                         .on_click(move |_, _, cx| {
@@ -6329,7 +6859,7 @@ impl Render for SynapseApp {
                         .justify_start()
                         .child(menu_item_content(
                             Icon::CloseAll,
-                            "Close All",
+                            self.language.text("关闭全部页签", "Close All"),
                             theme.muted_foreground,
                         ))
                         .on_click(move |_, _, cx| {
@@ -6402,7 +6932,7 @@ impl Render for SynapseApp {
                             .justify_start()
                             .child(menu_item_content(
                                 Icon::FolderPlus,
-                                "New Folder",
+                                self.language.text("新建文件夹", "New Folder"),
                                 theme.muted_foreground,
                             ))
                             .on_click(move |_, _, cx| {
@@ -6420,7 +6950,7 @@ impl Render for SynapseApp {
                             .justify_start()
                             .child(menu_item_content(
                                 Icon::Reveal,
-                                "Reveal in Finder",
+                                self.language.text("在访达中显示", "Reveal in Finder"),
                                 theme.muted_foreground,
                             ))
                             .on_click(move |_, _, cx| {
@@ -6438,7 +6968,7 @@ impl Render for SynapseApp {
                             .justify_start()
                             .child(menu_item_content(
                                 Icon::FilePlus,
-                                "New Note",
+                                self.language.text("新建笔记", "New Note"),
                                 theme.muted_foreground,
                             ))
                             .on_click(move |_, window, cx| {
@@ -6456,7 +6986,7 @@ impl Render for SynapseApp {
                             .justify_start()
                             .child(menu_item_content(
                                 Icon::Rename,
-                                "Rename",
+                                self.language.text("重命名", "Rename"),
                                 theme.muted_foreground,
                             ))
                             .on_click(move |_, window, cx| {
@@ -6475,7 +7005,7 @@ impl Render for SynapseApp {
                             .text_color(theme.danger)
                             .child(menu_item_content(
                                 Icon::Trash,
-                                "Delete Folder",
+                                self.language.text("删除文件夹", "Delete Folder"),
                                 theme.danger,
                             ))
                             .on_click(move |_, _, cx| {
@@ -6499,7 +7029,7 @@ impl Render for SynapseApp {
                             .justify_start()
                             .child(menu_item_content(
                                 Icon::Rename,
-                                "Rename",
+                                self.language.text("重命名", "Rename"),
                                 theme.muted_foreground,
                             ))
                             .on_click(move |_, window, cx| {
@@ -6517,7 +7047,7 @@ impl Render for SynapseApp {
                             .justify_start()
                             .child(menu_item_content(
                                 Icon::Reveal,
-                                "Reveal in Finder",
+                                self.language.text("在访达中显示", "Reveal in Finder"),
                                 theme.muted_foreground,
                             ))
                             .on_click(move |_, _, cx| {
@@ -6536,7 +7066,7 @@ impl Render for SynapseApp {
                             .text_color(theme.danger)
                             .child(menu_item_content(
                                 Icon::Trash,
-                                "Move to Trash",
+                                self.language.text("移到废纸篓", "Move to Trash"),
                                 theme.danger,
                             ))
                             .on_click(move |_, _, cx| {
@@ -6584,7 +7114,7 @@ impl Render for SynapseApp {
                         .justify_start()
                         .child(menu_item_content(
                             Icon::Download,
-                            "Export as Markdown",
+                            self.language.text("导出为 Markdown", "Export as Markdown"),
                             theme.muted_foreground,
                         ))
                         .on_click(move |_, _, cx| {
@@ -6602,7 +7132,7 @@ impl Render for SynapseApp {
                         .justify_start()
                         .child(menu_item_content(
                             Icon::Copy,
-                            "Copy Markdown",
+                            self.language.text("复制 Markdown", "Copy Markdown"),
                             theme.muted_foreground,
                         ))
                         .on_click(move |_, _, cx| {
@@ -6619,7 +7149,11 @@ impl Render for SynapseApp {
                         .h(px(40.0))
                         .justify_start()
                         .text_color(theme.danger)
-                        .child(menu_item_content(Icon::Trash, "Delete Note", theme.danger))
+                        .child(menu_item_content(
+                            Icon::Trash,
+                            self.language.text("删除笔记", "Delete Note"),
+                            theme.danger,
+                        ))
                         .on_click(move |_, _, cx| {
                             cx.stop_propagation();
                             trash_app.update(cx, |this, cx| {
@@ -6700,7 +7234,12 @@ impl Render for SynapseApp {
                                 .mt_2()
                                 .justify_start()
                                 .child(Icon::FilePlus.render(17.0))
-                                .child(div().flex_1().text_left().child("New Note"))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .text_left()
+                                        .child(self.language.text("新建笔记", "New Note")),
+                                )
                                 .child(div().text_xs().child("⌘N"))
                                 .on_click(move |_, window, cx| {
                                     cx.stop_propagation();
@@ -6716,7 +7255,11 @@ impl Render for SynapseApp {
                                 .h(px(38.0))
                                 .justify_start()
                                 .child(Icon::FolderOpen.render(17.0))
-                                .child(div().flex_1().child("Open Vault…"))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .child(self.language.text("打开 Vault…", "Open Vault…")),
+                                )
                                 .on_click(move |_, _, cx| {
                                     cx.stop_propagation();
                                     open_vault_app.update(cx, |this, cx| {
@@ -6732,7 +7275,11 @@ impl Render for SynapseApp {
                                 .h(px(38.0))
                                 .justify_start()
                                 .child(Icon::Todo.render(17.0))
-                                .child(div().flex_1().child("Open Todo"))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .child(self.language.text("打开待办", "Open Todo")),
+                                )
                                 .on_click(move |_, window, cx| {
                                     cx.stop_propagation();
                                     todo_app.update(cx, |this, cx| {
@@ -6747,7 +7294,11 @@ impl Render for SynapseApp {
                                 .h(px(38.0))
                                 .justify_start()
                                 .child(Icon::Bookmark.render(17.0))
-                                .child(div().flex_1().child("Open Bookmarks"))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .child(self.language.text("打开书签", "Open Bookmarks")),
+                                )
                                 .on_click(move |_, window, cx| {
                                     cx.stop_propagation();
                                     bookmarks_app.update(cx, |this, cx| {
@@ -6763,7 +7314,7 @@ impl Render for SynapseApp {
                                 .h(px(38.0))
                                 .justify_start()
                                 .child(Icon::Settings.render(17.0))
-                                .child(div().flex_1().child("Settings"))
+                                .child(div().flex_1().child(self.language.text("设置", "Settings")))
                                 .on_click(move |_, _, cx| {
                                     cx.stop_propagation();
                                     settings_app.update(cx, |this, cx| {
@@ -7232,18 +7783,18 @@ fn synapse_titlebar_options() -> TitlebarOptions {
     }
 }
 
-fn settings_titlebar_options() -> TitlebarOptions {
+fn settings_titlebar_options(language: AppLanguage) -> TitlebarOptions {
     TitlebarOptions {
-        title: Some("Synapse Settings".into()),
+        title: Some(language.text("Synapse 设置", "Synapse Settings").into()),
         appears_transparent: false,
         traffic_light_position: None,
     }
 }
 
-fn settings_window_options(bounds: Bounds<Pixels>) -> WindowOptions {
+fn settings_window_options(bounds: Bounds<Pixels>, language: AppLanguage) -> WindowOptions {
     WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
-        titlebar: Some(settings_titlebar_options()),
+        titlebar: Some(settings_titlebar_options(language)),
         focus: true,
         show: true,
         kind: WindowKind::Normal,
@@ -7269,6 +7820,8 @@ fn main() {
         state.set_error_message(format!("Unable to prepare the default workspace: {error}"));
     }
     let theme_preference = load_theme_preference();
+    let language = load_language_preference();
+    let auto_clear_completed_todos = load_auto_clear_completed_todos_preference();
     let todo_workspace = TodoWorkspace::load_default();
     let bookmark_workspace = BookmarkWorkspace::load_default();
     let http_client = SynapseHttpClient::new().expect("failed to initialize the HTTP client");
@@ -7279,6 +7832,7 @@ fn main() {
         .run(move |cx: &mut App| {
             register_bundled_fonts(cx);
             gpui_component::init(cx);
+            gpui_component::set_locale(language.as_str());
             apply_synapse_theme(theme_preference, None, cx);
             let [macos_palette_key, cross_platform_palette_key] = command_palette_key_bindings();
             cx.bind_keys([
@@ -7346,41 +7900,53 @@ fn main() {
                     apply_synapse_theme(theme_preference, Some(window), cx);
                     let command_search = cx.new(|cx| {
                         InputState::new(window, cx)
-                            .placeholder("Search any...")
+                            .placeholder(
+                                language.text("搜索笔记和命令…", "Search notes and commands…"),
+                            )
                             .clean_on_escape()
                     });
-                    let todo_tag_input =
-                        cx.new(|cx| InputState::new(window, cx).placeholder("标签名称"));
+                    let todo_tag_input = cx.new(|cx| {
+                        InputState::new(window, cx)
+                            .placeholder(language.text("标签名称", "Tag name"))
+                    });
                     let todo_item_input = cx.new(|cx| {
                         InputState::new(window, cx)
-                            .placeholder("添加待办…")
+                            .placeholder(language.text("添加待办…", "Add todo…"))
                             .clean_on_escape()
                     });
                     let todo_edit_input = cx.new(|cx| {
                         InputState::new(window, cx)
-                            .placeholder("编辑待办…")
+                            .placeholder(language.text("编辑待办…", "Edit todo…"))
                             .clean_on_escape()
                     });
                     let bookmark_query_input = cx.new(|cx| {
                         InputState::new(window, cx)
-                            .placeholder("搜索书签，或粘贴链接…")
+                            .placeholder(language.text(
+                                "搜索书签，或粘贴链接…",
+                                "Search bookmarks, or paste a link…",
+                            ))
                             .clean_on_escape()
                     });
-                    let bookmark_tag_input =
-                        cx.new(|cx| InputState::new(window, cx).placeholder("标签名称"));
+                    let bookmark_tag_input = cx.new(|cx| {
+                        InputState::new(window, cx)
+                            .placeholder(language.text("标签名称", "Tag name"))
+                    });
                     let bookmark_edit_input = cx.new(|cx| {
                         InputState::new(window, cx)
-                            .placeholder("编辑书签标题…")
+                            .placeholder(language.text("编辑书签标题…", "Edit bookmark title…"))
                             .clean_on_escape()
                     });
                     let selection_link_input = cx.new(|cx| {
                         InputState::new(window, cx)
-                            .placeholder("Paste a link…")
+                            .placeholder(language.text("粘贴链接…", "Paste a link…"))
                             .clean_on_escape()
                     });
                     let selection_ask_input = cx.new(|cx| {
                         InputState::new(window, cx)
-                            .placeholder("What should AI do with this selection?")
+                            .placeholder(language.text(
+                                "希望 AI 如何处理所选内容？",
+                                "What should AI do with this selection?",
+                            ))
                             .clean_on_escape()
                     });
                     let editor_line_layouts = Rc::new(RefCell::new(Vec::new()));
@@ -7520,6 +8086,10 @@ fn main() {
                             todo_edit_error: None,
                             todo_tag_picker: None,
                             todo_quick_open: false,
+                            todo_auto_clear_pending: BTreeSet::new(),
+                            todo_auto_clear_exiting: BTreeSet::new(),
+                            todo_auto_clear_generations: BTreeMap::new(),
+                            todo_auto_clear_generation: 0,
                             bookmark_query_input,
                             bookmark_tag_input,
                             bookmark_edit_input,
@@ -7540,6 +8110,10 @@ fn main() {
                             _input_subscriptions: input_subscriptions,
                             theme_preference,
                             theme_persistence_error: None,
+                            language,
+                            language_persistence_error: None,
+                            auto_clear_completed_todos,
+                            todo_preference_persistence_error: None,
                             vault_persistence_error: None,
                             settings_window: None,
                             settings_window_opening: false,
@@ -7623,7 +8197,7 @@ mod tests {
 
     use super::editor_surface::source_lines;
     use super::{
-        EDITOR_BODY_FONT_SIZE, EDITOR_BODY_LINE_HEIGHT, EDITOR_COMPACT_GUTTER,
+        AppLanguage, EDITOR_BODY_FONT_SIZE, EDITOR_BODY_LINE_HEIGHT, EDITOR_COMPACT_GUTTER,
         EDITOR_PAGE_MAX_WIDTH, EDITOR_REGULAR_GUTTER, EDITOR_RULE_BLOCK_HEIGHT,
         EDITOR_RULE_THICKNESS, EDITOR_TOP_PADDING, EDITOR_WIDE_GUTTER, FileTreeRow, InlineFormat,
         InlineFormatEdit, MARKD_PANEL_SPRING_DAMPING, MARKD_PANEL_SPRING_MASS,
@@ -7633,19 +8207,22 @@ mod tests {
         SIDEBAR_SEARCH_INNER_PADDING, SIDEBAR_SEARCH_OUTER_MARGIN, SIDEBAR_SHORTCUT_ACTION_WIDTH,
         SIDEBAR_TREE_FONT_FAMILY, SIDEBAR_TREE_FONT_SIZE, SIDEBAR_TREE_ROW_HEIGHT,
         TABLE_CELL_HORIZONTAL_PADDING, TABLE_CELL_VERTICAL_PADDING, TABLE_FONT_SIZE,
-        TABLE_ROW_MIN_HEIGHT, TITLEBAR_HEIGHT, ThemePreference, active_document_outline_index,
-        build_document_outline, build_file_tree_rows, build_image_previews, build_math_previews,
-        build_mermaid_previews, changed_line_span, clipboard_image_extension, code_block_edges,
-        command_palette_key_bindings, default_window_size, document_outline_horizontal_layout,
-        document_outline_is_visible, document_outline_layout, editor_backtick_key_bindings,
-        editor_horizontal_gutter, editor_page_content_width, fenced_code_block_edit,
-        file_manager_reveal_command, inline_format_edit, inline_format_is_active,
-        is_tab_context_trigger, markd_panel_spring_progress, markdown_link_context,
-        normalize_clipboard_text, normalize_markdown_link_destination, note_breadcrumb_parts,
+        TABLE_ROW_MIN_HEIGHT, TITLEBAR_HEIGHT, TODO_AUTO_CLEAR_COMPLETED_HOLD,
+        TODO_AUTO_CLEAR_EXIT, TODO_AUTO_CLEAR_EXIT_OFFSET, ThemePreference,
+        active_document_outline_index, build_document_outline, build_file_tree_rows,
+        build_image_previews, build_math_previews, build_mermaid_previews, changed_line_span,
+        clipboard_image_extension, code_block_edges, command_palette_key_bindings,
+        default_window_size, document_outline_horizontal_layout, document_outline_is_visible,
+        document_outline_layout, editor_backtick_key_bindings, editor_horizontal_gutter,
+        editor_page_content_width, fenced_code_block_edit, file_manager_reveal_command,
+        inline_format_edit, inline_format_is_active, is_tab_context_trigger,
+        markd_panel_spring_progress, markdown_link_context, normalize_clipboard_text,
+        normalize_markdown_link_destination, note_breadcrumb_parts, parse_boolean_preference,
         persist_clipboard_image, resolve_markdown_image, select_startup_vault_path,
-        settings_spring_progress, settings_theme_indicator_left, settings_window_options,
-        source_lines_from_buffer, synapse_mermaid_theme, synapse_theme_palette,
-        synapse_titlebar_options, titlebar_left_inset,
+        settings_language_indicator_left, settings_spring_progress, settings_theme_indicator_left,
+        settings_titlebar_options, settings_window_options, source_lines_from_buffer,
+        synapse_mermaid_theme, synapse_theme_palette, synapse_titlebar_options,
+        titlebar_left_inset,
     };
 
     fn sfnt_table<'a>(font: &'a [u8], tag: &[u8; 4]) -> Option<&'a [u8]> {
@@ -8022,6 +8599,23 @@ mod tests {
     }
 
     #[test]
+    fn settings_language_indicator_reuses_the_theme_segment_motion() {
+        let chinese = settings_language_indicator_left(AppLanguage::SimplifiedChinese);
+        let english = settings_language_indicator_left(AppLanguage::English);
+        assert!(chinese < english);
+        assert_eq!(english - chinese, (252.0 - 8.0) / 2.0);
+        assert_eq!(settings_spring_progress(0.0), 0.0);
+        assert_eq!(settings_spring_progress(1.0), 1.0);
+    }
+
+    #[test]
+    fn todo_auto_clear_keeps_completion_visible_before_a_short_directional_exit() {
+        assert_eq!(TODO_AUTO_CLEAR_COMPLETED_HOLD, Duration::from_millis(420));
+        assert_eq!(TODO_AUTO_CLEAR_EXIT, Duration::from_millis(220));
+        assert_eq!(TODO_AUTO_CLEAR_EXIT_OFFSET, 84.0);
+    }
+
+    #[test]
     fn sidebar_tree_typography_matches_the_markd_reference() {
         assert_eq!(SIDEBAR_TREE_FONT_FAMILY, "Inter");
         assert_eq!(SIDEBAR_TREE_FONT_SIZE, 13.0);
@@ -8119,7 +8713,7 @@ mod tests {
 
     #[test]
     fn settings_uses_a_normal_independent_resizable_window() {
-        let options = settings_window_options(Bounds::default());
+        let options = settings_window_options(Bounds::default(), AppLanguage::English);
         let titlebar = options.titlebar.expect("native Settings titlebar");
 
         assert_eq!(options.kind, WindowKind::Normal);
@@ -8139,6 +8733,31 @@ mod tests {
                 px(SETTINGS_WINDOW_MIN_HEIGHT)
             ))
         );
+    }
+
+    #[test]
+    fn app_language_parses_persisted_locale_codes_and_translates_settings_title() {
+        assert_eq!(
+            AppLanguage::parse("zh-CN\n"),
+            Some(AppLanguage::SimplifiedChinese)
+        );
+        assert_eq!(AppLanguage::parse("en"), Some(AppLanguage::English));
+        assert_eq!(AppLanguage::parse("fr"), None);
+        assert_eq!(
+            settings_titlebar_options(AppLanguage::SimplifiedChinese)
+                .title
+                .expect("Chinese Settings title")
+                .as_ref(),
+            "Synapse 设置"
+        );
+    }
+
+    #[test]
+    fn todo_auto_clear_preference_parser_is_strict_and_backward_compatible() {
+        assert_eq!(parse_boolean_preference("true\n"), Some(true));
+        assert_eq!(parse_boolean_preference("1"), Some(true));
+        assert_eq!(parse_boolean_preference("off"), Some(false));
+        assert_eq!(parse_boolean_preference("enabled"), None);
     }
 
     #[test]
