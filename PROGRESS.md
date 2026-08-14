@@ -1,12 +1,14 @@
 # Synapse 开发进度
 
-> 最后更新：2026-08-14（补齐斜杠浮层动画、菜单图标与内部笔记链接跳转）
-> 当前阶段：Markdown 编辑效率 — 斜杠命令已具备完整原生交互反馈，Vault 内笔记链接可从渲染态直接打开
+> 最后更新：2026-08-14（Synapse 图标已接入 Dock、应用切换器、Applications 与 Launchpad）
+> 当前阶段：macOS 应用交付 — 正式图标已进入运行时和可重复构建的原生 App Bundle
 > 同步规则：每次功能调整后立即维护本文件；每轮开发结束前再次核对代码、测试与本文档一致性。
 
 ## 当前可用功能
 
 - Rust + GPUI 原生桌面应用可启动。
+- 已完成 Synapse 正式品牌图标：三个节点构成抽象 `S` 形突触路径，中央纸张折角表达 Markdown 笔记；深石墨底色和蓝紫渐变与软件主题一致。项目内提供符合 Apple 当前规范的 1024×1024 全画布不透明、未预制圆角 PNG 主资源，以及包含完整 Retina 尺寸的 macOS `.icns` 文件；最终圆角由系统遮罩统一生成。
+- macOS 开发运行时会把 1024px PNG 编译进二进制，并通过 AppKit `NSApplication::setApplicationIconImage` 设置应用图标；`cargo run -p synapse` 的 Dock 和 `Command+Tab` 应用切换器不再显示通用可执行文件图标。`scripts/package-macos.sh` 可生成带正式 `.icns`、Bundle Identifier 和本地签名的 `Synapse.app`，可选 `--install` 安装到 Applications，供 Finder、Launchpad 和固定 Dock 快捷入口读取。
 - 已建立统一的原生通知系统：通知通过 gpui-component `Root` 的右上角队列呈现，正文使用官方 `Alert` Info / Success / Warning / Error 变体，可手动关闭并在 5 秒后自动消失；透明通知外壳避免重复容器视觉，保留组件既有进出动画和最多 10 条可见队列限制。
 - 用户直接触发的文件/文件夹移到废纸篓、当前笔记删除、待办/书签删除、待办/书签标签删除、标签关联移除及批量清除完成项，已统一接入 gpui-component 确认对话框：遮罩不可点击关闭、Escape 取消、Enter 确认，确认按钮使用 Danger 变体；取消不修改数据，成功或失败都会显示双语结果通知。
 - 待办与书签危险操作持久化失败时会恢复操作前的内存快照，避免界面显示已删除但磁盘保存失败；对象在确认期间被其他操作移除时显示错误通知且应用继续运行。用户主动开启的待办自动清理保持既有 420ms 完成态停留与 220ms 右移淡出，不为每条自动删除重复弹框或刷通知。
@@ -1063,6 +1065,20 @@
 - 斜杠菜单 12 项 Lucide 图标不再依赖 SVG `currentColor` 的隐式继承：每一行根据选中状态显式使用主题 `foreground` / `muted_foreground`，深色、浅色和 hover/键盘选中状态下均能稳定显示在名称左侧的固定图标列。
 - Markdown 链接解析器现在支持渲染态的空光标命中。单击 `[标题](Vault相对路径.md)` 的可见标题时，会解码 UTF-8 百分号路径、补全省略的 `.md`，拒绝 HTTP(S)、邮件、锚点、绝对路径和 `..` 越界路径，并仅在目标确实存在于当前 Vault 笔记快照时调用 `ShellState::select_note` 打开对应页签；普通外部链接和不存在的路径仍保持编辑行为，不会误跳转。
 - 新增内部中文路径解析、扩展名补全、外部/越界/缺失目标拒绝及浮层动画时序回归。`cargo test -p synapse --no-fail-fast` 共 155 项通过，另有 1 项手动性能探针按设计忽略；`cargo clippy -p synapse --all-targets -- -D warnings` 与 `git diff --check` 通过。遵循 `make-interfaces-feel-better` 的可中断动画、短退场和显式图标对比度约束，未运行截图测试。
+
+### 2026-08-14 — Synapse 品牌 Logo 与 macOS 应用图标
+
+- 使用内置图像生成能力完成原创 Logo：三个蓝紫渐变节点通过连续路径组成抽象 `S`，表达 Synapse 的知识连接和神经突触概念；中央嵌入白色纸张折角，补充 Markdown 笔记产品语义，避免使用文字、通用脑图轮廓或复杂网络图。
+- 图标采用铺满 1024×1024 正方形画布的深石墨背景和高对比蓝紫主标，能够同时适配浅色与深色桌面环境；源图不包含透明圆角、外边框或外投影，最终圆角交给 macOS 系统遮罩。主轮廓节点数量少、线条足够粗，面向 Dock、Finder 和 16px 小尺寸识别进行了约束。
+- 新增 `assets/branding/synapse-app-icon.png` 1024×1024 RGB 正式主资源，以及通过 macOS `iconutil` 生成的 `synapse-app-icon.icns`；ICNS 已反向解包验证，完整包含 16/32/128/256/512/1024 像素及 Retina 对应资源。`assets/branding/README.md` 记录设计含义与交付用途。
+- 根据 Apple 当前 App Icon HIG 完成规范纠正：iOS、iPadOS、macOS 应提供未遮罩正方形图层，由系统生成最终圆角；已移除初版预制圆角、透明四角、边缘轮廓和外投影，保持已确认的节点、`S` 路径、纸张折角和颜色不变。使用 `sips` 验证 PNG 为 1024×1024 且无 Alpha 通道，使用 `file` 与 `iconutil` 验证 ICNS 容器可读；本轮没有改动编辑器运行逻辑，也未运行截图测试。
+
+### 2026-08-14 — macOS Dock、Applications 与 Launchpad 图标接入
+
+- 正式 PNG 通过 `include_bytes!` 编译进 Synapse 二进制；macOS 应用事件循环建立后，使用 Cocoa `NSData` 与 `NSImage` 从内存解码图标，并调用 `NSApplication::setApplicationIconImage_`。该路径不依赖工作目录、源码资源路径或 Web 技术，因此直接执行 `cargo run -p synapse` 时 Dock 与 `Command+Tab` 应用切换器也会使用 Synapse 图标。
+- 新增 `scripts/package-macos.sh` 原生打包脚本，支持 `release` / `debug` 和显式 `--install`。脚本构建 Rust 可执行文件，生成标准 `Synapse.app/Contents/MacOS` 与 `Contents/Resources` 结构，写入 `CFBundleIdentifier=dev.xuyi.synapse`、`CFBundleIconFile=Synapse.icns`、产品名称、版本、生产力分类和 Retina 支持，并执行 `plutil` 校验及本地 ad-hoc `codesign`。
+- README 补充 macOS 应用包生成、安装位置与正式分发签名说明。已真实生成 `target/release/bundle/osx/Synapse.app`，校验 arm64 Mach-O、Info.plist、ICNS 与深度签名；在系统原本不存在同名应用的前提下安装至 `/Applications/Synapse.app`，通过 LaunchServices 注册并确认 Applications 内 ICNS 与项目源文件 SHA-256 完全一致。
+- 从 `/Applications/Synapse.app` 完成无截图启动冒烟，进程正常进入 GPUI 事件循环且无启动 panic，验证后已停止测试进程。新增内置 PNG 头回归，要求图标始终为 1024×1024、PNG RGB color type 2，并防止未来误换回带透明圆角的 RGBA 资源。`cargo test -p synapse --no-fail-fast` 共 156 项通过，另有 1 项手动性能探针按设计忽略；严格 Clippy 与 `git diff --check` 通过，未运行截图测试。
 
 ## 下一步
 

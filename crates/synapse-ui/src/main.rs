@@ -18,8 +18,9 @@ use std::{
 
 #[cfg(target_os = "macos")]
 use cocoa::{
-    appkit::{NSApp, NSAppearance, NSView},
+    appkit::{NSApp, NSAppearance, NSApplication, NSImage, NSView},
     base::{id, nil},
+    foundation::NSData,
 };
 use futures::StreamExt as _;
 use gpui::{
@@ -166,6 +167,7 @@ const NOTE_LINK_PICKER_WIDTH: f32 = 268.0;
 const SLASH_MENU_REVEAL_DELAY: Duration = Duration::from_millis(16);
 const SLASH_MENU_ENTER_TRANSITION: Duration = Duration::from_millis(120);
 const SLASH_MENU_EXIT_TRANSITION: Duration = Duration::from_millis(100);
+const SYNAPSE_APP_ICON_PNG: &[u8] = include_bytes!("../../../assets/branding/synapse-app-icon.png");
 static APP_ALERT_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -424,6 +426,37 @@ fn synapse_theme_palette(dark: bool) -> SynapseThemePalette {
 unsafe extern "C" {
     static NSAppearanceNameAqua: id;
     static NSAppearanceNameDarkAqua: id;
+}
+
+#[cfg(test)]
+fn embedded_app_icon_png_metadata() -> Option<(u32, u32, u8)> {
+    const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
+    if SYNAPSE_APP_ICON_PNG.get(..8)? != PNG_SIGNATURE
+        || SYNAPSE_APP_ICON_PNG.get(12..16)? != b"IHDR"
+    {
+        return None;
+    }
+    let width = u32::from_be_bytes(SYNAPSE_APP_ICON_PNG.get(16..20)?.try_into().ok()?);
+    let height = u32::from_be_bytes(SYNAPSE_APP_ICON_PNG.get(20..24)?.try_into().ok()?);
+    let color_type = *SYNAPSE_APP_ICON_PNG.get(25)?;
+    Some((width, height, color_type))
+}
+
+fn install_native_application_icon() {
+    #[cfg(target_os = "macos")]
+    unsafe {
+        use std::ffi::c_void;
+
+        let data = NSData::dataWithBytes_length_(
+            nil,
+            SYNAPSE_APP_ICON_PNG.as_ptr().cast::<c_void>(),
+            SYNAPSE_APP_ICON_PNG.len() as u64,
+        );
+        let image = NSImage::initWithData_(NSImage::alloc(nil), data);
+        if image != nil {
+            NSApplication::setApplicationIconImage_(NSApp(), image);
+        }
+    }
 }
 
 fn apply_native_application_appearance(preference: ThemePreference) {
@@ -9140,6 +9173,7 @@ fn main() {
         .with_http_client(http_client)
         .with_assets(SynapseAssets)
         .run(move |cx: &mut App| {
+            install_native_application_icon();
             register_bundled_fonts(cx);
             gpui_component::init(cx);
             gpui_component::set_locale(language.as_str());
@@ -9555,7 +9589,7 @@ mod tests {
         SIDEBAR_SEARCH_CONTENT_WIDTH, SIDEBAR_SEARCH_INNER_PADDING, SIDEBAR_SEARCH_OUTER_MARGIN,
         SIDEBAR_SHORTCUT_ACTION_WIDTH, SIDEBAR_TREE_FONT_FAMILY, SIDEBAR_TREE_FONT_SIZE,
         SIDEBAR_TREE_ROW_HEIGHT, SLASH_MENU_ENTER_TRANSITION, SLASH_MENU_EXIT_TRANSITION,
-        SLASH_MENU_REVEAL_DELAY, SlashCommand, TABLE_CELL_HORIZONTAL_PADDING,
+        SLASH_MENU_REVEAL_DELAY, SYNAPSE_APP_ICON_PNG, SlashCommand, TABLE_CELL_HORIZONTAL_PADDING,
         TABLE_CELL_VERTICAL_PADDING, TABLE_FONT_SIZE, TABLE_ROW_MIN_HEIGHT, TITLEBAR_HEIGHT,
         TODO_AUTO_CLEAR_COMPLETED_HOLD, TODO_AUTO_CLEAR_EXIT, TODO_AUTO_CLEAR_EXIT_OFFSET,
         ThemePreference, TreeTarget, active_document_outline_index, build_document_outline,
@@ -9563,9 +9597,9 @@ mod tests {
         changed_line_span, clipboard_image_extension, code_block_edges,
         command_palette_key_bindings, default_window_size, document_outline_horizontal_layout,
         document_outline_is_visible, document_outline_layout, editor_backtick_key_bindings,
-        editor_horizontal_gutter, editor_page_content_width, fenced_code_block_edit,
-        file_manager_reveal_command, filtered_slash_commands, inline_format_edit,
-        inline_format_is_active, is_tab_context_trigger, linked_vault_note,
+        editor_horizontal_gutter, editor_page_content_width, embedded_app_icon_png_metadata,
+        fenced_code_block_edit, file_manager_reveal_command, filtered_slash_commands,
+        inline_format_edit, inline_format_is_active, is_tab_context_trigger, linked_vault_note,
         markd_panel_spring_progress, markdown_link_context, normalize_clipboard_text,
         normalize_markdown_link_destination, note_breadcrumb_parts, note_link_candidates,
         parse_boolean_preference, persist_clipboard_image, resolve_markdown_image,
@@ -9596,6 +9630,12 @@ mod tests {
         let weight = u16::from_be_bytes(os2.get(4..6).unwrap().try_into().unwrap());
         let selection = u16::from_be_bytes(os2.get(62..64).unwrap().try_into().unwrap());
         (weight, selection)
+    }
+
+    #[test]
+    fn bundled_application_icon_is_an_opaque_apple_source_canvas() {
+        assert_eq!(embedded_app_icon_png_metadata(), Some((1024, 1024, 2)));
+        assert!(SYNAPSE_APP_ICON_PNG.len() > 100_000);
     }
 
     #[test]

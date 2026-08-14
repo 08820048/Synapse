@@ -94,6 +94,24 @@ cargo run -p synapse -- /path/to/markdown-folder
 
 不传路径时，Synapse 会自动恢复上次选择的 Vault。首次启动或保存路径已经失效时，会创建并打开 `~/Documents/Synapse Vault`，因此无需先手动选择工作区也能立即新建笔记和文件夹。当前路径可在 Settings → Workspace 中查看和更换。
 
+### macOS 应用包
+
+开发环境直接执行 `cargo run -p synapse` 时，应用会通过 AppKit 使用内置 Synapse 图标，因此 Dock 和 `Command+Tab` 应用切换器不再显示默认可执行文件图标。
+
+生成带正式名称、Bundle Identifier 和 `.icns` 资源的本地 `.app`：
+
+```bash
+./scripts/package-macos.sh
+```
+
+产物位于 `target/release/bundle/osx/Synapse.app`。使用以下命令同时生成并安装到 `/Applications`：
+
+```bash
+./scripts/package-macos.sh --install
+```
+
+Finder、Applications、Launchpad 和固定到 Dock 的快捷入口均从 App Bundle 的 `Synapse.icns` 读取图标。脚本会执行本地 ad-hoc 签名，正式分发时仍需替换为 Developer ID 签名和公证流程。
+
 ## 编辑快捷键
 
 | 操作 | 快捷键 |
