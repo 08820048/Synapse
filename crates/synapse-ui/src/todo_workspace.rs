@@ -16,7 +16,7 @@ use gpui_component::InteractiveElementExt;
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputState};
 
-use super::{AppLanguage, Icon, SynapseApp, SynapseThemePalette};
+use super::{AppLanguage, DangerousAction, Icon, SynapseApp, SynapseThemePalette};
 
 const CONTENT_MAX_WIDTH: f32 = 900.0;
 const TAG_COLUMN_WIDTH: f32 = 168.0;
@@ -775,6 +775,7 @@ pub(super) fn render_todo_workspace(
                                 .children(sidebar_tags.into_iter().map(|tag| {
                                     let tag_id = tag.id();
                                     let tag_name = tag.name().to_owned();
+                                    let delete_tag_name = tag_name.clone();
                                     let usage_count = workspace.tag_usage_count(tag_id);
                                     let color = tag_color(tag.color_index);
                                     let tag_app = app.clone();
@@ -881,11 +882,17 @@ pub(super) fn render_todo_workspace(
                                                     .render(12.0)
                                                     .text_color(theme.faint),
                                             )
-                                            .on_click(move |_, _, cx| {
+                                            .on_click(move |_, window, cx| {
                                                 cx.stop_propagation();
-                                                delete_app.update(cx, |this, cx| {
-                                                    this.delete_todo_tag(tag_id, cx);
-                                                });
+                                                SynapseApp::request_dangerous_action(
+                                                    DangerousAction::DeleteTodoTag {
+                                                        id: tag_id,
+                                                        display_name: delete_tag_name.clone(),
+                                                    },
+                                                    delete_app.clone(),
+                                                    window,
+                                                    cx,
+                                                );
                                             }),
                                         )
                                 }))
@@ -946,10 +953,15 @@ pub(super) fn render_todo_workspace(
                                                         ),
                                                     }),
                                             )
-                                            .on_click(move |_, _, cx| {
-                                                clear_completed_app.update(cx, |this, cx| {
-                                                    this.clear_completed_todos(cx);
-                                                });
+                                            .on_click(move |_, window, cx| {
+                                                SynapseApp::request_dangerous_action(
+                                                    DangerousAction::ClearCompletedTodos {
+                                                        count: completed_count,
+                                                    },
+                                                    clear_completed_app.clone(),
+                                                    window,
+                                                    cx,
+                                                );
                                             }),
                                     )
                                 }),
@@ -1006,6 +1018,7 @@ pub(super) fn render_todo_workspace(
                             let delete_app = app.clone();
                             let edit_app = app.clone();
                             let todo_text = todo.text.clone();
+                            let delete_text = todo.text.clone();
                             let copy_text = todo.text.clone();
                             let assigned_tags = todo
                                 .tags
@@ -1144,6 +1157,7 @@ pub(super) fn render_todo_workspace(
                                                     .children(assigned_tags.into_iter().map(
                                                         |(tag_id, tag_name, color_index)| {
                                                             let remove_app = app.clone();
+                                                            let remove_tag_name = tag_name.clone();
                                                             let color = tag_color(color_index);
                                                             div()
                                                                 .h(px(24.0))
@@ -1177,17 +1191,17 @@ pub(super) fn render_todo_workspace(
                                                                             .render(10.0)
                                                                             .text_color(color),
                                                                     )
-                                                                    .on_click(move |_, _, cx| {
+                                                                    .on_click(move |_, window, cx| {
                                                                         cx.stop_propagation();
-                                                                        remove_app.update(
-                                                                            cx,
-                                                                            |this, cx| {
-                                                                                this.remove_todo_tag_assignment(
-                                                                                    todo_id,
-                                                                                    tag_id,
-                                                                                    cx,
-                                                                                );
+                                                                        SynapseApp::request_dangerous_action(
+                                                                            DangerousAction::RemoveTodoTagAssignment {
+                                                                                todo_id,
+                                                                                tag_id,
+                                                                                display_name: remove_tag_name.clone(),
                                                                             },
+                                                                            remove_app.clone(),
+                                                                            window,
+                                                                            cx,
                                                                         );
                                                                     }),
                                                                 )
@@ -1275,11 +1289,17 @@ pub(super) fn render_todo_workspace(
                                                     .render(14.0)
                                                     .text_color(theme.muted),
                                             )
-                                            .on_click(move |_, _, cx| {
+                                            .on_click(move |_, window, cx| {
                                                 cx.stop_propagation();
-                                                delete_app.update(cx, |this, cx| {
-                                                    this.delete_todo_item(todo_id, cx);
-                                                });
+                                                SynapseApp::request_dangerous_action(
+                                                    DangerousAction::DeleteTodo {
+                                                        id: todo_id,
+                                                        display_name: delete_text.clone(),
+                                                    },
+                                                    delete_app.clone(),
+                                                    window,
+                                                    cx,
+                                                );
                                             }),
                                         ),
                                 )
@@ -1323,6 +1343,7 @@ pub(super) fn render_todo_workspace(
                     let tag_id = tag.id;
                     let todo_id = picker.todo_id;
                     let selected = assigned.iter().any(|assigned| assigned == &tag.name);
+                    let tag_name = tag.name.clone();
                     let color = tag_color(tag.color_index);
                     let toggle_app = panel_app.clone();
                     Button::new(SharedString::from(format!(
@@ -1357,11 +1378,24 @@ pub(super) fn render_todo_workspace(
                                 )
                             }),
                     )
-                    .on_click(move |_, _, cx| {
+                    .on_click(move |_, window, cx| {
                         cx.stop_propagation();
-                        toggle_app.update(cx, |this, cx| {
-                            this.toggle_todo_tag_assignment(todo_id, tag_id, cx);
-                        });
+                        if selected {
+                            SynapseApp::request_dangerous_action(
+                                DangerousAction::RemoveTodoTagAssignment {
+                                    todo_id,
+                                    tag_id,
+                                    display_name: tag_name.clone(),
+                                },
+                                toggle_app.clone(),
+                                window,
+                                cx,
+                            );
+                        } else {
+                            toggle_app.update(cx, |this, cx| {
+                                this.toggle_todo_tag_assignment(todo_id, tag_id, cx);
+                            });
+                        }
                     })
                 }))
                 .when(workspace.tags().is_empty(), |panel| {

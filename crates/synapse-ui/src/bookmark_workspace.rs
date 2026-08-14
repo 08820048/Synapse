@@ -20,7 +20,7 @@ use gpui_component::{
 use super::todo_workspace::{
     TAG_PILL_TRANSITION, TAG_ROW_GAP, TAG_ROW_HEIGHT, TagPillSpring, tag_color,
 };
-use super::{AppLanguage, Icon, SynapseApp, SynapseThemePalette};
+use super::{AppLanguage, DangerousAction, Icon, SynapseApp, SynapseThemePalette};
 
 const CONTENT_MAX_WIDTH: f32 = 940.0;
 const TAG_COLUMN_WIDTH: f32 = 168.0;
@@ -1140,6 +1140,7 @@ pub(super) fn render_bookmark_workspace(
                     let bookmark_id = picker.bookmark_id;
                     let tag_id = tag.id;
                     let selected = assigned.contains(&tag.name);
+                    let tag_name = tag.name.clone();
                     let toggle_app = panel_app.clone();
                     Button::new(SharedString::from(format!(
                         "bookmark-{bookmark_id}-picker-tag-{tag_id}"
@@ -1166,11 +1167,24 @@ pub(super) fn render_bookmark_workspace(
                                 row.child(Icon::Check.render(13.0).text_color(theme.foreground))
                             }),
                     )
-                    .on_click(move |_, _, cx| {
+                    .on_click(move |_, window, cx| {
                         cx.stop_propagation();
-                        toggle_app.update(cx, |this, cx| {
-                            this.toggle_bookmark_tag(bookmark_id, tag_id, cx);
-                        });
+                        if selected {
+                            SynapseApp::request_dangerous_action(
+                                DangerousAction::RemoveBookmarkTagAssignment {
+                                    bookmark_id,
+                                    tag_id,
+                                    display_name: tag_name.clone(),
+                                },
+                                toggle_app.clone(),
+                                window,
+                                cx,
+                            );
+                        } else {
+                            toggle_app.update(cx, |this, cx| {
+                                this.toggle_bookmark_tag(bookmark_id, tag_id, cx);
+                            });
+                        }
                     })
                 }))
                 .when(tags_empty, |panel| {
@@ -1209,6 +1223,7 @@ fn bookmark_filter_row(
     app: Entity<SynapseApp>,
 ) -> AnyElement {
     let delete_app = app.clone();
+    let delete_name = name.clone();
     let hover_group = SharedString::from(format!(
         "bookmark-filter-group-{}",
         tag_id.map_or_else(|| "all".to_owned(), |id| id.to_string())
@@ -1292,9 +1307,17 @@ fn bookmark_filter_row(
                     .group_hover(hover_group, |button| button.visible().opacity(1.0))
                     .tooltip(language.text("删除标签", "Delete tag"))
                     .child(Icon::Close.render(12.0).text_color(theme.faint))
-                    .on_click(move |_, _, cx| {
+                    .on_click(move |_, window, cx| {
                         cx.stop_propagation();
-                        delete_app.update(cx, |this, cx| this.delete_bookmark_tag(id, cx));
+                        SynapseApp::request_dangerous_action(
+                            DangerousAction::DeleteBookmarkTag {
+                                id,
+                                display_name: delete_name.clone(),
+                            },
+                            delete_app.clone(),
+                            window,
+                            cx,
+                        );
                     }),
             )
         })
@@ -1319,6 +1342,7 @@ fn render_bookmark_row(
     let url = bookmark.url.clone();
     let copy_url = url.clone();
     let title = bookmark.title.clone();
+    let delete_title = title.clone();
     let picker_open = tag_picker.is_some_and(|picker| picker.bookmark_id == id);
     let editing = editing_id == Some(id);
     let hover_group = SharedString::from(format!("bookmark-row-{id}"));
@@ -1409,6 +1433,7 @@ fn render_bookmark_row(
                     content.child(div().mt_1().flex().flex_wrap().gap_1().children(
                         assigned.into_iter().map(|(tag_id, name, color_index)| {
                             let remove_app = app.clone();
+                            let remove_tag_name = name.clone();
                             let color = tag_color(color_index);
                             let is_active = active_tag == Some(name.as_str());
                             div()
@@ -1434,11 +1459,18 @@ fn render_bookmark_row(
                                     .p_0()
                                     .child(Icon::Close.render(10.0).text_color(color))
                                     .on_click(
-                                        move |_, _, cx| {
+                                        move |_, window, cx| {
                                             cx.stop_propagation();
-                                            remove_app.update(cx, |this, cx| {
-                                                this.remove_bookmark_tag(id, tag_id, cx);
-                                            });
+                                            SynapseApp::request_dangerous_action(
+                                                DangerousAction::RemoveBookmarkTagAssignment {
+                                                    bookmark_id: id,
+                                                    tag_id,
+                                                    display_name: remove_tag_name.clone(),
+                                                },
+                                                remove_app.clone(),
+                                                window,
+                                                cx,
+                                            );
                                         },
                                     ),
                                 )
@@ -1493,11 +1525,17 @@ fn render_bookmark_row(
                         .p_0()
                         .tooltip(language.text("删除书签", "Delete bookmark"))
                         .child(Icon::Close.render(14.0).text_color(theme.muted))
-                        .on_click(move |_, _, cx| {
+                        .on_click(move |_, window, cx| {
                             cx.stop_propagation();
-                            delete_app.update(cx, |this, cx| {
-                                this.delete_bookmark(id, cx);
-                            });
+                            SynapseApp::request_dangerous_action(
+                                DangerousAction::DeleteBookmark {
+                                    id,
+                                    display_name: delete_title.clone(),
+                                },
+                                delete_app.clone(),
+                                window,
+                                cx,
+                            );
                         }),
                 ),
         )

@@ -9,7 +9,10 @@ use std::{
     path::{Component, Path, PathBuf},
     process::Command,
     rc::Rc,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -33,11 +36,14 @@ use gpui_animation::{
     transition::{Transition, general::EaseInOutCubic, general::EaseOutQuad},
 };
 use gpui_component::{
-    ActiveTheme, Disableable as _, IconName, Root, Sizable as _, Theme, ThemeMode,
-    button::{Button, ButtonCustomVariant, ButtonRounded, ButtonVariants as _},
+    ActiveTheme, Disableable as _, IconName, Root, Sizable as _, Theme, ThemeMode, WindowExt as _,
+    alert::Alert,
+    button::{Button, ButtonCustomVariant, ButtonRounded, ButtonVariant, ButtonVariants as _},
+    dialog::DialogButtonProps,
     group_box::GroupBoxVariant,
     input::{Input, InputEvent, InputState},
     kbd::Kbd,
+    notification::Notification,
     setting::{SettingField, SettingGroup, SettingItem, SettingPage, Settings},
     switch::Switch,
 };
@@ -149,6 +155,54 @@ const SELECTION_LINK_MENU_WIDTH: f32 = 264.0;
 const SELECTION_ASK_PANEL_WIDTH: f32 = 340.0;
 const SELECTION_ASK_PANEL_HEIGHT: f32 = 56.0;
 const SELECTION_ASK_PANEL_GAP: f32 = 8.0;
+static APP_ALERT_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)] // Info/Warning are part of the reusable notification contract.
+enum AppNotificationVariant {
+    Info,
+    Success,
+    Warning,
+    Error,
+}
+
+fn push_alert_notification(
+    window: &mut Window,
+    cx: &mut App,
+    variant: AppNotificationVariant,
+    title: impl Into<SharedString>,
+    message: impl Into<SharedString>,
+) {
+    let title = title.into();
+    let message = message.into();
+    let alert_id = SharedString::from(format!(
+        "synapse-alert-{}",
+        APP_ALERT_ID.fetch_add(1, Ordering::Relaxed)
+    ));
+    let notification = Notification::new()
+        .border_0()
+        .bg(hsla(0.0, 0.0, 0.0, 0.0))
+        .shadow_none()
+        .p_0()
+        .content(move |_, _, _| {
+            match variant {
+                AppNotificationVariant::Info => {
+                    Alert::info(alert_id.clone(), message.clone()).title(title.clone())
+                }
+                AppNotificationVariant::Success => {
+                    Alert::success(alert_id.clone(), message.clone()).title(title.clone())
+                }
+                AppNotificationVariant::Warning => {
+                    Alert::warning(alert_id.clone(), message.clone()).title(title.clone())
+                }
+                AppNotificationVariant::Error => {
+                    Alert::error(alert_id.clone(), message.clone()).title(title.clone())
+                }
+            }
+            .into_any_element()
+        });
+    window.push_notification(notification, cx);
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 struct MarkdPanelSpring;
@@ -743,6 +797,201 @@ struct TreeTarget {
     relative_path: PathBuf,
     name: String,
     kind: VaultEntryKind,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum DangerousAction {
+    TrashTreeEntry {
+        target: TreeTarget,
+    },
+    TrashActiveNote {
+        relative_path: PathBuf,
+        display_name: String,
+    },
+    DeleteTodo {
+        id: u64,
+        display_name: String,
+    },
+    ClearCompletedTodos {
+        count: usize,
+    },
+    DeleteTodoTag {
+        id: u64,
+        display_name: String,
+    },
+    RemoveTodoTagAssignment {
+        todo_id: u64,
+        tag_id: u64,
+        display_name: String,
+    },
+    DeleteBookmark {
+        id: u64,
+        display_name: String,
+    },
+    DeleteBookmarkTag {
+        id: u64,
+        display_name: String,
+    },
+    RemoveBookmarkTagAssignment {
+        bookmark_id: u64,
+        tag_id: u64,
+        display_name: String,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DangerousActionCopy {
+    title: String,
+    description: String,
+    confirm_label: String,
+    success_title: String,
+    success_message: String,
+}
+
+impl DangerousAction {
+    fn is_actionable(&self) -> bool {
+        !matches!(self, Self::ClearCompletedTodos { count: 0 })
+    }
+
+    fn copy(&self, language: AppLanguage) -> DangerousActionCopy {
+        let confirm_label = if matches!(
+            self,
+            Self::TrashTreeEntry { .. } | Self::TrashActiveNote { .. }
+        ) {
+            language.text("移到废纸篓", "Move to Trash").to_owned()
+        } else {
+            language.text("确认删除", "Delete").to_owned()
+        };
+        let success_title = language.text("操作成功", "Action completed").to_owned();
+        let (title, description, success_message) = match self {
+            Self::TrashTreeEntry { target } => {
+                let kind = match target.kind {
+                    VaultEntryKind::Directory => language.text("文件夹", "folder"),
+                    VaultEntryKind::Note => language.text("笔记", "note"),
+                };
+                (
+                    language.text("移到废纸篓？", "Move to Trash?").to_owned(),
+                    match language {
+                        AppLanguage::SimplifiedChinese => format!(
+                            "确定要将{kind}“{}”移到废纸篓吗？此操作会关闭受影响的页签。",
+                            target.name
+                        ),
+                        AppLanguage::English => format!(
+                            "Move the {kind} “{}” to Trash? Any affected tabs will be closed.",
+                            target.name
+                        ),
+                    },
+                    match language {
+                        AppLanguage::SimplifiedChinese => {
+                            format!("“{}”已移到废纸篓", target.name)
+                        }
+                        AppLanguage::English => {
+                            format!("“{}” was moved to Trash", target.name)
+                        }
+                    },
+                )
+            }
+            Self::TrashActiveNote { display_name, .. } => (
+                language.text("删除笔记？", "Delete Note?").to_owned(),
+                match language {
+                    AppLanguage::SimplifiedChinese => {
+                        format!("确定要将笔记“{display_name}”移到废纸篓吗？")
+                    }
+                    AppLanguage::English => {
+                        format!("Move the note “{display_name}” to Trash?")
+                    }
+                },
+                match language {
+                    AppLanguage::SimplifiedChinese => {
+                        format!("笔记“{display_name}”已移到废纸篓")
+                    }
+                    AppLanguage::English => {
+                        format!("Note “{display_name}” was moved to Trash")
+                    }
+                },
+            ),
+            Self::DeleteTodo { display_name, .. } => (
+                language.text("删除待办？", "Delete Todo?").to_owned(),
+                match language {
+                    AppLanguage::SimplifiedChinese => {
+                        format!("确定要永久删除待办“{display_name}”吗？")
+                    }
+                    AppLanguage::English => {
+                        format!("Permanently delete the todo “{display_name}”?")
+                    }
+                },
+                language.text("待办已删除", "Todo deleted").to_owned(),
+            ),
+            Self::ClearCompletedTodos { count } => (
+                language
+                    .text("清除已完成待办？", "Clear Completed Todos?")
+                    .to_owned(),
+                match language {
+                    AppLanguage::SimplifiedChinese => {
+                        format!("确定要永久删除 {count} 条已完成待办吗？")
+                    }
+                    AppLanguage::English => {
+                        format!("Permanently delete {count} completed todos?")
+                    }
+                },
+                match language {
+                    AppLanguage::SimplifiedChinese => format!("已清除 {count} 条完成项"),
+                    AppLanguage::English => format!("Cleared {count} completed todos"),
+                },
+            ),
+            Self::DeleteTodoTag { display_name, .. }
+            | Self::DeleteBookmarkTag { display_name, .. } => (
+                language.text("删除标签？", "Delete Tag?").to_owned(),
+                match language {
+                    AppLanguage::SimplifiedChinese => {
+                        format!("确定要删除标签“{display_name}”吗？该标签会从所有关联项目中移除。")
+                    }
+                    AppLanguage::English => format!(
+                        "Delete the tag “{display_name}”? It will be removed from every associated item."
+                    ),
+                },
+                match language {
+                    AppLanguage::SimplifiedChinese => format!("标签“{display_name}”已删除"),
+                    AppLanguage::English => format!("Tag “{display_name}” deleted"),
+                },
+            ),
+            Self::RemoveTodoTagAssignment { display_name, .. }
+            | Self::RemoveBookmarkTagAssignment { display_name, .. } => (
+                language.text("移除标签？", "Remove Tag?").to_owned(),
+                match language {
+                    AppLanguage::SimplifiedChinese => {
+                        format!("确定要从当前项目中移除标签“{display_name}”吗？")
+                    }
+                    AppLanguage::English => {
+                        format!("Remove the tag “{display_name}” from this item?")
+                    }
+                },
+                match language {
+                    AppLanguage::SimplifiedChinese => format!("标签“{display_name}”已移除"),
+                    AppLanguage::English => format!("Tag “{display_name}” removed"),
+                },
+            ),
+            Self::DeleteBookmark { display_name, .. } => (
+                language.text("删除书签？", "Delete Bookmark?").to_owned(),
+                match language {
+                    AppLanguage::SimplifiedChinese => {
+                        format!("确定要永久删除书签“{display_name}”吗？")
+                    }
+                    AppLanguage::English => {
+                        format!("Permanently delete the bookmark “{display_name}”?")
+                    }
+                },
+                language.text("书签已删除", "Bookmark deleted").to_owned(),
+            ),
+        };
+        DangerousActionCopy {
+            title,
+            description,
+            confirm_label,
+            success_title,
+            success_message,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1620,37 +1869,6 @@ impl SynapseApp {
         }
     }
 
-    fn remove_bookmark_tag(&mut self, bookmark_id: u64, tag_id: u64, cx: &mut Context<Self>) {
-        if self.bookmark_workspace.remove_tag(bookmark_id, tag_id) {
-            self.bookmark_query_error = self.bookmark_workspace.save_default().err().map(|error| {
-                format!(
-                    "{}: {error}",
-                    self.language.text(
-                        "标签已取消分配，但无法保存",
-                        "Tag removed but could not be saved"
-                    )
-                )
-            });
-            cx.notify();
-        }
-    }
-
-    fn delete_bookmark_tag(&mut self, tag_id: u64, cx: &mut Context<Self>) {
-        if self.bookmark_workspace.delete_tag(tag_id) {
-            self.bookmark_tag_picker = None;
-            self.bookmark_tag_error = self.bookmark_workspace.save_default().err().map(|error| {
-                format!(
-                    "{}: {error}",
-                    self.language.text(
-                        "标签已删除，但无法保存",
-                        "Tag deleted but could not be saved"
-                    )
-                )
-            });
-            cx.notify();
-        }
-    }
-
     fn open_bookmark_url(&mut self, bookmark_id: u64, cx: &mut Context<Self>) {
         if let Some(url) = self
             .bookmark_workspace
@@ -1665,28 +1883,6 @@ impl SynapseApp {
         cx.write_to_clipboard(ClipboardItem::new_string(url));
         self.bookmark_query_error = None;
         cx.notify();
-    }
-
-    fn delete_bookmark(&mut self, bookmark_id: u64, cx: &mut Context<Self>) {
-        if self.bookmark_workspace.delete_bookmark(bookmark_id) {
-            self.bookmark_fetching_ids.remove(&bookmark_id);
-            if self
-                .bookmark_tag_picker
-                .is_some_and(|picker| picker.bookmark_id == bookmark_id)
-            {
-                self.bookmark_tag_picker = None;
-            }
-            self.bookmark_query_error = self.bookmark_workspace.save_default().err().map(|error| {
-                format!(
-                    "{}: {error}",
-                    self.language.text(
-                        "书签已删除，但无法保存",
-                        "Bookmark deleted but could not be saved"
-                    )
-                )
-            });
-            cx.notify();
-        }
     }
 
     fn toggle_bookmark_quick_picker(&mut self, cx: &mut Context<Self>) {
@@ -1992,92 +2188,223 @@ impl SynapseApp {
         }
     }
 
-    fn remove_todo_tag_assignment(&mut self, todo_id: u64, tag_id: u64, cx: &mut Context<Self>) {
-        if self.todo_workspace.remove_todo_tag(todo_id, tag_id) {
-            self.todo_item_error = self.todo_workspace.save_default().err().map(|error| {
-                format!(
-                    "{}: {error}",
-                    self.language.text(
-                        "标签已取消分配，但无法保存",
-                        "Tag removed but could not be saved"
-                    )
-                )
-            });
-            cx.notify();
-        }
-    }
-
-    fn delete_todo_tag(&mut self, tag_id: u64, cx: &mut Context<Self>) {
-        if self.todo_workspace.delete_tag(tag_id) {
-            self.todo_tag_error = self.todo_workspace.save_default().err().map(|error| {
-                format!(
-                    "{}: {error}",
-                    self.language.text(
-                        "标签已删除，但无法保存",
-                        "Tag deleted but could not be saved"
-                    )
-                )
-            });
-            cx.notify();
-        }
-    }
-
     fn copy_todo_text(&mut self, text: String, cx: &mut Context<Self>) {
         cx.write_to_clipboard(ClipboardItem::new_string(text));
         self.todo_item_error = None;
         cx.notify();
     }
 
-    fn delete_todo_item(&mut self, todo_id: u64, cx: &mut Context<Self>) {
-        if self.todo_workspace.delete_todo(todo_id) {
-            self.todo_auto_clear_generations.remove(&todo_id);
-            self.todo_auto_clear_pending.remove(&todo_id);
-            self.todo_auto_clear_exiting.remove(&todo_id);
-            if self
-                .todo_tag_picker
-                .is_some_and(|picker| picker.todo_id == todo_id)
-            {
-                self.todo_tag_picker = None;
-            }
-            self.todo_item_error = self.todo_workspace.save_default().err().map(|error| {
-                format!(
-                    "{}: {error}",
-                    self.language.text(
-                        "待办已删除，但无法保存",
-                        "Todo deleted but could not be saved"
-                    )
-                )
-            });
-            cx.notify();
-        }
-    }
-
-    fn clear_completed_todos(&mut self, cx: &mut Context<Self>) {
-        if self.todo_workspace.clear_completed() == 0 {
+    fn request_dangerous_action(
+        action: DangerousAction,
+        app: Entity<Self>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        if !action.is_actionable() {
             return;
         }
-        if self
-            .todo_tag_picker
-            .is_some_and(|picker| !self.todo_workspace.contains_todo(picker.todo_id))
-        {
-            self.todo_tag_picker = None;
-        }
-        self.todo_auto_clear_generations
-            .retain(|todo_id, _| self.todo_workspace.contains_todo(*todo_id));
-        self.todo_auto_clear_pending
-            .retain(|todo_id| self.todo_workspace.contains_todo(*todo_id));
-        self.todo_auto_clear_exiting
-            .retain(|todo_id| self.todo_workspace.contains_todo(*todo_id));
-        self.todo_item_error = self.todo_workspace.save_default().err().map(|error| {
-            format!(
-                "{}: {error}",
-                self.language.text(
-                    "已清除完成项，但无法保存",
-                    "Completed todos cleared but could not be saved"
+
+        let language = app.read(cx).language;
+        let copy = action.copy(language);
+        app.update(cx, |this, cx| this.dismiss_context_menus(cx));
+
+        let dialog_action = action.clone();
+        let dialog_app = app.clone();
+        let dialog_copy = copy.clone();
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let execute_app = dialog_app.clone();
+            let execute_action = dialog_action.clone();
+            let success_title = dialog_copy.success_title.clone();
+            let success_message = dialog_copy.success_message.clone();
+            let failure_title = match language {
+                AppLanguage::SimplifiedChinese => "操作失败".to_owned(),
+                AppLanguage::English => "Action failed".to_owned(),
+            };
+            dialog
+                .title(dialog_copy.title.clone())
+                .confirm()
+                .button_props(
+                    DialogButtonProps::default()
+                        .ok_text(dialog_copy.confirm_label.clone())
+                        .ok_variant(ButtonVariant::Danger)
+                        .cancel_text(language.text("取消", "Cancel")),
                 )
-            )
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(dialog_copy.description.clone()),
+                )
+                .on_ok(move |_, window, cx| {
+                    let result = execute_app.update(cx, |this, cx| {
+                        this.execute_dangerous_action(&execute_action, cx)
+                    });
+                    match result {
+                        Ok(()) => push_alert_notification(
+                            window,
+                            cx,
+                            AppNotificationVariant::Success,
+                            success_title.clone(),
+                            success_message.clone(),
+                        ),
+                        Err(error) => push_alert_notification(
+                            window,
+                            cx,
+                            AppNotificationVariant::Error,
+                            failure_title.clone(),
+                            error,
+                        ),
+                    }
+                    true
+                })
         });
+    }
+
+    fn execute_dangerous_action(
+        &mut self,
+        action: &DangerousAction,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let missing = || {
+            self.language
+                .text(
+                    "目标不存在或已被其他操作移除",
+                    "The target no longer exists or was removed by another operation",
+                )
+                .to_owned()
+        };
+
+        match action {
+            DangerousAction::TrashTreeEntry { target } => {
+                self.state
+                    .trash_entry(&target.relative_path)
+                    .map_err(|error| error.to_string())?;
+                self.collapsed_directories.clear();
+            }
+            DangerousAction::TrashActiveNote { relative_path, .. } => {
+                self.state
+                    .trash_entry(relative_path)
+                    .map_err(|error| error.to_string())?;
+                self.editor_selection.collapse(self.state.cursor());
+                self.editor_marked_range = None;
+                self.editor_render_cache = None;
+            }
+            DangerousAction::DeleteTodo { id, .. } => {
+                let previous = self.todo_workspace.clone();
+                if !self.todo_workspace.delete_todo(*id) {
+                    return Err(missing());
+                }
+                if let Err(error) = self.todo_workspace.save_default() {
+                    self.todo_workspace = previous;
+                    return Err(error.to_string());
+                }
+                self.todo_auto_clear_generations.remove(id);
+                self.todo_auto_clear_pending.remove(id);
+                self.todo_auto_clear_exiting.remove(id);
+                if self
+                    .todo_tag_picker
+                    .is_some_and(|picker| picker.todo_id == *id)
+                {
+                    self.todo_tag_picker = None;
+                }
+                self.todo_item_error = None;
+            }
+            DangerousAction::ClearCompletedTodos { .. } => {
+                let previous = self.todo_workspace.clone();
+                if self.todo_workspace.clear_completed() == 0 {
+                    return Err(missing());
+                }
+                if let Err(error) = self.todo_workspace.save_default() {
+                    self.todo_workspace = previous;
+                    return Err(error.to_string());
+                }
+                if self
+                    .todo_tag_picker
+                    .is_some_and(|picker| !self.todo_workspace.contains_todo(picker.todo_id))
+                {
+                    self.todo_tag_picker = None;
+                }
+                self.todo_auto_clear_generations
+                    .retain(|todo_id, _| self.todo_workspace.contains_todo(*todo_id));
+                self.todo_auto_clear_pending
+                    .retain(|todo_id| self.todo_workspace.contains_todo(*todo_id));
+                self.todo_auto_clear_exiting
+                    .retain(|todo_id| self.todo_workspace.contains_todo(*todo_id));
+                self.todo_item_error = None;
+            }
+            DangerousAction::DeleteTodoTag { id, .. } => {
+                let previous = self.todo_workspace.clone();
+                if !self.todo_workspace.delete_tag(*id) {
+                    return Err(missing());
+                }
+                if let Err(error) = self.todo_workspace.save_default() {
+                    self.todo_workspace = previous;
+                    return Err(error.to_string());
+                }
+                self.todo_tag_picker = None;
+                self.todo_tag_error = None;
+            }
+            DangerousAction::RemoveTodoTagAssignment {
+                todo_id, tag_id, ..
+            } => {
+                let previous = self.todo_workspace.clone();
+                if !self.todo_workspace.remove_todo_tag(*todo_id, *tag_id) {
+                    return Err(missing());
+                }
+                if let Err(error) = self.todo_workspace.save_default() {
+                    self.todo_workspace = previous;
+                    return Err(error.to_string());
+                }
+                self.todo_item_error = None;
+            }
+            DangerousAction::DeleteBookmark { id, .. } => {
+                let previous = self.bookmark_workspace.clone();
+                if !self.bookmark_workspace.delete_bookmark(*id) {
+                    return Err(missing());
+                }
+                if let Err(error) = self.bookmark_workspace.save_default() {
+                    self.bookmark_workspace = previous;
+                    return Err(error.to_string());
+                }
+                self.bookmark_fetching_ids.remove(id);
+                if self
+                    .bookmark_tag_picker
+                    .is_some_and(|picker| picker.bookmark_id == *id)
+                {
+                    self.bookmark_tag_picker = None;
+                }
+                self.bookmark_query_error = None;
+            }
+            DangerousAction::DeleteBookmarkTag { id, .. } => {
+                let previous = self.bookmark_workspace.clone();
+                if !self.bookmark_workspace.delete_tag(*id) {
+                    return Err(missing());
+                }
+                if let Err(error) = self.bookmark_workspace.save_default() {
+                    self.bookmark_workspace = previous;
+                    return Err(error.to_string());
+                }
+                self.bookmark_tag_picker = None;
+                self.bookmark_tag_error = None;
+            }
+            DangerousAction::RemoveBookmarkTagAssignment {
+                bookmark_id,
+                tag_id,
+                ..
+            } => {
+                let previous = self.bookmark_workspace.clone();
+                if !self.bookmark_workspace.remove_tag(*bookmark_id, *tag_id) {
+                    return Err(missing());
+                }
+                if let Err(error) = self.bookmark_workspace.save_default() {
+                    self.bookmark_workspace = previous;
+                    return Err(error.to_string());
+                }
+                self.bookmark_query_error = None;
+            }
+        }
         cx.notify();
+        Ok(())
     }
 
     fn begin_new_todo_tag(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2290,39 +2617,93 @@ impl SynapseApp {
         cx.notify();
     }
 
-    fn prompt_for_vault(&mut self, cx: &mut Context<Self>) {
+    fn prompt_for_vault(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let receiver = cx.prompt_for_paths(PathPromptOptions {
             files: false,
             directories: true,
             multiple: false,
-            prompt: Some("Choose Workspace".into()),
+            prompt: Some(self.language.text("选择工作区", "Choose Workspace").into()),
         });
 
-        cx.spawn(async move |this, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             let result = receiver.await;
-            let _ = this.update(cx, |this, cx| {
+            let _ = this.update_in(cx, |this, window, cx| {
                 match result {
                     Ok(Ok(Some(paths))) => {
-                        if let Some(path) = paths.into_iter().next()
-                            && this.state.open_vault(&path).is_ok()
-                        {
-                            this.vault_persistence_error =
-                                save_vault_preference(&path).err().map(|error| {
-                                    format!("Workspace preference could not be saved: {error}")
-                                });
-                            this.collapsed_directories.clear();
-                            this.editor_selection.collapse(0);
-                            this.editor_marked_range = None;
-                            this.restart_vault_watcher(cx);
+                        if let Some(path) = paths.into_iter().next() {
+                            match this.state.open_vault(&path) {
+                                Ok(()) => {
+                                    this.vault_persistence_error =
+                                        save_vault_preference(&path).err().map(|error| {
+                                            format!(
+                                                "Workspace preference could not be saved: {error}"
+                                            )
+                                        });
+                                    this.collapsed_directories.clear();
+                                    this.editor_selection.collapse(0);
+                                    this.editor_marked_range = None;
+                                    this.restart_vault_watcher(cx);
+                                    push_alert_notification(
+                                        window,
+                                        cx,
+                                        AppNotificationVariant::Success,
+                                        this.language.text("工作区已切换", "Workspace changed"),
+                                        match this.language {
+                                            AppLanguage::SimplifiedChinese => {
+                                                format!("当前工作区：{}", path.display())
+                                            }
+                                            AppLanguage::English => {
+                                                format!("Current workspace: {}", path.display())
+                                            }
+                                        },
+                                    );
+                                }
+                                Err(error) => push_alert_notification(
+                                    window,
+                                    cx,
+                                    AppNotificationVariant::Error,
+                                    this.language
+                                        .text("无法切换工作区", "Could not change workspace"),
+                                    error.to_string(),
+                                ),
+                            }
                         }
                     }
                     Ok(Ok(None)) => {}
-                    Ok(Err(error)) => this
-                        .state
-                        .set_error_message(format!("Unable to open the folder picker: {error}")),
-                    Err(error) => this.state.set_error_message(format!(
-                        "The folder picker closed unexpectedly: {error}"
-                    )),
+                    Ok(Err(error)) => {
+                        let message = format!(
+                            "{}: {error}",
+                            this.language
+                                .text("无法打开文件夹选择器", "Unable to open the folder picker")
+                        );
+                        this.state.set_error_message(message.clone());
+                        push_alert_notification(
+                            window,
+                            cx,
+                            AppNotificationVariant::Error,
+                            this.language
+                                .text("工作区切换失败", "Workspace change failed"),
+                            message,
+                        );
+                    }
+                    Err(error) => {
+                        let message = format!(
+                            "{}: {error}",
+                            this.language.text(
+                                "文件夹选择器意外关闭",
+                                "The folder picker closed unexpectedly"
+                            )
+                        );
+                        this.state.set_error_message(message.clone());
+                        push_alert_notification(
+                            window,
+                            cx,
+                            AppNotificationVariant::Error,
+                            this.language
+                                .text("工作区切换失败", "Workspace change failed"),
+                            message,
+                        );
+                    }
                 }
                 cx.notify();
             });
@@ -2529,23 +2910,6 @@ impl SynapseApp {
         .detach();
     }
 
-    fn trash_active_note(&mut self, cx: &mut Context<Self>) {
-        let Some(path) = self
-            .state
-            .active_document()
-            .map(|document| document.relative_path().to_path_buf())
-        else {
-            return;
-        };
-        if self.state.trash_entry(&path).is_ok() {
-            self.editor_selection.collapse(self.state.cursor());
-            self.editor_marked_range = None;
-            self.editor_render_cache = None;
-        }
-        self.dismiss_context_menus(cx);
-        cx.notify();
-    }
-
     fn create_untitled_note(&mut self, parent: &Path, window: &mut Window, cx: &mut Context<Self>) {
         if self.state.create_untitled_note(parent).is_ok() {
             self.workspace_view = WorkspaceView::Note;
@@ -2648,13 +3012,6 @@ impl SynapseApp {
                 }
             }
             Err(error) => self.state.set_error_message(error.to_string()),
-        }
-        self.dismiss_context_menus(cx);
-    }
-
-    fn trash_tree_target(&mut self, target: &TreeTarget, cx: &mut Context<Self>) {
-        if self.state.trash_entry(&target.relative_path).is_ok() {
-            self.collapsed_directories.clear();
         }
         self.dismiss_context_menus(cx);
     }
@@ -4599,8 +4956,23 @@ impl SettingsWindow {
     }
 }
 
+fn render_component_root_layers(window: &mut Window, cx: &mut App) -> Vec<AnyElement> {
+    let mut layers = Vec::with_capacity(3);
+    if let Some(layer) = Root::render_sheet_layer(window, cx) {
+        layers.push(layer.into_any_element());
+    }
+    if let Some(layer) = Root::render_dialog_layer(window, cx) {
+        layers.push(layer.into_any_element());
+    }
+    if let Some(layer) = Root::render_notification_layer(window, cx) {
+        layers.push(layer.into_any_element());
+    }
+    layers
+}
+
 impl Render for SettingsWindow {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let component_layers = render_component_root_layers(window, cx);
         let (vault_path, language, preference_errors) = {
             let app = self.app.read(cx);
             (
@@ -4624,14 +4996,17 @@ impl Render for SettingsWindow {
                 .collect::<Vec<_>>(),
             )
         };
-        render_settings_content(
-            self.app.clone(),
-            vault_path,
-            language,
-            preference_errors,
-            cx.theme().danger,
-            cx.theme().background,
-        )
+        div()
+            .size_full()
+            .child(render_settings_content(
+                self.app.clone(),
+                vault_path,
+                language,
+                preference_errors,
+                cx.theme().danger,
+                cx.theme().background,
+            ))
+            .children(component_layers)
     }
 }
 
@@ -4834,9 +5209,9 @@ fn render_settings_content(
                     .with_size(options.size)
                     .icon(IconName::FolderOpen)
                     .label(language.text("更换", "Change"))
-                    .on_click(move |_, _, cx| {
+                    .on_click(move |_, window, cx| {
                         app.update(cx, |this, cx| {
-                            this.prompt_for_vault(cx);
+                            this.prompt_for_vault(window, cx);
                         });
                     }),
             )
@@ -4912,6 +5287,7 @@ fn render_settings_content(
 
 impl Render for SynapseApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let component_layers = render_component_root_layers(window, cx);
         let theme = cx.theme().clone();
         let app_entity = cx.entity();
         let command_kbd = Kbd::binding_for_action(&OpenCommandPalette, None, window);
@@ -5588,9 +5964,9 @@ impl Render for SynapseApp {
                                     .primary()
                                     .large()
                                     .label(self.language.text("打开 Vault", "Open Vault"))
-                                    .on_click(move |_, _, cx| {
+                                    .on_click(move |_, window, cx| {
                                         app.update(cx, |this, cx| {
-                                            this.prompt_for_vault(cx);
+                                            this.prompt_for_vault(window, cx);
                                         });
                                     }),
                             )
@@ -7008,11 +7384,16 @@ impl Render for SynapseApp {
                                 self.language.text("删除文件夹", "Delete Folder"),
                                 theme.danger,
                             ))
-                            .on_click(move |_, _, cx| {
+                            .on_click(move |_, window, cx| {
                                 cx.stop_propagation();
-                                trash_app.update(cx, |this, cx| {
-                                    this.trash_tree_target(&trash_target, cx);
-                                });
+                                SynapseApp::request_dangerous_action(
+                                    DangerousAction::TrashTreeEntry {
+                                        target: trash_target.clone(),
+                                    },
+                                    trash_app.clone(),
+                                    window,
+                                    cx,
+                                );
                             }),
                     )
                     .into_any_element()
@@ -7069,11 +7450,16 @@ impl Render for SynapseApp {
                                 self.language.text("移到废纸篓", "Move to Trash"),
                                 theme.danger,
                             ))
-                            .on_click(move |_, _, cx| {
+                            .on_click(move |_, window, cx| {
                                 cx.stop_propagation();
-                                trash_app.update(cx, |this, cx| {
-                                    this.trash_tree_target(&trash_target, cx);
-                                });
+                                SynapseApp::request_dangerous_action(
+                                    DangerousAction::TrashTreeEntry {
+                                        target: trash_target.clone(),
+                                    },
+                                    trash_app.clone(),
+                                    window,
+                                    cx,
+                                );
                             }),
                     )
                     .into_any_element()
@@ -7154,11 +7540,30 @@ impl Render for SynapseApp {
                             self.language.text("删除笔记", "Delete Note"),
                             theme.danger,
                         ))
-                        .on_click(move |_, _, cx| {
+                        .on_click(move |_, window, cx| {
                             cx.stop_propagation();
-                            trash_app.update(cx, |this, cx| {
-                                this.trash_active_note(cx);
-                            });
+                            let action = {
+                                let this = trash_app.read(cx);
+                                this.state.active_document().map(|document| {
+                                    DangerousAction::TrashActiveNote {
+                                        relative_path: document.relative_path().to_path_buf(),
+                                        display_name: document
+                                            .relative_path()
+                                            .file_stem()
+                                            .and_then(|name| name.to_str())
+                                            .unwrap_or("note")
+                                            .to_owned(),
+                                    }
+                                })
+                            };
+                            if let Some(action) = action {
+                                SynapseApp::request_dangerous_action(
+                                    action,
+                                    trash_app.clone(),
+                                    window,
+                                    cx,
+                                );
+                            }
                         }),
                 )
                 .opacity(0.0)
@@ -7260,11 +7665,11 @@ impl Render for SynapseApp {
                                         .flex_1()
                                         .child(self.language.text("打开 Vault…", "Open Vault…")),
                                 )
-                                .on_click(move |_, _, cx| {
+                                .on_click(move |_, window, cx| {
                                     cx.stop_propagation();
                                     open_vault_app.update(cx, |this, cx| {
                                         this.dismiss_command_palette(cx);
-                                        this.prompt_for_vault(cx);
+                                        this.prompt_for_vault(window, cx);
                                     });
                                 }),
                         )
@@ -7365,6 +7770,7 @@ impl Render for SynapseApp {
             .children(tree_context_menu)
             .children(note_actions_menu)
             .children(command_palette)
+            .children(component_layers)
     }
 }
 
@@ -8197,18 +8603,18 @@ mod tests {
 
     use super::editor_surface::source_lines;
     use super::{
-        AppLanguage, EDITOR_BODY_FONT_SIZE, EDITOR_BODY_LINE_HEIGHT, EDITOR_COMPACT_GUTTER,
-        EDITOR_PAGE_MAX_WIDTH, EDITOR_REGULAR_GUTTER, EDITOR_RULE_BLOCK_HEIGHT,
-        EDITOR_RULE_THICKNESS, EDITOR_TOP_PADDING, EDITOR_WIDE_GUTTER, FileTreeRow, InlineFormat,
-        InlineFormatEdit, MARKD_PANEL_SPRING_DAMPING, MARKD_PANEL_SPRING_MASS,
-        MARKD_PANEL_SPRING_STIFFNESS, MENU_ITEM_ICON_SIZE, MENU_ITEM_ICON_SLOT_SIZE,
-        MarkdownImagePreview, PANEL_TRANSITION, SETTINGS_WINDOW_MIN_HEIGHT,
-        SETTINGS_WINDOW_MIN_WIDTH, SIDEBAR_FOOTER_HEIGHT, SIDEBAR_SEARCH_CONTENT_WIDTH,
-        SIDEBAR_SEARCH_INNER_PADDING, SIDEBAR_SEARCH_OUTER_MARGIN, SIDEBAR_SHORTCUT_ACTION_WIDTH,
-        SIDEBAR_TREE_FONT_FAMILY, SIDEBAR_TREE_FONT_SIZE, SIDEBAR_TREE_ROW_HEIGHT,
-        TABLE_CELL_HORIZONTAL_PADDING, TABLE_CELL_VERTICAL_PADDING, TABLE_FONT_SIZE,
-        TABLE_ROW_MIN_HEIGHT, TITLEBAR_HEIGHT, TODO_AUTO_CLEAR_COMPLETED_HOLD,
-        TODO_AUTO_CLEAR_EXIT, TODO_AUTO_CLEAR_EXIT_OFFSET, ThemePreference,
+        AppLanguage, DangerousAction, EDITOR_BODY_FONT_SIZE, EDITOR_BODY_LINE_HEIGHT,
+        EDITOR_COMPACT_GUTTER, EDITOR_PAGE_MAX_WIDTH, EDITOR_REGULAR_GUTTER,
+        EDITOR_RULE_BLOCK_HEIGHT, EDITOR_RULE_THICKNESS, EDITOR_TOP_PADDING, EDITOR_WIDE_GUTTER,
+        FileTreeRow, InlineFormat, InlineFormatEdit, MARKD_PANEL_SPRING_DAMPING,
+        MARKD_PANEL_SPRING_MASS, MARKD_PANEL_SPRING_STIFFNESS, MENU_ITEM_ICON_SIZE,
+        MENU_ITEM_ICON_SLOT_SIZE, MarkdownImagePreview, PANEL_TRANSITION,
+        SETTINGS_WINDOW_MIN_HEIGHT, SETTINGS_WINDOW_MIN_WIDTH, SIDEBAR_FOOTER_HEIGHT,
+        SIDEBAR_SEARCH_CONTENT_WIDTH, SIDEBAR_SEARCH_INNER_PADDING, SIDEBAR_SEARCH_OUTER_MARGIN,
+        SIDEBAR_SHORTCUT_ACTION_WIDTH, SIDEBAR_TREE_FONT_FAMILY, SIDEBAR_TREE_FONT_SIZE,
+        SIDEBAR_TREE_ROW_HEIGHT, TABLE_CELL_HORIZONTAL_PADDING, TABLE_CELL_VERTICAL_PADDING,
+        TABLE_FONT_SIZE, TABLE_ROW_MIN_HEIGHT, TITLEBAR_HEIGHT, TODO_AUTO_CLEAR_COMPLETED_HOLD,
+        TODO_AUTO_CLEAR_EXIT, TODO_AUTO_CLEAR_EXIT_OFFSET, ThemePreference, TreeTarget,
         active_document_outline_index, build_document_outline, build_file_tree_rows,
         build_image_previews, build_math_previews, build_mermaid_previews, changed_line_span,
         clipboard_image_extension, code_block_edges, command_palette_key_bindings,
@@ -9133,5 +9539,58 @@ mod tests {
         } else {
             assert_eq!(program, "xdg-open");
         }
+    }
+
+    #[test]
+    fn notification_spec_dangerous_copy_is_localized_and_names_the_target() {
+        let action = DangerousAction::DeleteTodo {
+            id: 7,
+            display_name: "发布说明".to_owned(),
+        };
+
+        let chinese = action.copy(AppLanguage::SimplifiedChinese);
+        assert_eq!(chinese.title, "删除待办？");
+        assert!(chinese.description.contains("发布说明"));
+        assert_eq!(chinese.confirm_label, "确认删除");
+
+        let english = action.copy(AppLanguage::English);
+        assert_eq!(english.title, "Delete Todo?");
+        assert!(english.description.contains("发布说明"));
+        assert_eq!(english.confirm_label, "Delete");
+    }
+
+    #[test]
+    fn notification_spec_clear_completed_requires_a_nonzero_count() {
+        assert!(!DangerousAction::ClearCompletedTodos { count: 0 }.is_actionable());
+
+        let action = DangerousAction::ClearCompletedTodos { count: 4 };
+        assert!(action.is_actionable());
+        assert!(action.copy(AppLanguage::English).description.contains('4'));
+    }
+
+    #[test]
+    fn notification_spec_trash_copy_distinguishes_folder_from_note() {
+        let folder = DangerousAction::TrashTreeEntry {
+            target: TreeTarget {
+                relative_path: PathBuf::from("archive"),
+                name: "archive".to_owned(),
+                kind: VaultEntryKind::Directory,
+            },
+        };
+        let note = DangerousAction::TrashTreeEntry {
+            target: TreeTarget {
+                relative_path: PathBuf::from("draft.md"),
+                name: "draft".to_owned(),
+                kind: VaultEntryKind::Note,
+            },
+        };
+
+        assert!(
+            folder
+                .copy(AppLanguage::English)
+                .description
+                .contains("folder")
+        );
+        assert!(note.copy(AppLanguage::English).description.contains("note"));
     }
 }
