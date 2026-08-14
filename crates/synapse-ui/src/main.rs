@@ -13,15 +13,20 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(target_os = "macos")]
+use cocoa::{
+    appkit::{NSApp, NSAppearance, NSView},
+    base::{id, nil},
+};
 use futures::StreamExt as _;
 use gpui::{
-    AnyElement, App, Application, Bounds, ClickEvent, ClipboardEntry, ClipboardItem, Context,
-    Corner, CursorStyle, ElementInputHandler, Entity, FocusHandle, Focusable, FontWeight, Hsla,
-    Image, ImageFormat, ImageSource, KeyBinding, ListAlignment, ListOffset, ListState, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, PathPromptOptions, Pixels, Point,
-    SharedString, StyledImage as _, Subscription, TitlebarOptions, Window, WindowBounds,
-    WindowControlArea, WindowOptions, actions, anchored, canvas, deferred, div, hsla, img, list,
-    point, prelude::*, px, relative, rgb, rgba, size,
+    AnyElement, AnyWindowHandle, App, Application, Bounds, ClickEvent, ClipboardEntry,
+    ClipboardItem, Context, Corner, CursorStyle, ElementInputHandler, Entity, FocusHandle,
+    Focusable, FontWeight, Hsla, Image, ImageFormat, ImageSource, KeyBinding, ListAlignment,
+    ListOffset, ListState, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit,
+    PathPromptOptions, Pixels, Point, SharedString, StyledImage as _, Subscription,
+    TitlebarOptions, Window, WindowBounds, WindowControlArea, WindowKind, WindowOptions, actions,
+    anchored, canvas, deferred, div, hsla, img, list, point, prelude::*, px, rgb, rgba, size,
 };
 use gpui_animation::{
     animation::TransitionExt,
@@ -30,8 +35,10 @@ use gpui_animation::{
 use gpui_component::{
     ActiveTheme, Disableable as _, IconName, Root, Sizable as _, Theme, ThemeMode,
     button::{Button, ButtonCustomVariant, ButtonRounded, ButtonVariants as _},
+    group_box::GroupBoxVariant,
     input::{Input, InputEvent, InputState},
     kbd::Kbd,
+    setting::{SettingField, SettingGroup, SettingItem, SettingPage, Settings},
 };
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher as _};
 use synapse::{ShellState, trailing_fenced_code_block_paragraph_edit};
@@ -88,6 +95,14 @@ const SIDEBAR_SEARCH_INNER_PADDING: f32 = 12.0;
 const SIDEBAR_SEARCH_CONTENT_WIDTH: f32 =
     SIDEBAR_WIDTH - SIDEBAR_SEARCH_OUTER_MARGIN * 2.0 - SIDEBAR_SEARCH_INNER_PADDING * 2.0;
 const QUICK_TRANSITION: Duration = Duration::from_millis(140);
+const SETTINGS_THEME_TRANSITION: Duration = Duration::from_millis(260);
+const SETTINGS_SIDEBAR_WIDTH: f32 = 240.0;
+const SETTINGS_THEME_CONTROL_WIDTH: f32 = 252.0;
+const SETTINGS_THEME_CONTROL_PADDING: f32 = 4.0;
+const SETTINGS_WINDOW_WIDTH: f32 = 1000.0;
+const SETTINGS_WINDOW_HEIGHT: f32 = 700.0;
+const SETTINGS_WINDOW_MIN_WIDTH: f32 = 760.0;
+const SETTINGS_WINDOW_MIN_HEIGHT: f32 = 520.0;
 const VAULT_REFRESH_DEBOUNCE: Duration = Duration::from_millis(180);
 const PANEL_TRANSITION: Duration = Duration::from_millis(180);
 const MARKD_PANEL_SPRING_STIFFNESS: f32 = 420.0;
@@ -233,14 +248,6 @@ impl ThemePreference {
         }
     }
 
-    fn description(self) -> &'static str {
-        match self {
-            Self::System => "Follow system appearance",
-            Self::Light => "Bright writing canvas",
-            Self::Dark => "Low-light writing canvas",
-        }
-    }
-
     fn icon(self) -> IconName {
         match self {
             Self::System => IconName::Palette,
@@ -300,11 +307,35 @@ fn synapse_theme_palette(dark: bool) -> SynapseThemePalette {
     }
 }
 
-fn apply_synapse_theme(preference: ThemePreference, window: Option<&mut Window>, cx: &mut App) {
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    static NSAppearanceNameAqua: id;
+    static NSAppearanceNameDarkAqua: id;
+}
+
+fn apply_native_application_appearance(preference: ThemePreference) {
+    #[cfg(target_os = "macos")]
+    unsafe {
+        let appearance = match preference {
+            ThemePreference::System => nil,
+            ThemePreference::Light => NSAppearance(NSAppearanceNameAqua),
+            ThemePreference::Dark => NSAppearance(NSAppearanceNameDarkAqua),
+        };
+        NSView::setAppearance(NSApp(), appearance);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    let _ = preference;
+}
+
+fn apply_synapse_theme(preference: ThemePreference, mut window: Option<&mut Window>, cx: &mut App) {
+    // GPUI Component changes content colors only. Keep native titlebars, traffic lights, system
+    // panels and other AppKit chrome on the same global System/Light/Dark preference.
+    apply_native_application_appearance(preference);
     match preference {
-        ThemePreference::System => Theme::sync_system_appearance(window, cx),
-        ThemePreference::Light => Theme::change(ThemeMode::Light, window, cx),
-        ThemePreference::Dark => Theme::change(ThemeMode::Dark, window, cx),
+        ThemePreference::System => Theme::sync_system_appearance(window.as_deref_mut(), cx),
+        ThemePreference::Light => Theme::change(ThemeMode::Light, window.as_deref_mut(), cx),
+        ThemePreference::Dark => Theme::change(ThemeMode::Dark, window.as_deref_mut(), cx),
     }
 
     let palette = synapse_theme_palette(Theme::global(cx).is_dark());
@@ -363,6 +394,10 @@ fn apply_synapse_theme(preference: ThemePreference, window: Option<&mut Window>,
     theme.table_even = palette.background;
     theme.table_head = palette.panel;
     theme.table_head_foreground = palette.foreground;
+
+    if let Some(window) = window {
+        window.refresh();
+    }
 }
 
 fn register_bundled_fonts(cx: &mut App) {
@@ -382,17 +417,25 @@ fn register_bundled_fonts(cx: &mut App) {
 }
 
 fn theme_preference_path() -> Option<PathBuf> {
+    synapse_config_directory().map(|directory| directory.join("theme"))
+}
+
+fn vault_preference_path() -> Option<PathBuf> {
+    synapse_config_directory().map(|directory| directory.join("vault"))
+}
+
+fn synapse_config_directory() -> Option<PathBuf> {
     #[cfg(target_os = "macos")]
     {
         std::env::var_os("HOME")
             .map(PathBuf::from)
-            .map(|home| home.join("Library/Application Support/Synapse/theme"))
+            .map(|home| home.join("Library/Application Support/Synapse"))
     }
     #[cfg(target_os = "windows")]
     {
         std::env::var_os("APPDATA")
             .map(PathBuf::from)
-            .map(|directory| directory.join("Synapse/theme"))
+            .map(|directory| directory.join("Synapse"))
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
@@ -403,7 +446,107 @@ fn theme_preference_path() -> Option<PathBuf> {
                     .map(PathBuf::from)
                     .map(|home| home.join(".config"))
             })
-            .map(|directory| directory.join("synapse/theme"))
+            .map(|directory| directory.join("synapse"))
+    }
+}
+
+fn default_vault_path() -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .map(|home| home.join("Documents/Synapse Vault"))
+    }
+    #[cfg(target_os = "windows")]
+    {
+        std::env::var_os("USERPROFILE")
+            .map(PathBuf::from)
+            .map(|home| home.join("Documents/Synapse Vault"))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .map(|home| home.join("Documents/Synapse Vault"))
+    }
+}
+
+fn load_vault_preference() -> Option<PathBuf> {
+    vault_preference_path()
+        .and_then(|path| fs::read_to_string(path).ok())
+        .map(|value| PathBuf::from(value.trim()))
+        .filter(|path| !path.as_os_str().is_empty())
+}
+
+fn save_vault_preference(path: &Path) -> io::Result<()> {
+    let preference_path = vault_preference_path()
+        .ok_or_else(|| io::Error::other("unable to locate the user configuration directory"))?;
+    if let Some(parent) = preference_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(preference_path, format!("{}\n", path.display()))
+}
+
+fn startup_vault_path(argument: Option<OsString>) -> io::Result<PathBuf> {
+    let default = default_vault_path()
+        .ok_or_else(|| io::Error::other("unable to locate the default Vault directory"))?;
+    let (path, uses_default) =
+        select_startup_vault_path(argument, load_vault_preference(), default);
+    if uses_default {
+        fs::create_dir_all(&path)?;
+        save_vault_preference(&path)?;
+    }
+    Ok(path)
+}
+
+fn select_startup_vault_path(
+    argument: Option<OsString>,
+    saved: Option<PathBuf>,
+    default: PathBuf,
+) -> (PathBuf, bool) {
+    if let Some(argument) = argument {
+        return (PathBuf::from(argument), false);
+    }
+    if let Some(saved) = saved
+        && saved.is_dir()
+    {
+        return (saved, false);
+    }
+    (default, true)
+}
+
+fn settings_theme_indicator_left(preference: ThemePreference) -> f32 {
+    let segment_width = (SETTINGS_THEME_CONTROL_WIDTH - SETTINGS_THEME_CONTROL_PADDING * 2.0) / 3.0;
+    SETTINGS_THEME_CONTROL_PADDING
+        + segment_width
+            * match preference {
+                ThemePreference::System => 0.0,
+                ThemePreference::Light => 1.0,
+                ThemePreference::Dark => 2.0,
+            }
+}
+
+fn settings_spring_progress(progress: f32) -> f32 {
+    let stiffness = 420.0_f32;
+    let damping = 40.0_f32;
+    let mass = 0.5_f32;
+    let discriminant = (damping * damping - 4.0 * mass * stiffness).sqrt();
+    let denominator = 2.0 * mass;
+    let slow_root = (-damping + discriminant) / denominator;
+    let fast_root = (-damping - discriminant) / denominator;
+    let response = |seconds: f32| {
+        1.0 + (fast_root * (slow_root * seconds).exp() - slow_root * (fast_root * seconds).exp())
+            / (slow_root - fast_root)
+    };
+    let duration = SETTINGS_THEME_TRANSITION.as_secs_f32();
+    (response(progress * duration) / response(duration)).clamp(0.0, 1.0)
+}
+
+struct SettingsSpring;
+
+impl Transition for SettingsSpring {
+    fn calculate(&self, progress: f32) -> f32 {
+        settings_spring_progress(progress)
     }
 }
 
@@ -631,10 +774,10 @@ struct SynapseApp {
     vault_refresh_generation: u64,
     _input_subscriptions: Vec<Subscription>,
     theme_preference: ThemePreference,
-    theme_settings_open: bool,
-    theme_settings_closing: bool,
-    theme_settings_generation: u64,
     theme_persistence_error: Option<String>,
+    vault_persistence_error: Option<String>,
+    settings_window: Option<AnyWindowHandle>,
+    settings_window_opening: bool,
     left_sidebar_open: bool,
     command_palette_open: bool,
     command_palette_closing: bool,
@@ -1707,34 +1850,55 @@ impl SynapseApp {
         cx.notify();
     }
 
-    fn open_theme_settings(&mut self, cx: &mut Context<Self>) {
+    fn open_settings_window(&mut self, cx: &mut Context<Self>) {
+        self.selection_menu_mode = SelectionMenuMode::Formatting;
         self.dismiss_command_palette(cx);
         self.dismiss_context_menus(cx);
-        self.theme_settings_open = true;
-        self.theme_settings_closing = false;
-        self.theme_settings_generation = self.theme_settings_generation.wrapping_add(1);
-        cx.notify();
-    }
 
-    fn close_theme_settings(&mut self, cx: &mut Context<Self>) {
-        if !self.theme_settings_open || self.theme_settings_closing {
+        if let Some(handle) = self.settings_window {
+            if handle
+                .update(cx, |_, window, _| window.activate_window())
+                .is_ok()
+            {
+                return;
+            }
+            self.settings_window = None;
+        }
+
+        if self.settings_window_opening {
             return;
         }
-        self.theme_settings_closing = true;
-        self.theme_settings_generation = self.theme_settings_generation.wrapping_add(1);
-        let generation = self.theme_settings_generation;
-        let timer = cx.background_executor().timer(QUICK_TRANSITION);
-        cx.spawn(async move |this, cx| {
-            timer.await;
-            let _ = this.update(cx, |this, cx| {
-                if this.theme_settings_generation == generation {
-                    this.theme_settings_open = false;
-                    this.theme_settings_closing = false;
-                    cx.notify();
+        self.settings_window_opening = true;
+
+        let app = cx.entity();
+        let preference = self.theme_preference;
+        // `open_window` draws its first frame synchronously. Defer until this entity update has
+        // unwound so the Settings view can safely read the shared SynapseApp state on that frame.
+        cx.defer(move |cx| {
+            let bounds = Bounds::centered(
+                None,
+                size(px(SETTINGS_WINDOW_WIDTH), px(SETTINGS_WINDOW_HEIGHT)),
+                cx,
+            );
+            let result = cx.open_window(settings_window_options(bounds), {
+                let app = app.clone();
+                move |window, cx| {
+                    apply_synapse_theme(preference, Some(window), cx);
+                    let settings = cx.new(|cx| SettingsWindow::new(app, cx));
+                    cx.new(|cx| Root::new(settings, window, cx))
                 }
             });
-        })
-        .detach();
+            app.update(cx, |this, cx| {
+                this.settings_window_opening = false;
+                match result {
+                    Ok(handle) => this.settings_window = Some(handle.into()),
+                    Err(error) => this
+                        .state
+                        .set_error_message(format!("Unable to open Settings window: {error}")),
+                }
+                cx.notify();
+            });
+        });
         cx.notify();
     }
 
@@ -1757,7 +1921,7 @@ impl SynapseApp {
             files: false,
             directories: true,
             multiple: false,
-            prompt: Some("Open Vault".into()),
+            prompt: Some("Choose Workspace".into()),
         });
 
         cx.spawn(async move |this, cx| {
@@ -1766,8 +1930,12 @@ impl SynapseApp {
                 match result {
                     Ok(Ok(Some(paths))) => {
                         if let Some(path) = paths.into_iter().next()
-                            && this.state.open_vault(path).is_ok()
+                            && this.state.open_vault(&path).is_ok()
                         {
+                            this.vault_persistence_error =
+                                save_vault_preference(&path).err().map(|error| {
+                                    format!("Workspace preference could not be saved: {error}")
+                                });
                             this.collapsed_directories.clear();
                             this.editor_selection.collapse(0);
                             this.editor_marked_range = None;
@@ -1847,7 +2015,6 @@ impl SynapseApp {
     }
 
     fn open_command_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.close_theme_settings(cx);
         self.command_palette_open = true;
         self.command_palette_closing = false;
         self.command_palette_generation = self.command_palette_generation.wrapping_add(1);
@@ -4026,6 +4193,211 @@ fn render_editor_row(
         .into_any_element()
 }
 
+struct SettingsWindow {
+    app: Entity<SynapseApp>,
+    _app_subscription: Subscription,
+}
+
+impl SettingsWindow {
+    fn new(app: Entity<SynapseApp>, cx: &mut Context<Self>) -> Self {
+        let app_subscription = cx.observe(&app, |_, _, cx| cx.notify());
+        Self {
+            app,
+            _app_subscription: app_subscription,
+        }
+    }
+}
+
+impl Render for SettingsWindow {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let (vault_path, persistence_error, vault_error) = {
+            let app = self.app.read(cx);
+            (
+                app.state
+                    .vault_root()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "No workspace available".to_owned()),
+                app.theme_persistence_error.clone(),
+                app.vault_persistence_error.clone(),
+            )
+        };
+        render_settings_content(
+            self.app.clone(),
+            vault_path,
+            persistence_error,
+            vault_error,
+            cx.theme().danger,
+            cx.theme().background,
+        )
+    }
+}
+
+fn render_settings_content(
+    app_entity: Entity<SynapseApp>,
+    vault_path: String,
+    persistence_error: Option<String>,
+    vault_error: Option<String>,
+    danger: Hsla,
+    background: Hsla,
+) -> AnyElement {
+    let segment_width = (SETTINGS_THEME_CONTROL_WIDTH - SETTINGS_THEME_CONTROL_PADDING * 2.0) / 3.0;
+    let theme_field_app = app_entity.clone();
+    let theme_field =
+        SettingField::render(move |_options, _window, cx| {
+            let selected_preference = theme_field_app.read(cx).theme_preference;
+            let theme = cx.theme().clone();
+            let indicator_left = settings_theme_indicator_left(selected_preference);
+            div()
+                .id("settings-theme-segments")
+                .relative()
+                .w(px(SETTINGS_THEME_CONTROL_WIDTH))
+                .h(px(40.0))
+                .p(px(SETTINGS_THEME_CONTROL_PADDING))
+                .rounded_xl()
+                .bg(theme.accordion)
+                .child(
+                    div()
+                        .id("settings-theme-indicator-motion")
+                        .absolute()
+                        .top(px(SETTINGS_THEME_CONTROL_PADDING))
+                        .w(px(segment_width))
+                        .h(px(32.0))
+                        .left(px(indicator_left))
+                        .child(div().size_full().rounded_lg().bg(theme.foreground))
+                        .with_transition("settings-theme-indicator-transition")
+                        .transition_when_else(
+                            true,
+                            SETTINGS_THEME_TRANSITION,
+                            SettingsSpring,
+                            move |style| style.left(px(indicator_left)),
+                            move |style| style.left(px(indicator_left)),
+                        ),
+                )
+                .child(div().relative().flex().h_full().children(
+                    ThemePreference::ALL.into_iter().map(|preference| {
+                        let app = theme_field_app.clone();
+                        let selected = preference == selected_preference;
+                        div()
+                            .id(SharedString::from(format!(
+                                "theme-preference-{}",
+                                preference.as_str()
+                            )))
+                            .w(px(segment_width))
+                            .h(px(32.0))
+                            .rounded_lg()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .gap_1()
+                            .cursor_pointer()
+                            .text_size(px(12.0))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(if selected {
+                                theme.background
+                            } else {
+                                theme.muted_foreground
+                            })
+                            .hover(|style| {
+                                style.text_color(if selected {
+                                    theme.background
+                                } else {
+                                    theme.foreground
+                                })
+                            })
+                            .active(|style| style.opacity(0.72))
+                            .child(gpui_component::Icon::new(preference.icon()).xsmall())
+                            .child(preference.label())
+                            .on_click(move |_, window, cx| {
+                                app.update(cx, |this, cx| {
+                                    this.set_theme_preference(preference, window, cx);
+                                });
+                            })
+                    }),
+                ))
+        });
+    let vault_field_app = app_entity.clone();
+    let vault_field = SettingField::render(move |options, _window, _cx| {
+        let app = vault_field_app.clone();
+        div()
+            .flex()
+            .items_center()
+            .justify_end()
+            .gap_3()
+            .child(
+                div()
+                    .max_w(px(360.0))
+                    .truncate()
+                    .font_family(".SystemUIFontMonospaced")
+                    .text_size(px(11.0))
+                    .child(vault_path.clone()),
+            )
+            .child(
+                Button::new("change-vault-from-settings")
+                    .outline()
+                    .h(px(40.0))
+                    .with_size(options.size)
+                    .icon(IconName::FolderOpen)
+                    .label("Change")
+                    .on_click(move |_, _, cx| {
+                        app.update(cx, |this, cx| {
+                            this.prompt_for_vault(cx);
+                        });
+                    }),
+            )
+    });
+    let settings = Settings::new("synapse-settings-workspace")
+        .sidebar_width(px(SETTINGS_SIDEBAR_WIDTH))
+        .with_group_variant(GroupBoxVariant::Outline)
+        .page(
+            SettingPage::new("General")
+                .default_open(true)
+                .resettable(false)
+                .description("Appearance and workspace preferences")
+                .groups([
+                    SettingGroup::new().title("Appearance").item(
+                        SettingItem::new("Theme", theme_field)
+                            .description("Choose a global theme or follow the system appearance."),
+                    ),
+                    SettingGroup::new()
+                        .title("Workspace")
+                        .item(SettingItem::new("Vault location", vault_field).description(
+                            "Synapse opens this folder automatically when it starts.",
+                        )),
+                ]),
+        );
+
+    div()
+        .id("settings-window-content")
+        .size_full()
+        .min_w(px(0.0))
+        .min_h(px(0.0))
+        .flex()
+        .flex_col()
+        .bg(background)
+        .child(settings)
+        .when_some(persistence_error, |workspace, error| {
+            workspace.child(
+                div()
+                    .px_4()
+                    .pb_3()
+                    .text_xs()
+                    .text_color(danger)
+                    .child(error),
+            )
+        })
+        .when_some(vault_error, |workspace, error| {
+            workspace.child(
+                div()
+                    .px_4()
+                    .pb_3()
+                    .text_xs()
+                    .text_color(danger)
+                    .child(error),
+            )
+        })
+        .into_any_element()
+}
+
 impl Render for SynapseApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
@@ -5857,7 +6229,7 @@ impl Render for SynapseApp {
                             ))
                             .on_click(move |_, _, cx| {
                                 app.update(cx, |this, cx| {
-                                    this.open_theme_settings(cx);
+                                    this.open_settings_window(cx);
                                 });
                             })
                     }),
@@ -6395,7 +6767,7 @@ impl Render for SynapseApp {
                                 .on_click(move |_, _, cx| {
                                     cx.stop_propagation();
                                     settings_app.update(cx, |this, cx| {
-                                        this.open_theme_settings(cx);
+                                        this.open_settings_window(cx);
                                     });
                                 }),
                         )
@@ -6407,131 +6779,6 @@ impl Render for SynapseApp {
                             |style| style.opacity(1.0),
                             |style| style.opacity(0.0),
                         ),
-                )
-                .into_any_element()
-        });
-
-        let theme_settings = self.theme_settings_open.then(|| {
-            let selected_preference = self.theme_preference;
-            let close_app = app_entity.clone();
-            let persistence_error = self.theme_persistence_error.clone();
-            div()
-                .id("theme-settings-backdrop")
-                .absolute()
-                .top(px(0.0))
-                .right(px(0.0))
-                .bottom(px(0.0))
-                .left(px(0.0))
-                .flex()
-                .items_center()
-                .justify_center()
-                .opacity(0.0)
-                .bg(if theme.is_dark() {
-                    hsla(0.0, 0.0, 0.0, 0.62)
-                } else {
-                    hsla(0.0, 0.0, 0.0, 0.22)
-                })
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.close_theme_settings(cx);
-                }))
-                .child(
-                    div()
-                        .id("theme-settings-dialog")
-                        .w(px(420.0))
-                        .max_w(relative(0.92))
-                        .p_4()
-                        .rounded_lg()
-                        .border_1()
-                        .border_color(theme.border)
-                        .bg(theme.popover)
-                        .text_color(theme.popover_foreground)
-                        .on_click(cx.listener(|_, _, _, cx| {
-                            cx.stop_propagation();
-                        }))
-                        .child(
-                            div()
-                                .h(px(40.0))
-                                .flex()
-                                .items_center()
-                                .justify_between()
-                                .child(
-                                    div()
-                                        .text_base()
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .child("Appearance"),
-                                )
-                                .child(
-                                    Button::new("close-theme-settings")
-                                        .ghost()
-                                        .size(px(40.0))
-                                        .tooltip("Close settings")
-                                        .child(IconName::Close)
-                                        .on_click(move |_, _, cx| {
-                                            close_app.update(cx, |this, cx| {
-                                                this.close_theme_settings(cx);
-                                            });
-                                        }),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .mb_3()
-                                .text_sm()
-                                .text_color(theme.muted_foreground)
-                                .child("Choose a theme or keep Synapse in sync with the system."),
-                        )
-                        .children(ThemePreference::ALL.into_iter().map(|preference| {
-                            let app = app_entity.clone();
-                            let selected = preference == selected_preference;
-                            Button::new(SharedString::from(format!(
-                                "theme-preference-{}",
-                                preference.as_str()
-                            )))
-                            .when(selected, |button| button.primary())
-                            .when(!selected, |button| button.outline())
-                            .w_full()
-                            .h(px(48.0))
-                            .mb_2()
-                            .justify_start()
-                            .child(gpui_component::Icon::new(preference.icon()).small())
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w(px(0.0))
-                                    .flex()
-                                    .flex_col()
-                                    .items_start()
-                                    .child(preference.label())
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(if selected {
-                                                theme.primary_foreground
-                                            } else {
-                                                theme.muted_foreground
-                                            })
-                                            .child(preference.description()),
-                                    ),
-                            )
-                            .when(selected, |button| button.child(IconName::Check))
-                            .on_click(move |_, window, cx| {
-                                app.update(cx, |this, cx| {
-                                    this.set_theme_preference(preference, window, cx);
-                                });
-                            })
-                        }))
-                        .when_some(persistence_error, |dialog, error| {
-                            dialog
-                                .child(div().mt_1().text_xs().text_color(theme.danger).child(error))
-                        }),
-                )
-                .with_transition("theme-settings-transition")
-                .transition_when_else(
-                    !self.theme_settings_closing,
-                    QUICK_TRANSITION,
-                    EaseOutQuad,
-                    |style| style.opacity(1.0),
-                    |style| style.opacity(0.0),
                 )
                 .into_any_element()
         });
@@ -6567,7 +6814,6 @@ impl Render for SynapseApp {
             .children(tree_context_menu)
             .children(note_actions_menu)
             .children(command_palette)
-            .children(theme_settings)
     }
 }
 
@@ -6986,8 +7232,42 @@ fn synapse_titlebar_options() -> TitlebarOptions {
     }
 }
 
+fn settings_titlebar_options() -> TitlebarOptions {
+    TitlebarOptions {
+        title: Some("Synapse Settings".into()),
+        appears_transparent: false,
+        traffic_light_position: None,
+    }
+}
+
+fn settings_window_options(bounds: Bounds<Pixels>) -> WindowOptions {
+    WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(bounds)),
+        titlebar: Some(settings_titlebar_options()),
+        focus: true,
+        show: true,
+        kind: WindowKind::Normal,
+        is_movable: true,
+        is_resizable: true,
+        is_minimizable: true,
+        window_min_size: Some(size(
+            px(SETTINGS_WINDOW_MIN_WIDTH),
+            px(SETTINGS_WINDOW_MIN_HEIGHT),
+        )),
+        ..Default::default()
+    }
+}
+
 fn main() {
-    let state = ShellState::from_vault_argument(std::env::args_os().nth(1));
+    let (startup_vault, startup_vault_error) = match startup_vault_path(std::env::args_os().nth(1))
+    {
+        Ok(path) => (Some(OsString::from(path)), None),
+        Err(error) => (None, Some(error)),
+    };
+    let mut state = ShellState::from_vault_argument(startup_vault);
+    if let Some(error) = startup_vault_error {
+        state.set_error_message(format!("Unable to prepare the default workspace: {error}"));
+    }
     let theme_preference = load_theme_preference();
     let todo_workspace = TodoWorkspace::load_default();
     let bookmark_workspace = BookmarkWorkspace::load_default();
@@ -7259,10 +7539,10 @@ fn main() {
                             vault_refresh_generation: 0,
                             _input_subscriptions: input_subscriptions,
                             theme_preference,
-                            theme_settings_open: false,
-                            theme_settings_closing: false,
-                            theme_settings_generation: 0,
                             theme_persistence_error: None,
+                            vault_persistence_error: None,
+                            settings_window: None,
+                            settings_window_opening: false,
                             left_sidebar_open: true,
                             command_palette_open: false,
                             command_palette_closing: false,
@@ -7335,7 +7615,7 @@ mod tests {
         time::Duration,
     };
 
-    use gpui::{Image, ImageFormat, MouseButton, px, rgb};
+    use gpui::{Bounds, Image, ImageFormat, MouseButton, WindowKind, px, rgb, size};
     use synapse_core::{VaultEntry, VaultEntryKind};
     use tempfile::tempdir;
 
@@ -7348,22 +7628,24 @@ mod tests {
         EDITOR_RULE_THICKNESS, EDITOR_TOP_PADDING, EDITOR_WIDE_GUTTER, FileTreeRow, InlineFormat,
         InlineFormatEdit, MARKD_PANEL_SPRING_DAMPING, MARKD_PANEL_SPRING_MASS,
         MARKD_PANEL_SPRING_STIFFNESS, MENU_ITEM_ICON_SIZE, MENU_ITEM_ICON_SLOT_SIZE,
-        MarkdownImagePreview, PANEL_TRANSITION, SIDEBAR_FOOTER_HEIGHT,
-        SIDEBAR_SEARCH_CONTENT_WIDTH, SIDEBAR_SEARCH_INNER_PADDING, SIDEBAR_SEARCH_OUTER_MARGIN,
-        SIDEBAR_SHORTCUT_ACTION_WIDTH, SIDEBAR_TREE_FONT_FAMILY, SIDEBAR_TREE_FONT_SIZE,
-        SIDEBAR_TREE_ROW_HEIGHT, TABLE_CELL_HORIZONTAL_PADDING, TABLE_CELL_VERTICAL_PADDING,
-        TABLE_FONT_SIZE, TABLE_ROW_MIN_HEIGHT, TITLEBAR_HEIGHT, ThemePreference,
-        active_document_outline_index, build_document_outline, build_file_tree_rows,
-        build_image_previews, build_math_previews, build_mermaid_previews, changed_line_span,
-        clipboard_image_extension, code_block_edges, command_palette_key_bindings,
-        default_window_size, document_outline_horizontal_layout, document_outline_is_visible,
-        document_outline_layout, editor_backtick_key_bindings, editor_horizontal_gutter,
-        editor_page_content_width, fenced_code_block_edit, file_manager_reveal_command,
-        inline_format_edit, inline_format_is_active, is_tab_context_trigger,
-        markd_panel_spring_progress, markdown_link_context, normalize_clipboard_text,
-        normalize_markdown_link_destination, note_breadcrumb_parts, persist_clipboard_image,
-        resolve_markdown_image, source_lines_from_buffer, synapse_mermaid_theme,
-        synapse_theme_palette, synapse_titlebar_options, titlebar_left_inset,
+        MarkdownImagePreview, PANEL_TRANSITION, SETTINGS_WINDOW_MIN_HEIGHT,
+        SETTINGS_WINDOW_MIN_WIDTH, SIDEBAR_FOOTER_HEIGHT, SIDEBAR_SEARCH_CONTENT_WIDTH,
+        SIDEBAR_SEARCH_INNER_PADDING, SIDEBAR_SEARCH_OUTER_MARGIN, SIDEBAR_SHORTCUT_ACTION_WIDTH,
+        SIDEBAR_TREE_FONT_FAMILY, SIDEBAR_TREE_FONT_SIZE, SIDEBAR_TREE_ROW_HEIGHT,
+        TABLE_CELL_HORIZONTAL_PADDING, TABLE_CELL_VERTICAL_PADDING, TABLE_FONT_SIZE,
+        TABLE_ROW_MIN_HEIGHT, TITLEBAR_HEIGHT, ThemePreference, active_document_outline_index,
+        build_document_outline, build_file_tree_rows, build_image_previews, build_math_previews,
+        build_mermaid_previews, changed_line_span, clipboard_image_extension, code_block_edges,
+        command_palette_key_bindings, default_window_size, document_outline_horizontal_layout,
+        document_outline_is_visible, document_outline_layout, editor_backtick_key_bindings,
+        editor_horizontal_gutter, editor_page_content_width, fenced_code_block_edit,
+        file_manager_reveal_command, inline_format_edit, inline_format_is_active,
+        is_tab_context_trigger, markd_panel_spring_progress, markdown_link_context,
+        normalize_clipboard_text, normalize_markdown_link_destination, note_breadcrumb_parts,
+        persist_clipboard_image, resolve_markdown_image, select_startup_vault_path,
+        settings_spring_progress, settings_theme_indicator_left, settings_window_options,
+        source_lines_from_buffer, synapse_mermaid_theme, synapse_theme_palette,
+        synapse_titlebar_options, titlebar_left_inset,
     };
 
     fn sfnt_table<'a>(font: &'a [u8], tag: &[u8; 4]) -> Option<&'a [u8]> {
@@ -7704,6 +7986,42 @@ mod tests {
     }
 
     #[test]
+    fn startup_workspace_prefers_argument_then_valid_saved_path_then_default() {
+        let argument = tempdir().expect("argument workspace");
+        let saved = tempdir().expect("saved workspace");
+        let fallback = PathBuf::from("/tmp/synapse-default-workspace-test");
+
+        assert_eq!(
+            select_startup_vault_path(
+                Some(argument.path().as_os_str().to_os_string()),
+                Some(saved.path().to_path_buf()),
+                fallback.clone(),
+            ),
+            (argument.path().to_path_buf(), false)
+        );
+        assert_eq!(
+            select_startup_vault_path(None, Some(saved.path().to_path_buf()), fallback.clone(),),
+            (saved.path().to_path_buf(), false)
+        );
+        assert_eq!(
+            select_startup_vault_path(None, Some(saved.path().join("missing")), fallback.clone(),),
+            (fallback, true)
+        );
+    }
+
+    #[test]
+    fn settings_theme_indicator_uses_three_equal_segments_and_spring_motion() {
+        let system = settings_theme_indicator_left(ThemePreference::System);
+        let light = settings_theme_indicator_left(ThemePreference::Light);
+        let dark = settings_theme_indicator_left(ThemePreference::Dark);
+        assert!(system < light && light < dark);
+        assert!((light - system - (dark - light)).abs() < f32::EPSILON);
+        assert_eq!(settings_spring_progress(0.0), 0.0);
+        assert_eq!(settings_spring_progress(1.0), 1.0);
+        assert!(settings_spring_progress(0.5) > 0.5);
+    }
+
+    #[test]
     fn sidebar_tree_typography_matches_the_markd_reference() {
         assert_eq!(SIDEBAR_TREE_FONT_FAMILY, "Inter");
         assert_eq!(SIDEBAR_TREE_FONT_SIZE, 13.0);
@@ -7796,6 +8114,30 @@ mod tests {
             } else {
                 gpui::px(10.0)
             }
+        );
+    }
+
+    #[test]
+    fn settings_uses_a_normal_independent_resizable_window() {
+        let options = settings_window_options(Bounds::default());
+        let titlebar = options.titlebar.expect("native Settings titlebar");
+
+        assert_eq!(options.kind, WindowKind::Normal);
+        assert!(options.focus && options.show);
+        assert!(options.is_movable);
+        assert!(options.is_resizable);
+        assert!(options.is_minimizable);
+        assert!(!titlebar.appears_transparent);
+        assert_eq!(
+            titlebar.title.expect("Settings title").as_ref(),
+            "Synapse Settings"
+        );
+        assert_eq!(
+            options.window_min_size,
+            Some(size(
+                px(SETTINGS_WINDOW_MIN_WIDTH),
+                px(SETTINGS_WINDOW_MIN_HEIGHT)
+            ))
         );
     }
 

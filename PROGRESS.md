@@ -1,6 +1,6 @@
 # Synapse 开发进度
 
-> 最后更新：2026-08-13（完善围栏代码块的键盘与鼠标退出交互）
+> 最后更新：2026-08-14（Settings 原生标题栏同步全局主题）
 > 当前阶段：编辑器交互 — 默认持续渲染编辑、格式快捷键和结构化回车输入已经贯通原生 Markdown 编辑路径
 > 同步规则：每次功能调整后立即维护本文件；每轮开发结束前再次核对代码、测试与本文档一致性。
 
@@ -127,7 +127,10 @@
 - 空状态、侧栏入口、新建控件、标题栏侧栏开关/页签关闭、两类右键菜单和命令面板操作已迁移到标准 Button；界面表面色、边框、状态色和文本层级优先读取主题 token。
 - 命令面板搜索区域使用标准 Input，具备组件库原生输入法、选择、剪贴板、光标和焦点状态；全局 `Cmd/Ctrl+K` 会打开面板并聚焦搜索框。
 - 搜索快捷键提示使用标准 Kbd，组件默认图标资源与项目固定 Lucide 资源通过同一个 GPUI AssetSource 提供。
-- Settings 已提供可操作的 Appearance 面板，支持 System、Light、Dark；System 会监听系统外观变化，选择结果保存到用户配置目录。
+- Settings 已改为 `WindowKind::Normal` 原生独立窗口，不再覆盖主窗口编辑器，也不再使用弹窗/遮罩；它拥有自己的系统标题栏、关闭、最小化、缩放和自由调整尺寸能力。重复点击 Settings 会激活已有窗口而不是叠加创建。
+- Settings 窗口创建已退出主应用当前点击事件的实体更新栈后再执行，避免新窗口首帧同步读取仍处于可变更新中的 `SynapseApp` 导致 GPUI 重入 panic；快速重复点击由独立 opening 状态合并。
+- Settings 及其他 macOS 原生窗口装饰现与全局 System / Light / Dark 偏好同步：Dark 使用 AppKit `Dark Aqua`，Light 使用 `Aqua`，System 清除应用级覆盖并恢复系统外观；原生标题栏不会再与深色内容区形成浅色断层。
+- Settings 独立窗口继续使用 gpui-component 官方 `Settings`，Appearance 支持 System、Light、Dark；System 会监听系统外观变化，选择结果保存到用户配置目录。
 - 浅色主题使用 `#fbfbfa` 编辑画布和 `#f4f4f2` 侧栏，深色使用 `#1a1a1a` 与 `#151515`，保证导航与写作区层级可辨。
 - Markdown 呈现结果按 Vault、笔记路径、文档 revision、光标和主题缓存；光标闪烁、侧栏动画及无关状态刷新不再重复复制 Rope 和解析全文。
 - 编辑器渲染缓存现在长期持有与当前文档 revision 对齐的 Writ Buffer；中文输入、组合输入、Backspace、Delete 和选区替换直接在该 Rope 上按字节范围增量更新，下一帧复用解析状态，不再为每个按键重新创建并全量解析 Writ Buffer。缓存同步通过 revision 校验，不复制全文，也不在调试构建中逐键全文比较。
@@ -158,7 +161,7 @@
 
 - 最近 Vault 记录和多 Vault 管理界面。
 - 页签拖拽排序、跨窗口移动、重启后的工作区恢复和未保存关闭确认弹窗。
-- 搜索输入、结果过滤与键盘导航；Todo 文本编辑、Bookmarks 以及完整 Settings 功能（主题偏好已实现）。
+- 搜索输入、结果过滤与键盘导航；Settings 已完成主题与工作区设置，后续仍需补充编辑器、文件管理等其他偏好分类。
 - 完整专业编辑器能力中的按词移动/选择、双击选词、三击选行、撤销/重做和查找替换。
 - HTML、定义列表的专用组件渲染；当前未专门渲染的扩展语法仍安全显示源码。
 - 搜索业务逻辑和文件监听。
@@ -175,7 +178,7 @@
 | V3 文件管理回归 | 通过 | 核心、会话、资源与平台命令测试全部通过 |
 | Rust 格式化 | 通过 | Synapse 两个 workspace 包分别通过 `cargo fmt --package … -- --check`；vendor 保持上游源码原样 |
 | Clippy | 通过 | workspace/all-targets，warnings 视为错误 |
-| 自动化测试 | 通过 | 149 个 Synapse workspace 测试全部通过，另有 1 个手动 release 性能探针按需运行；供应组件上游 102 个测试此前已通过 |
+| 自动化测试 | 通过 | 165 个 Synapse workspace 测试全部通过，另有 1 个手动 release 性能探针按需运行；供应组件上游 102 个测试此前已通过 |
 | GPUI 原生交互 | 部分通过 | IME、鼠标定位/拖选、Shift 选区、全选/复制/剪切/粘贴、列表续写、可点击任务框、光标闪烁、提示块、脚注、Mermaid 与数学 SVG 已接入；其余扩展语法组件和高级编辑行为仍需补齐；按要求未运行截图或自动界面操作 |
 | 编辑器与侧栏性能 | 待手动验收 | 已完成解析缓存、GPUI 变高虚拟列表、共享布局回写、线性字符映射和非布局侧栏动画；字符边界 release 探针约 79.7ms → 46.4µs。按要求未启动应用，尚无真实帧率数据 |
 
@@ -940,10 +943,71 @@
 - 新增命令级与会话级回归，覆盖前两次回车仍在块内、第三次回车清理并退出、已有后续正文复用、末尾鼠标段落创建和非代码文本拒绝误触；同步 README、P3 规格与本进度文档。
 - 重新构建后使用独立临时 Vault 完成真实 GPUI 键盘链路验收：在 macOS `ABC` 英文输入源下以右 `Option` + 波浪号物理键输入三个反引号，输入 `rust` 回车形成代码块，键入 `x` 后连续三次回车再输入块外文本；磁盘最终结构精确为 `````rust\nx\n```\n<块外文本> ``，证明第三次回车确实越过闭合围栏而非继续写入代码。鼠标探针同时确认点击最终代码块下方会先创建真实块后空行；测试实例已停止并恢复原输入源。最终 workspace/all-targets 共 135 项自动化测试通过，1 项手动性能探针按设计忽略，严格 Clippy、开发构建、格式化和 `git diff --check` 全部通过。
 
+### 2026-08-13 — 默认 Vault、工作区持久化与设置面板重构
+
+- 建立完整的启动工作区优先级：显式命令行路径优先，其次读取用户保存的 Vault 路径；没有设置、保存路径已失效或目录被移除时，自动创建并打开 `~/Documents/Synapse Vault`。默认目录会在首次启动时一并写入原生配置目录，软件不再以 “No vault open” 空壳状态启动，可立即在默认工作区新建文件夹和笔记。
+- 工作区选择变为持久设置：现有文件夹选择器继续支持命令面板和设置入口；只有新目录成功打开后才更新配置文件，切换失败或取消不会覆盖原工作区。成功切换会清理旧目录折叠状态、重置编辑选区并重启文件系统 watcher；设置面板路径信息同步显示实际 canonical Vault 根目录。
+- 对照 `ornata-new` 的设置层级，以纯 Rust + GPUI 重构设置面板：宽度调整为 460px，顶部使用独立图标、标题、副标题和 40px 关闭命中区；正文分为 Appearance 与 Workspace 两组，Vault 卡片显示等宽截断路径、文件夹图标和 “Change” 操作，不再是三张纵向测试按钮。
+- 主题模式改为 252px 三段式按钮组，System / Light / Dark 共用一个 32px 活动指示块；指示块按参考项目的 420/40/0.5 spring 响应在分段之间滑动，文本和图标随选中状态切换。面板和遮罩使用独立、可中断的 220ms 进入/退出过渡，面板以轻微 7px 位移和透明度过渡呈现；遮罩通过主题自适应的半透明层弱化并视觉模糊后方内容，面板使用圆角、细边框和原生阴影建立层级，没有引入 WebView、HTML、CSS 或 JavaScript。
+- 新增启动路径优先级、失效保存路径回退、主题指示块等分布局和 spring 边界回归；同步本进度文档。实现遵循 `make-interfaces-feel-better` 的最小 40px 命中区、可中断动画、明确属性过渡和背景/面板层级原则。
+- 使用隔离临时 HOME 启动真实构建完成非截图验收：无任何配置和命令行参数时，应用自动创建 `Documents/Synapse Vault`，并在 `Library/Application Support/Synapse/vault` 写入同一绝对路径；证明首次启动的目录创建与持久化链路生效且没有读取或修改用户真实配置。最终 workspace/all-targets 共 137 项自动化测试通过，1 项手动性能探针按设计忽略；严格 Clippy、开发构建、格式化和 `git diff --check` 全部通过。
+
+### 2026-08-13 — 设置面板深浅主题一致性修复
+
+- 定位设置面板切换深色模式后出现白色主体与黑色控件混用的根因：切换动作中组件库按钮已经读取新的全局主题，而面板自绘容器仍持有当前渲染帧开始时克隆的旧主题快照，造成同一帧两套主题来源并存。
+- 设置面板改为根据刚选中的 System / Light / Dark 偏好独立解析即时外观，并从统一的 Synapse 调色板显式取得全部面板颜色；System 继续读取系统当前外观，Light / Dark 不再受旧渲染快照影响。
+- 深色面板统一使用 `#1a1a1a` 主表面、`#151515` Workspace 卡片、`#0f0f0f` 主题分段底色、`#ebebe8` 主文字和 `#8f8f8a` 次文字；边框、图标、关闭操作、路径、Change 按钮及错误状态同步适配。浅色面板继续使用 `#fbfbfa` / `#f4f4f2` / `#e9e9e6` 对应层级。
+- 新增设置表面随显式主题即时切换的回归，覆盖 System 对系统外观的映射、Light / Dark 对旧外观快照的覆盖及两套面板关键色和文本对比关系。定向 2 项设置主题测试、`cargo check -p synapse` 与定向 rustfmt 检查通过；按产品要求未启动应用、未运行截图或自动 UI 测试，等待手动验收。
+
+### 2026-08-14 — 设置面板全局主题链路修正
+
+- 纠正上一轮将设置面板外观按选项单独推导的错误方案：软件主题切换必须是全局操作，设置面板现已移除独立调色板与独立深浅判断，面板、Workspace 卡片、分段控件、文字、图标、按钮、边框、错误状态和遮罩全部只读取 GPUI Component 全局 `Theme`。
+- 确认深色切换后设置面板仍呈浅色的真实原因是 `gpui-animation` 会缓存动画节点的完整 Style：面板、遮罩和主题指示块的浅色背景曾与 `opacity` / `translate` / `left` 一起进入动画状态，后续即使全局 Theme 已切换，旧缓存仍会覆盖新主题颜色。
+- 重构设置浮层的动画/表面层级：动画节点现在只承担透明度、位移或水平位置，实际背景、边框、圆角、文字和图标位于其子表面中，每次渲染均从最新全局 Theme 取值；主题动画继续保留，不再缓存或覆盖颜色。
+- `apply_synapse_theme` 在完成 GPUI Component 模式切换和 Synapse 全部自定义 token 写入后显式刷新窗口，避免窗口仅绘制组件库默认主题的中间状态。System 的系统外观监听、Light / Dark 全局切换和偏好持久化保持原逻辑。
+- 全 workspace 共 164 项自动化测试通过，另有 1 项手动性能探针按设计忽略；`cargo check -p synapse` 和定向 rustfmt 检查通过。按产品要求未启动应用、未执行截图或自动 UI 测试，等待手动切换主题验收。
+
+### 2026-08-14 — 设置面板迁移至官方 Settings 组件
+
+- 按产品建议对照 gpui-component 官方 Settings 文档及项目当前固定的最新版 `0.5.1` 源码，将设置正文从自绘行迁移到真实的 `Settings → SettingPage → SettingGroup → SettingItem → SettingField` 组件体系；没有只复刻外观，也没有引入 WebView 或其他 Web 技术。
+- 设置浮层调整为适合官方两栏结构的 820×560px：左侧使用组件自带的搜索输入和 General 页面导航，右侧使用官方页面标题、描述、滚动区域与 Outline GroupBox 分组；侧栏初始宽度为 200px并可使用组件原生调整能力。
+- Appearance 使用官方 `SettingGroup` / `SettingItem` 承载 Theme 字段，字段内部保留 System / Light / Dark 三段控件和 spring 指示块，继续调用全局主题切换及偏好持久化逻辑；所有颜色仍只读取全局 Theme。
+- Workspace 使用官方设置项承载当前 canonical Vault 路径和带文件夹图标的 Change 操作，继续复用原生目录选择、切换保护、文件监听重启及路径持久化逻辑。弹窗的关闭按钮、主题自适应遮罩与进入/退出动画保留。
+- 使用界面细节规范复核 40px 交互命中区、动画/主题表面分层和内容可用尺寸；gpui-component crates.io 最新版本确认仍为 `0.5.1`。全 workspace 164 项自动化测试通过，另有 1 项手动性能探针按设计忽略；严格 Clippy、`cargo check -p synapse`、定向 rustfmt 和 `git diff --check` 通过。按产品要求未启动应用、未运行截图或自动 UI 测试。
+
+### 2026-08-14 — 设置改为独立工作区（误实现，已由下一节替代）
+
+- 根据产品截图纠正对官方 Settings 组件定位的误读：该组件本身就是完整设置工作区，不应嵌入自定义弹窗。已删除设置弹窗的固定宽高、圆角/阴影外壳、遮罩、重复 Settings 标题栏、关闭按钮以及弹窗进入/退出状态和动画。
+- `WorkspaceView` 新增 `Settings`，与 `Note`、`Todo`、`Bookmark` 同级；点击侧栏底部或命令面板的 Settings 会直接将右侧编辑器区域切换成设置工作区，左侧 Synapse 主侧栏与顶部应用标题栏保留。选择笔记页签/文件、待办或书签即可切离设置，既有笔记页签、缓冲区和编辑状态不被重建。
+- 官方 `Settings` 现在直接获得右侧工作区域的完整可用宽高，内部搜索、General 导航、分组导航、页面标题、设置项和滚动列表不再被 820×560px 弹窗裁切；官方设置侧栏初始宽度调整为 240px，右侧 Vault 路径最大展示宽度提升到 360px。
+- Appearance 和 Workspace 继续由官方 `SettingPage` / `SettingGroup` / `SettingItem` / `SettingField` 实现，主题三段控件、全局主题切换、Vault 路径、更换目录和持久化业务保持不变。全 workspace 164 项自动化测试通过，另有 1 项手动性能探针按设计忽略；基础编译通过。按产品要求未启动应用、未运行截图或自动 UI 测试。
+
+### 2026-08-14 — Settings 改为原生独立窗口
+
+- 根据产品进一步澄清，上一节将 Settings 作为主窗口 `WorkspaceView` 的实现仍不符合需求，已完整撤销：`WorkspaceView` 恢复为 Note / Todo / Bookmark，主窗口不再存在 Settings 正文分支，打开设置不会切走当前笔记、待办或书签界面。
+- 侧栏底部与命令面板的 Settings 入口现在通过 GPUI `open_window` 创建真正的 `WindowKind::Normal` 原生窗口；窗口使用不透明系统标题栏并显示 `Synapse Settings`，由操作系统提供关闭、最小化和缩放控制，同时明确启用窗口移动、自由调整尺寸及 760×520 最小尺寸。
+- 设置窗口默认以 1000×700 居中打开，内部直接以 gpui-component `Root` 承载官方 `Settings` 两栏界面，不再绘制模态遮罩、自定义弹窗边框或关闭按钮。它与主 Synapse 窗口拥有彼此独立的尺寸和窗口生命周期。
+- 主应用保留设置窗口句柄；窗口仍存在时重复点击任一 Settings 入口只会将其激活并带到前台，关闭后再次点击会清理失效句柄并创建新窗口，避免堆叠多个设置窗口。
+- Settings 窗口订阅主应用状态，主题偏好、Vault 路径和持久化错误会实时更新；System / Light / Dark 仍走全局主题链路，Change 仍复用原生目录选择与 Vault 安全切换逻辑。新增定向回归锁定普通窗口类型、系统标题栏、可移动/可调整/可最小化属性及最小尺寸；全 workspace 165 项自动化测试通过，另有 1 项手动性能探针按设计忽略，严格 Clippy、两个 Synapse 包格式检查、`cargo check -p synapse` 与 `git diff --check` 均通过。按产品要求未启动应用、未执行截图或自动 UI 测试。
+
+### 2026-08-14 — 修复 Settings 首次打开时 GPUI 重入闪退
+
+- 根据产品提供的 macOS abort 回溯重新审计真实事件时序：崩溃发生在左键 MouseUp 回调。`SynapseApp.update` 尚未返回时同步调用 `open_window`，而 GPUI 会在 `open_window` 返回前立即绘制新窗口；Settings 首帧随后读取同一个仍处于可变更新栈中的 `SynapseApp`，触发不可重入的实体借用 panic。panic 穿过 macOS Objective-C 事件回调的不可展开边界后直接终止进程。
+- 窗口创建现通过 GPUI effect-cycle `defer` 延迟到当前实体更新完整退出后执行；新窗口首帧读取共享主题、Vault 和错误状态时不再与主实体的可变更新重叠。新增 `settings_window_opening` 状态合并创建完成前的连续点击，成功或失败后统一复位。
+- 使用独立 `/tmp` 临时 Vault 启动真实构建并通过 macOS 原生鼠标事件完成无截图冒烟测试：首次点击成功出现 `Synapse Settings` 第二窗口，进程保持运行；系统辅助功能确认关闭、全屏/缩放、最小化三个原生按钮全部可用；再次点击只激活现有窗口、不创建第三个窗口；关闭后再次点击可重新创建设置窗口且进程继续运行。测试进程已停止，临时 Vault 已删除，未读取或修改用户实际 Vault。
+- 修复后全 workspace 165 项自动化测试全部通过，另有 1 项手动性能探针按设计忽略；严格 Clippy、`cargo check -p synapse`、两个 Synapse 包格式检查与 `git diff --check` 均通过。
+
+### 2026-08-14 — Settings 原生标题栏同步全局主题
+
+- 根据产品截图确认 Settings 内容区已经切换为深色，但 macOS 原生标题栏仍保持 Aqua 浅色。根因是 gpui-component `Theme::change` 只更新组件 token 与 GPUI 绘制，不会设置原生 `NSApplication.appearance`；普通系统标题栏因此继续继承系统外观，与应用内显式主题无关。
+- 全局主题入口现在先同步 AppKit 应用级外观：System 设置为 `nil` 以恢复系统跟随，Light 使用 `NSAppearanceNameAqua`，Dark 使用 `NSAppearanceNameDarkAqua`，随后再执行既有 GPUI Component 主题、Synapse 自定义 token 和窗口刷新。Settings 标题栏、主窗口原生控件以及系统面板由同一个偏好驱动，不再出现一窗两套主题。
+- macOS 原生桥接仅作为 `cfg(target_os = "macos")` 目标依赖接入现有 Cocoa 0.26.0，不影响 Windows/Linux 构建路径，不引入 WebView、HTML/CSS 或 JavaScript。切换动画和 Settings 内容布局没有变化。
+- 全 workspace 165 项自动化测试全部通过，另有 1 项手动性能探针按设计忽略；严格 Clippy、两个 Synapse 包格式检查与 `git diff --check` 均通过。按产品要求未运行截图测试。
+
 ## 下一步
 
 1. 由产品方分别在窄窗口、默认窗口和最大化窗口手动验收标题栏页签、侧栏即时左移、正文边距和长文档滚动体感。
 2. 继续缩小正文内容 revision 变化时的 SourceLine 重建范围；光标移动已不再触发 Markdown 全文重新呈现或活动行源码/预览切换。
 3. 增加 1k/10k 行 Markdown 持久 Writ 缓冲区命中、局部编辑和虚拟列表状态微基准，建立持续性能预算。
-4. 继续实现搜索、Todo 文本编辑、Bookmarks、会话恢复和 HTML、定义列表等其余扩展 Markdown 组件。
+4. 继续实现搜索、会话恢复、更多 Settings 偏好项和 HTML、定义列表等其余扩展 Markdown 组件。
 5. 待办 P1（标签选中 pill 滑动、新建标签输入框动画与无边框样式）已实现，等待产品手动验收标签点击体感与输入框展开动画。
