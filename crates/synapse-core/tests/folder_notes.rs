@@ -29,6 +29,35 @@ fn v3_ac1_discovers_empty_folders_and_nested_markdown_notes() {
 }
 
 #[test]
+fn discover_entries_skips_hidden_directories_and_notes() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir_all(directory.path().join(".git/objects")).unwrap();
+    fs::create_dir_all(directory.path().join(".obsidian")).unwrap();
+    fs::create_dir_all(directory.path().join("notes")).unwrap();
+    fs::write(directory.path().join(".git/objects/lost.md"), "# Lost").unwrap();
+    fs::write(directory.path().join(".obsidian/app.md"), "# Config").unwrap();
+    fs::write(directory.path().join(".hidden.md"), "# Hidden").unwrap();
+    fs::write(directory.path().join("notes/visible.md"), "# Visible").unwrap();
+
+    let entries = Vault::open(directory.path())
+        .unwrap()
+        .discover_entries()
+        .unwrap();
+    let actual: Vec<_> = entries
+        .iter()
+        .map(|entry| (entry.relative_path.as_path(), entry.kind))
+        .collect();
+
+    assert_eq!(
+        actual,
+        vec![
+            (Path::new("notes"), VaultEntryKind::Directory),
+            (Path::new("notes/visible.md"), VaultEntryKind::Note),
+        ]
+    );
+}
+
+#[test]
 fn v3_ac2_creates_root_and_nested_folders_and_notes_without_overwrite() {
     let directory = tempfile::tempdir().unwrap();
     let vault = Vault::open(directory.path()).unwrap();

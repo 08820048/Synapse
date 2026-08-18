@@ -130,13 +130,19 @@ impl Vault {
                     let Ok(relative_path) = path.strip_prefix(&self.root) else {
                         continue;
                     };
-                    if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
-                        discovered.push(VaultEntry {
-                            relative_path: relative_path.to_path_buf(),
-                            name: name.to_owned(),
-                            kind: VaultEntryKind::Directory,
-                        });
+                    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                        continue;
+                    };
+                    // Dot-prefixed names are hidden on Unix/macOS (.git, .obsidian).
+                    // Skip the whole subtree so discovery does not walk them.
+                    if is_hidden_name(name) {
+                        continue;
                     }
+                    discovered.push(VaultEntry {
+                        relative_path: relative_path.to_path_buf(),
+                        name: name.to_owned(),
+                        kind: VaultEntryKind::Directory,
+                    });
                     pending_directories.push(path);
                     continue;
                 }
@@ -147,6 +153,10 @@ impl Vault {
                 let Ok(relative_path) = path.strip_prefix(&self.root) else {
                     continue;
                 };
+                let file_name = path.file_name().and_then(|name| name.to_str());
+                if file_name.is_some_and(is_hidden_name) {
+                    continue;
+                }
                 if let Some(note) = note_entry_from_relative_path(relative_path) {
                     discovered.push(VaultEntry {
                         relative_path: note.relative_path,
@@ -598,6 +608,10 @@ fn has_markdown_extension(path: &Path) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| extension.eq_ignore_ascii_case("md"))
+}
+
+fn is_hidden_name(name: &str) -> bool {
+    name.starts_with('.')
 }
 
 fn note_entry_from_relative_path(relative_path: &Path) -> Option<NoteEntry> {
