@@ -4,6 +4,12 @@ All notable changes to Synapse are recorded here. The format follows [Keep a Cha
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-08-18
+
+### Fixed
+
+- Windows clippy and Ubuntu rustfmt accept the macOS app-bundle icon helper
+
 ## [0.1.1] - 2026-08-18
 
 ### Added
