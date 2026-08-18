@@ -443,10 +443,43 @@ fn embedded_app_icon_png_metadata() -> Option<(u32, u32, u8)> {
     Some((width, height, color_type))
 }
 
+fn path_is_inside_macos_app_bundle(executable: &Path) -> bool {
+    let macos_dir = match executable.parent() {
+        Some(path) => path,
+        None => return false,
+    };
+    let contents_dir = match macos_dir.parent() {
+        Some(path) => path,
+        None => return false,
+    };
+    let app_dir = match contents_dir.parent() {
+        Some(path) => path,
+        None => return false,
+    };
+
+    macos_dir.file_name().is_some_and(|name| name == "MacOS")
+        && contents_dir
+            .file_name()
+            .is_some_and(|name| name == "Contents")
+        && app_dir
+            .extension()
+            .is_some_and(|extension| extension == "app")
+}
+
 fn install_native_application_icon() {
     #[cfg(target_os = "macos")]
     unsafe {
         use std::ffi::c_void;
+
+        // Packaged .app icons must stay on the bundle .icns. AppKit applies the
+        // system squircle to that file; setApplicationIconImage with the square
+        // PNG master would replace it and show a rectangle in Dock / Cmd+Tab.
+        if std::env::current_exe()
+            .ok()
+            .is_some_and(|path| path_is_inside_macos_app_bundle(&path))
+        {
+            return;
+        }
 
         let data = NSData::dataWithBytes_length_(
             nil,
@@ -9607,7 +9640,7 @@ mod tests {
         select_startup_vault_path, settings_language_indicator_left, settings_spring_progress,
         settings_theme_indicator_left, settings_titlebar_options, settings_window_options,
         source_lines_from_buffer, synapse_mermaid_theme, synapse_theme_palette,
-        synapse_titlebar_options, titlebar_left_inset,
+        path_is_inside_macos_app_bundle, synapse_titlebar_options, titlebar_left_inset,
     };
     fn sfnt_table<'a>(font: &'a [u8], tag: &[u8; 4]) -> Option<&'a [u8]> {
         let table_count = usize::from(u16::from_be_bytes(font.get(4..6)?.try_into().ok()?));
@@ -9637,6 +9670,19 @@ mod tests {
     fn bundled_application_icon_is_an_opaque_apple_source_canvas() {
         assert_eq!(embedded_app_icon_png_metadata(), Some((1024, 1024, 2)));
         assert!(SYNAPSE_APP_ICON_PNG.len() > 100_000);
+    }
+
+    #[test]
+    fn packaged_macos_executables_are_detected_as_app_bundle_residents() {
+        assert!(path_is_inside_macos_app_bundle(Path::new(
+            "/Applications/Synapse.app/Contents/MacOS/Synapse"
+        )));
+        assert!(!path_is_inside_macos_app_bundle(Path::new(
+            "target/release/synapse"
+        )));
+        assert!(!path_is_inside_macos_app_bundle(Path::new(
+            "/Applications/Synapse.app/Contents/Resources/Synapse.icns"
+        )));
     }
 
     #[test]

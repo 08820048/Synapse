@@ -4,6 +4,8 @@ All notable changes to Synapse are recorded here. The format follows [Keep a Cha
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-08-18
+
 ### Added
 
 - Tag-triggered GitHub Release workflow that publishes a universal macOS DMG and a Windows x64 setup EXE
@@ -11,6 +13,12 @@ All notable changes to Synapse are recorded here. The format follows [Keep a Cha
 - `scripts/package-windows.ps1` and an Inno Setup script for `Synapse-<version>-windows-x64.exe`
 - Windows application icon (`assets/branding/synapse-app-icon.ico`)
 - Windows job in CI (`clippy` + tests)
+
+### Fixed
+
+- Packaged macOS apps keep the bundle `.icns` so Dock and the app switcher use the system rounded mask
+- Windows release packaging no longer tries to copy `synapse.exe` onto itself
+- Windows CI compiles after unused icon bytes and italic-fallback arguments were gated by platform
 
 ## [0.1.0] - 2026-08-18
 

@@ -121,8 +121,6 @@ cat > "$CONTENTS/Info.plist" <<PLIST
     <string>Synapse</string>
     <key>CFBundleIconFile</key>
     <string>Synapse.icns</string>
-    <key>CFBundleIconName</key>
-    <string>Synapse</string>
     <key>CFBundleIdentifier</key>
     <string>dev.xuyi.synapse</string>
     <key>CFBundleInfoDictionaryVersion</key>
