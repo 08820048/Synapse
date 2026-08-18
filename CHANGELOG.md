@@ -6,6 +6,7 @@ All notable changes to Synapse are recorded here. The format follows [Keep a Cha
 
 ### Added
 
+- Editor undo and redo, with coalesced typing/backspace, per-tab history, and `Cmd/Ctrl+Z` / `Cmd/Ctrl+Shift+Z`
 - Native update checks against GitHub Releases, with a startup prompt, a sidebar “有更新” affordance, a top-level Settings page, and a command-palette entry that open the platform installer
 
 ## [0.1.2] - 2026-08-18

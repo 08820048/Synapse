@@ -42,6 +42,11 @@ impl NoteDocument {
         self.buffer.len_chars()
     }
 
+    pub fn slice(&self, range: Range<usize>) -> Result<String, BufferError> {
+        self.ensure_range(range.clone())?;
+        Ok(self.buffer.slice(range).to_string())
+    }
+
     pub fn first_line_len_chars(&self) -> usize {
         self.buffer
             .line(0)
@@ -59,13 +64,7 @@ impl NoteDocument {
     }
 
     pub fn insert(&mut self, char_index: usize, text: &str) -> Result<(), BufferError> {
-        let len = self.len_chars();
-        if char_index > len {
-            return Err(BufferError::CharacterIndexOutOfBounds {
-                index: char_index,
-                len,
-            });
-        }
+        self.ensure_index(char_index)?;
         if text.is_empty() {
             return Ok(());
         }
@@ -76,6 +75,28 @@ impl NoteDocument {
     }
 
     pub fn remove(&mut self, range: Range<usize>) -> Result<(), BufferError> {
+        self.ensure_range(range.clone())?;
+        if range.is_empty() {
+            return Ok(());
+        }
+
+        self.buffer.remove(range);
+        self.revision = self.revision.saturating_add(1);
+        Ok(())
+    }
+
+    fn ensure_index(&self, char_index: usize) -> Result<(), BufferError> {
+        let len = self.len_chars();
+        if char_index > len {
+            return Err(BufferError::CharacterIndexOutOfBounds {
+                index: char_index,
+                len,
+            });
+        }
+        Ok(())
+    }
+
+    fn ensure_range(&self, range: Range<usize>) -> Result<(), BufferError> {
         let len = self.len_chars();
         if range.start > range.end || range.end > len {
             return Err(BufferError::InvalidCharacterRange {
@@ -84,12 +105,6 @@ impl NoteDocument {
                 len,
             });
         }
-        if range.is_empty() {
-            return Ok(());
-        }
-
-        self.buffer.remove(range);
-        self.revision = self.revision.saturating_add(1);
         Ok(())
     }
 
@@ -146,5 +161,13 @@ mod tests {
         let document = NoteDocument::from_text(PathBuf::from("note.md"), "# 标题\n正文\n更多");
 
         assert_eq!(document.first_line_len_chars(), 4);
+    }
+
+    #[test]
+    fn slice_returns_unicode_character_ranges() {
+        let document = NoteDocument::from_text(PathBuf::from("note.md"), "A你好B");
+
+        assert_eq!(document.slice(1..3).unwrap(), "你好");
+        assert!(document.slice(0..5).is_err());
     }
 }

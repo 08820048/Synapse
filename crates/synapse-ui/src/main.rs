@@ -1270,6 +1270,8 @@ actions!(
     synapse_editor,
     [
         Save,
+        Undo,
+        Redo,
         Backspace,
         DeleteForward,
         MoveLeft,
@@ -3449,6 +3451,30 @@ impl SynapseApp {
         cx.notify();
     }
 
+    fn undo(&mut self, _: &Undo, _: &mut Window, cx: &mut Context<Self>) {
+        if self.state.undo().unwrap_or(false) {
+            self.editor_render_cache = None;
+            self.editor_marked_range = None;
+            self.editor_selection.collapse(self.state.cursor());
+            self.refresh_slash_menu(cx);
+            self.restart_editor_cursor_blink(cx);
+        }
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn redo(&mut self, _: &Redo, _: &mut Window, cx: &mut Context<Self>) {
+        if self.state.redo().unwrap_or(false) {
+            self.editor_render_cache = None;
+            self.editor_marked_range = None;
+            self.editor_selection.collapse(self.state.cursor());
+            self.refresh_slash_menu(cx);
+            self.restart_editor_cursor_blink(cx);
+        }
+        cx.stop_propagation();
+        cx.notify();
+    }
+
     fn backspace(&mut self, _: &Backspace, _: &mut Window, cx: &mut Context<Self>) {
         self.editor_marked_range = None;
         let previous_revision = self
@@ -4406,6 +4432,7 @@ impl SynapseApp {
         self.selection_menu_mode = SelectionMenuMode::Formatting;
         self.begin_close_slash_menu(cx);
         self.begin_close_note_link_picker(cx);
+        self.state.break_history_coalesce();
         self.editor_selection
             .start_drag(cursor, event.modifiers.shift);
         self.state.set_cursor(cursor);
@@ -6510,6 +6537,8 @@ impl Render for SynapseApp {
                 .track_focus(&self.editor_focus)
                 .key_context("SynapseEditor")
                 .on_action(cx.listener(Self::save))
+                .on_action(cx.listener(Self::undo))
+                .on_action(cx.listener(Self::redo))
                 .on_action(cx.listener(Self::backspace))
                 .on_action(cx.listener(Self::delete_forward))
                 .on_action(cx.listener(Self::move_left))
@@ -9525,6 +9554,11 @@ fn main() {
                 KeyBinding::new(cross_platform_palette_key, OpenCommandPalette, None),
                 KeyBinding::new("cmd-s", Save, Some("SynapseEditor")),
                 KeyBinding::new("ctrl-s", Save, Some("SynapseEditor")),
+                KeyBinding::new("cmd-z", Undo, Some("SynapseEditor")),
+                KeyBinding::new("ctrl-z", Undo, Some("SynapseEditor")),
+                KeyBinding::new("cmd-shift-z", Redo, Some("SynapseEditor")),
+                KeyBinding::new("ctrl-shift-z", Redo, Some("SynapseEditor")),
+                KeyBinding::new("ctrl-y", Redo, Some("SynapseEditor")),
                 KeyBinding::new("backspace", Backspace, Some("SynapseEditor")),
                 KeyBinding::new("delete", DeleteForward, Some("SynapseEditor")),
                 KeyBinding::new("left", MoveLeft, Some("SynapseEditor")),

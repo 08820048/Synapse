@@ -102,6 +102,8 @@ The installer is written to `target/release/bundle/windows/Synapse-<version>-win
 | Action | macOS | Windows / Linux |
 |---|---|---|
 | Save | `Cmd+S` | `Ctrl+S` |
+| Undo | `Cmd+Z` | `Ctrl+Z` |
+| Redo | `Cmd+Shift+Z` | `Ctrl+Shift+Z` or `Ctrl+Y` |
 | Command palette | `Cmd+K` | `Ctrl+K` |
 | Bold / italic / underline | `Cmd+B` / `I` / `U` | `Ctrl+B` / `I` / `U` |
 | Strikethrough | `Cmd+Shift+S` | `Ctrl+Shift+S` |

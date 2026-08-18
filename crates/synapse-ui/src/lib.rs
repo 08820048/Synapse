@@ -10,11 +10,14 @@ use synapse_core::{
     BufferError, NoteDocument, NoteEntry, Vault, VaultEntry, VaultEntryKind, VaultError,
 };
 
+mod edit_history;
 mod markdown_command;
 
 pub use markdown_command::{
     MarkdownEdit, smart_enter_edit, trailing_fenced_code_block_paragraph_edit,
 };
+
+use edit_history::{EditHistory, HistoryEntry, forward_range, inverse_range};
 
 #[derive(Debug)]
 struct OpenTab {
@@ -22,6 +25,7 @@ struct OpenTab {
     cursor: usize,
     preferred_column: Option<usize>,
     title_linked: bool,
+    history: EditHistory,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -60,7 +64,7 @@ impl ShellState {
     }
 
     pub fn open_vault(&mut self, path: impl AsRef<Path>) -> Result<(), SessionError> {
-        if self.tabs.iter().any(|tab| tab.document.is_dirty()) {
+        if self.tabs.iter().any(|tab| tab.history.is_dirty()) {
             let error = SessionError::UnsavedChanges;
             self.record_error(&error);
             return Err(error);
@@ -254,6 +258,102 @@ impl ShellState {
             .map_or(0, |tab| tab.cursor)
     }
 
+    fn active_slice(&self, range: Range<usize>) -> Result<String, SessionError> {
+        self.active_document()
+            .ok_or(SessionError::NoActiveNote)?
+            .slice(range)
+            .map_err(SessionError::Buffer)
+    }
+
+    fn commit_edit(
+        &mut self,
+        start: usize,
+        deleted: String,
+        inserted: &str,
+        cursor_before: usize,
+        sync_linked_title: bool,
+    ) -> Result<(), SessionError> {
+        if deleted.is_empty() && inserted.is_empty() {
+            return Ok(());
+        }
+        let index = self.active_tab.ok_or(SessionError::NoActiveNote)?;
+        let deleted_len = deleted.chars().count();
+        let tab = &mut self.tabs[index];
+        if !deleted.is_empty() {
+            tab.document
+                .remove(start..start + deleted_len)
+                .map_err(SessionError::Buffer)?;
+        }
+        if !inserted.is_empty() {
+            tab.document
+                .insert(start, inserted)
+                .map_err(SessionError::Buffer)?;
+        }
+        tab.cursor = start + inserted.chars().count();
+        tab.preferred_column = None;
+        tab.history.push(HistoryEntry {
+            start,
+            deleted,
+            inserted: inserted.to_owned(),
+            cursor_before,
+            cursor_after: tab.cursor,
+        });
+        if tab.history.is_dirty() {
+            self.status_message = "Modified".to_owned();
+            self.vault_error = None;
+        } else {
+            self.refresh_active_status();
+        }
+        if sync_linked_title && start <= self.tabs[index].document.first_line_len_chars() {
+            self.sync_active_linked_title();
+        }
+        Ok(())
+    }
+
+    fn apply_history_entry(
+        &mut self,
+        entry: &HistoryEntry,
+        undo: bool,
+    ) -> Result<(), SessionError> {
+        let index = self.active_tab.ok_or(SessionError::NoActiveNote)?;
+        let (remove_range, insert_text, cursor) = if undo {
+            (
+                inverse_range(entry),
+                entry.deleted.as_str(),
+                entry.cursor_before,
+            )
+        } else {
+            (
+                forward_range(entry),
+                entry.inserted.as_str(),
+                entry.cursor_after,
+            )
+        };
+        let tab = &mut self.tabs[index];
+        if !remove_range.is_empty() {
+            tab.document
+                .remove(remove_range.clone())
+                .map_err(SessionError::Buffer)?;
+        }
+        if !insert_text.is_empty() {
+            tab.document
+                .insert(remove_range.start, insert_text)
+                .map_err(SessionError::Buffer)?;
+        }
+        tab.cursor = cursor.min(tab.document.len_chars());
+        tab.preferred_column = None;
+        if tab.history.is_dirty() {
+            self.status_message = "Modified".to_owned();
+        } else {
+            self.refresh_active_status();
+        }
+        self.vault_error = None;
+        if entry.start <= self.tabs[index].document.first_line_len_chars() {
+            self.sync_active_linked_title();
+        }
+        Ok(())
+    }
+
     pub fn status_message(&self) -> &str {
         &self.status_message
     }
@@ -269,7 +369,7 @@ impl ShellState {
                     .file_name()
                     .map(|name| name.to_string_lossy().into_owned())
                     .unwrap_or_else(|| tab.document.relative_path().display().to_string()),
-                is_dirty: tab.document.is_dirty(),
+                is_dirty: tab.history.is_dirty(),
             })
             .collect()
     }
@@ -311,6 +411,7 @@ impl ShellState {
                     cursor: 0,
                     preferred_column: None,
                     title_linked: false,
+                    history: EditHistory::default(),
                 });
                 self.active_tab = Some(self.tabs.len() - 1);
                 self.status_message = "Saved".to_owned();
@@ -325,22 +426,8 @@ impl ShellState {
     }
 
     pub fn insert_text(&mut self, text: &str) -> Result<(), SessionError> {
-        let index = self.active_tab.ok_or(SessionError::NoActiveNote)?;
-        let tab = &mut self.tabs[index];
-        let edit_start = tab.cursor;
-        tab.document
-            .insert(tab.cursor, text)
-            .map_err(SessionError::Buffer)?;
-        tab.cursor += text.chars().count();
-        tab.preferred_column = None;
-        if tab.document.is_dirty() {
-            self.status_message = "Modified".to_owned();
-            self.vault_error = None;
-        }
-        if edit_start <= self.tabs[index].document.first_line_len_chars() {
-            self.sync_active_linked_title();
-        }
-        Ok(())
+        let cursor = self.cursor();
+        self.commit_edit(cursor, String::new(), text, cursor, true)
     }
 
     pub fn smart_enter(&mut self) -> Result<(), SessionError> {
@@ -376,23 +463,9 @@ impl ShellState {
         text: &str,
         sync_linked_title: bool,
     ) -> Result<(), SessionError> {
-        let index = self.active_tab.ok_or(SessionError::NoActiveNote)?;
-        let edit_start = range.start;
-        let tab = &mut self.tabs[index];
-        tab.document
-            .remove(range.clone())
-            .map_err(SessionError::Buffer)?;
-        tab.document
-            .insert(range.start, text)
-            .map_err(SessionError::Buffer)?;
-        tab.cursor = range.start + text.chars().count();
-        tab.preferred_column = None;
-        self.status_message = "Modified".to_owned();
-        self.vault_error = None;
-        if sync_linked_title && edit_start <= self.tabs[index].document.first_line_len_chars() {
-            self.sync_active_linked_title();
-        }
-        Ok(())
+        let cursor_before = self.cursor();
+        let deleted = self.active_slice(range.clone())?;
+        self.commit_edit(range.start, deleted, text, cursor_before, sync_linked_title)
     }
 
     pub fn finalize_active_composition(&mut self, edit_start: usize) {
@@ -411,46 +484,72 @@ impl ShellState {
         }
     }
 
-    pub fn backspace(&mut self) -> Result<(), SessionError> {
+    pub fn break_history_coalesce(&mut self) {
+        if let Some(tab) = self.active_tab.and_then(|index| self.tabs.get_mut(index)) {
+            tab.history.break_coalesce();
+        }
+    }
+
+    pub fn can_undo(&self) -> bool {
+        self.active_tab
+            .and_then(|index| self.tabs.get(index))
+            .is_some_and(|tab| tab.history.can_undo())
+    }
+
+    pub fn can_redo(&self) -> bool {
+        self.active_tab
+            .and_then(|index| self.tabs.get(index))
+            .is_some_and(|tab| tab.history.can_redo())
+    }
+
+    pub fn undo(&mut self) -> Result<bool, SessionError> {
+        if !self.can_undo() {
+            return Ok(false);
+        }
         let index = self.active_tab.ok_or(SessionError::NoActiveNote)?;
-        let tab = &mut self.tabs[index];
-        if tab.cursor == 0 {
+        let Some(entry) = self.tabs[index].history.undo() else {
+            return Ok(false);
+        };
+        self.apply_history_entry(&entry, true)?;
+        Ok(true)
+    }
+
+    pub fn redo(&mut self) -> Result<bool, SessionError> {
+        if !self.can_redo() {
+            return Ok(false);
+        }
+        let index = self.active_tab.ok_or(SessionError::NoActiveNote)?;
+        let Some(entry) = self.tabs[index].history.redo() else {
+            return Ok(false);
+        };
+        self.apply_history_entry(&entry, false)?;
+        Ok(true)
+    }
+
+    pub fn backspace(&mut self) -> Result<(), SessionError> {
+        let cursor = self.cursor();
+        if cursor == 0 {
             return Ok(());
         }
-        let removed_at = tab.cursor - 1;
-        tab.document
-            .remove(removed_at..tab.cursor)
-            .map_err(SessionError::Buffer)?;
-        tab.cursor -= 1;
-        tab.preferred_column = None;
-        self.status_message = "Modified".to_owned();
-        self.vault_error = None;
-        if removed_at <= self.tabs[index].document.first_line_len_chars() {
-            self.sync_active_linked_title();
-        }
-        Ok(())
+        let deleted = self.active_slice(cursor - 1..cursor)?;
+        self.commit_edit(cursor - 1, deleted, "", cursor, true)
     }
 
     pub fn delete_forward(&mut self) -> Result<(), SessionError> {
-        let index = self.active_tab.ok_or(SessionError::NoActiveNote)?;
-        let tab = &mut self.tabs[index];
-        if tab.cursor == tab.document.len_chars() {
+        let cursor = self.cursor();
+        let len = self
+            .active_document()
+            .ok_or(SessionError::NoActiveNote)?
+            .len_chars();
+        if cursor == len {
             return Ok(());
         }
-        let removed_at = tab.cursor;
-        tab.document
-            .remove(removed_at..removed_at + 1)
-            .map_err(SessionError::Buffer)?;
-        tab.preferred_column = None;
-        self.status_message = "Modified".to_owned();
-        self.vault_error = None;
-        if removed_at <= self.tabs[index].document.first_line_len_chars() {
-            self.sync_active_linked_title();
-        }
-        Ok(())
+        let deleted = self.active_slice(cursor..cursor + 1)?;
+        self.commit_edit(cursor, deleted, "", cursor, true)
     }
 
     pub fn move_left(&mut self) {
+        self.break_history_coalesce();
         if let Some(tab) = self.active_tab.and_then(|index| self.tabs.get_mut(index)) {
             tab.cursor = tab.cursor.saturating_sub(1);
             tab.preferred_column = None;
@@ -458,6 +557,7 @@ impl ShellState {
     }
 
     pub fn move_right(&mut self) {
+        self.break_history_coalesce();
         if let Some(tab) = self.active_tab.and_then(|index| self.tabs.get_mut(index)) {
             tab.cursor = (tab.cursor + 1).min(tab.document.len_chars());
             tab.preferred_column = None;
@@ -465,6 +565,7 @@ impl ShellState {
     }
 
     pub fn move_home(&mut self) {
+        self.break_history_coalesce();
         let Some(tab) = self.active_tab.and_then(|index| self.tabs.get_mut(index)) else {
             return;
         };
@@ -478,6 +579,7 @@ impl ShellState {
     }
 
     pub fn move_end(&mut self) {
+        self.break_history_coalesce();
         let Some(tab) = self.active_tab.and_then(|index| self.tabs.get_mut(index)) else {
             return;
         };
@@ -500,6 +602,7 @@ impl ShellState {
     }
 
     fn move_vertical(&mut self, direction: i8) {
+        self.break_history_coalesce();
         let Some(tab) = self.active_tab.and_then(|index| self.tabs.get_mut(index)) else {
             return;
         };
@@ -563,6 +666,7 @@ impl ShellState {
 
         match save_result {
             Ok(()) => {
+                self.tabs[index].history.mark_saved();
                 self.status_message = "Saved".to_owned();
                 self.vault_error = None;
                 Ok(true)
@@ -723,7 +827,7 @@ impl ShellState {
     }
 
     fn ensure_tabs_clean(&mut self, range: std::ops::Range<usize>) -> Result<(), SessionError> {
-        if self.tabs[range].iter().any(|tab| tab.document.is_dirty()) {
+        if self.tabs[range].iter().any(|tab| tab.history.is_dirty()) {
             let error = SessionError::UnsavedChanges;
             self.record_error(&error);
             return Err(error);
@@ -733,7 +837,7 @@ impl ShellState {
 
     fn ensure_affected_tabs_clean(&mut self, path: &Path) -> Result<(), SessionError> {
         if self.tabs.iter().any(|tab| {
-            path_is_affected(tab.document.relative_path(), path) && tab.document.is_dirty()
+            path_is_affected(tab.document.relative_path(), path) && tab.history.is_dirty()
         }) {
             let error = SessionError::UnsavedChanges;
             self.record_error(&error);
@@ -810,9 +914,10 @@ impl ShellState {
 
     fn refresh_active_status(&mut self) {
         self.status_message = self
-            .active_document()
-            .map(|document| {
-                if document.is_dirty() {
+            .active_tab
+            .and_then(|index| self.tabs.get(index))
+            .map(|tab| {
+                if tab.history.is_dirty() {
                     "Modified"
                 } else {
                     "Saved"
@@ -1694,5 +1799,105 @@ mod tests {
             fs::read_to_string(directory.path().join("destination/未命名1.md")).unwrap(),
             "# 未命名1\n"
         );
+    }
+
+    #[test]
+    fn undo_restores_typed_text_and_cursor_as_one_run() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("note.md"), "").unwrap();
+        let mut state =
+            ShellState::from_vault_argument(Some(OsString::from(directory.path().as_os_str())));
+        state.select_note(Path::new("note.md")).unwrap();
+        state.insert_text("你").unwrap();
+        state.insert_text("好").unwrap();
+        state.insert_text("\n").unwrap();
+        state.insert_text("世").unwrap();
+
+        assert!(state.undo().unwrap());
+        assert_eq!(state.active_document().unwrap().text(), "你好\n");
+        assert_eq!(state.cursor(), 3);
+        assert!(state.undo().unwrap());
+        assert_eq!(state.active_document().unwrap().text(), "你好");
+        assert!(state.undo().unwrap());
+        assert_eq!(state.active_document().unwrap().text(), "");
+        assert!(!state.undo().unwrap());
+    }
+
+    #[test]
+    fn redo_replays_the_undone_edit_and_a_new_edit_clears_redo() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("note.md"), "ab").unwrap();
+        let mut state =
+            ShellState::from_vault_argument(Some(OsString::from(directory.path().as_os_str())));
+        state.select_note(Path::new("note.md")).unwrap();
+        state.move_end();
+        state.insert_text("c").unwrap();
+        state.undo().unwrap();
+        assert_eq!(state.active_document().unwrap().text(), "ab");
+        assert!(state.redo().unwrap());
+        assert_eq!(state.active_document().unwrap().text(), "abc");
+        state.undo().unwrap();
+        state.insert_text("d").unwrap();
+        assert!(!state.redo().unwrap());
+        assert_eq!(state.active_document().unwrap().text(), "abd");
+    }
+
+    #[test]
+    fn undo_is_independent_per_tab() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("first.md"), "one").unwrap();
+        fs::write(directory.path().join("second.md"), "two").unwrap();
+        let mut state =
+            ShellState::from_vault_argument(Some(OsString::from(directory.path().as_os_str())));
+        state.select_note(Path::new("first.md")).unwrap();
+        state.move_end();
+        state.insert_text("1").unwrap();
+        state.select_note(Path::new("second.md")).unwrap();
+        state.move_end();
+        state.insert_text("2").unwrap();
+
+        state.undo().unwrap();
+        assert_eq!(state.active_document().unwrap().text(), "two");
+        state.activate_tab(0).unwrap();
+        assert_eq!(state.active_document().unwrap().text(), "one1");
+        state.undo().unwrap();
+        assert_eq!(state.active_document().unwrap().text(), "one");
+    }
+
+    #[test]
+    fn moving_the_cursor_breaks_insert_coalescing() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("note.md"), "").unwrap();
+        let mut state =
+            ShellState::from_vault_argument(Some(OsString::from(directory.path().as_os_str())));
+        state.select_note(Path::new("note.md")).unwrap();
+        state.insert_text("a").unwrap();
+        state.move_left();
+        state.move_right();
+        state.insert_text("b").unwrap();
+
+        state.undo().unwrap();
+        assert_eq!(state.active_document().unwrap().text(), "a");
+        state.undo().unwrap();
+        assert_eq!(state.active_document().unwrap().text(), "");
+    }
+
+    #[test]
+    fn undo_after_save_marks_the_tab_dirty_and_redo_marks_it_clean() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("note.md"), "base").unwrap();
+        let mut state =
+            ShellState::from_vault_argument(Some(OsString::from(directory.path().as_os_str())));
+        state.select_note(Path::new("note.md")).unwrap();
+        state.move_end();
+        state.insert_text("!").unwrap();
+        assert!(state.save_active().unwrap());
+        assert!(!state.tabs()[0].is_dirty);
+        assert!(state.undo().unwrap());
+        assert_eq!(state.active_document().unwrap().text(), "base");
+        assert!(state.tabs()[0].is_dirty);
+        assert!(state.redo().unwrap());
+        assert_eq!(state.active_document().unwrap().text(), "base!");
+        assert!(!state.tabs()[0].is_dirty);
     }
 }
