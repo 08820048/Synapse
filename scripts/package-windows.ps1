@@ -24,8 +24,8 @@ $LicensePath = Join-Path $ProjectRoot "LICENSE-MIT"
 $IssPath = Join-Path $ProjectRoot "scripts\windows\synapse.iss"
 $TargetDir = Join-Path $ProjectRoot "target\$Profile"
 $BuiltExe = Join-Path $TargetDir "synapse.exe"
-$StagedExe = Join-Path $TargetDir "Synapse.exe"
 $OutputDir = Join-Path $ProjectRoot "target\$Profile\bundle\windows"
+$StagedExe = Join-Path $OutputDir "Synapse.exe"
 
 if (-not (Test-Path $IconPath)) {
     throw "Application icon is missing: $IconPath"
@@ -49,6 +49,7 @@ if (-not (Test-Path $BuiltExe)) {
     throw "Built executable is missing: $BuiltExe"
 }
 
+New-Item -ItemType Directory -Force -Path $OutputDir | Out-Null
 Copy-Item -Force $BuiltExe $StagedExe
 
 $rcedit = Get-Command rcedit -ErrorAction SilentlyContinue
@@ -68,8 +69,6 @@ if ($rcedit) {
 } else {
     Write-Host "rcedit not found; installer will still use SetupIconFile"
 }
-
-New-Item -ItemType Directory -Force -Path $OutputDir | Out-Null
 
 $iscc = @(
     "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",

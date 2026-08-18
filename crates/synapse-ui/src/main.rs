@@ -167,6 +167,7 @@ const NOTE_LINK_PICKER_WIDTH: f32 = 268.0;
 const SLASH_MENU_REVEAL_DELAY: Duration = Duration::from_millis(16);
 const SLASH_MENU_ENTER_TRANSITION: Duration = Duration::from_millis(120);
 const SLASH_MENU_EXIT_TRANSITION: Duration = Duration::from_millis(100);
+#[cfg(any(target_os = "macos", test))]
 const SYNAPSE_APP_ICON_PNG: &[u8] = include_bytes!("../../../assets/branding/synapse-app-icon.png");
 static APP_ALERT_ID: AtomicU64 = AtomicU64::new(1);
 

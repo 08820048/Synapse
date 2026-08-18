@@ -32,9 +32,16 @@ fn markdown_italic_fallbacks(strong: bool) -> FontFallbacks {
         ["Kaiti SC", "Kaiti TC", "STKaiti"]
     };
     #[cfg(target_os = "windows")]
-    let families = ["KaiTi", "Microsoft YaHei", "Microsoft JhengHei"];
+    let families = if strong {
+        ["Microsoft YaHei", "Microsoft JhengHei", "KaiTi"]
+    } else {
+        ["KaiTi", "Microsoft YaHei", "Microsoft JhengHei"]
+    };
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    let families = ["Noto Serif CJK SC", "Noto Serif CJK TC", "Noto Serif"];
+    let families = {
+        let _ = strong;
+        ["Noto Serif CJK SC", "Noto Serif CJK TC", "Noto Serif"]
+    };
 
     FontFallbacks::from_fonts(families.into_iter().map(str::to_owned).collect())
 }
