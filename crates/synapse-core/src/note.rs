@@ -47,6 +47,10 @@ impl NoteDocument {
         Ok(self.buffer.slice(range).to_string())
     }
 
+    pub fn char_to_line(&self, char_index: usize) -> usize {
+        self.buffer.char_to_line(char_index.min(self.len_chars()))
+    }
+
     pub fn first_line_len_chars(&self) -> usize {
         self.buffer
             .line(0)
@@ -169,5 +173,15 @@ mod tests {
 
         assert_eq!(document.slice(1..3).unwrap(), "你好");
         assert!(document.slice(0..5).is_err());
+    }
+
+    #[test]
+    fn char_to_line_maps_unicode_offsets() {
+        let document = NoteDocument::from_text(PathBuf::from("note.md"), "标题\n你好\n正文");
+
+        assert_eq!(document.char_to_line(0), 0);
+        assert_eq!(document.char_to_line(3), 1);
+        assert_eq!(document.char_to_line(6), 2);
+        assert_eq!(document.char_to_line(document.len_chars()), 2);
     }
 }

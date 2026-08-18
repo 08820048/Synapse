@@ -3452,10 +3452,15 @@ impl SynapseApp {
     }
 
     fn undo(&mut self, _: &Undo, _: &mut Window, cx: &mut Context<Self>) {
-        if self.state.undo().unwrap_or(false) {
-            self.editor_render_cache = None;
+        let previous_revision = self
+            .state
+            .active_document()
+            .map_or(0, |document| document.revision());
+        if let Ok(Some(edit)) = self.state.undo() {
+            self.sync_writ_render_buffer(previous_revision, edit.range, &edit.replacement);
             self.editor_marked_range = None;
             self.editor_selection.collapse(self.state.cursor());
+            self.reveal_editor_cursor();
             self.refresh_slash_menu(cx);
             self.restart_editor_cursor_blink(cx);
         }
@@ -3464,15 +3469,35 @@ impl SynapseApp {
     }
 
     fn redo(&mut self, _: &Redo, _: &mut Window, cx: &mut Context<Self>) {
-        if self.state.redo().unwrap_or(false) {
-            self.editor_render_cache = None;
+        let previous_revision = self
+            .state
+            .active_document()
+            .map_or(0, |document| document.revision());
+        if let Ok(Some(edit)) = self.state.redo() {
+            self.sync_writ_render_buffer(previous_revision, edit.range, &edit.replacement);
             self.editor_marked_range = None;
             self.editor_selection.collapse(self.state.cursor());
+            self.reveal_editor_cursor();
             self.refresh_slash_menu(cx);
             self.restart_editor_cursor_blink(cx);
         }
         cx.stop_propagation();
         cx.notify();
+    }
+
+    fn reveal_editor_cursor(&mut self) {
+        let Some(document) = self.state.active_document() else {
+            return;
+        };
+        let line = document.char_to_line(self.state.cursor());
+        if self.editor_visible_range.contains(&line) {
+            return;
+        }
+        self.editor_list_state.scroll_to(ListOffset {
+            item_ix: line,
+            offset_in_item: px(0.0),
+        });
+        self.editor_visible_range = line..line.saturating_add(1);
     }
 
     fn backspace(&mut self, _: &Backspace, _: &mut Window, cx: &mut Context<Self>) {

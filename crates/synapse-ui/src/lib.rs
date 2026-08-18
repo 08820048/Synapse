@@ -35,6 +35,12 @@ pub struct TabInfo {
     pub is_dirty: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AppliedHistoryEdit {
+    pub range: Range<usize>,
+    pub replacement: String,
+}
+
 #[derive(Debug, Default)]
 pub struct ShellState {
     pub vault_name: Option<String>,
@@ -502,28 +508,34 @@ impl ShellState {
             .is_some_and(|tab| tab.history.can_redo())
     }
 
-    pub fn undo(&mut self) -> Result<bool, SessionError> {
+    pub fn undo(&mut self) -> Result<Option<AppliedHistoryEdit>, SessionError> {
         if !self.can_undo() {
-            return Ok(false);
+            return Ok(None);
         }
         let index = self.active_tab.ok_or(SessionError::NoActiveNote)?;
         let Some(entry) = self.tabs[index].history.undo() else {
-            return Ok(false);
+            return Ok(None);
         };
         self.apply_history_entry(&entry, true)?;
-        Ok(true)
+        Ok(Some(AppliedHistoryEdit {
+            range: inverse_range(&entry),
+            replacement: entry.deleted,
+        }))
     }
 
-    pub fn redo(&mut self) -> Result<bool, SessionError> {
+    pub fn redo(&mut self) -> Result<Option<AppliedHistoryEdit>, SessionError> {
         if !self.can_redo() {
-            return Ok(false);
+            return Ok(None);
         }
         let index = self.active_tab.ok_or(SessionError::NoActiveNote)?;
         let Some(entry) = self.tabs[index].history.redo() else {
-            return Ok(false);
+            return Ok(None);
         };
         self.apply_history_entry(&entry, false)?;
-        Ok(true)
+        Ok(Some(AppliedHistoryEdit {
+            range: forward_range(&entry),
+            replacement: entry.inserted,
+        }))
     }
 
     pub fn backspace(&mut self) -> Result<(), SessionError> {
@@ -1813,14 +1825,16 @@ mod tests {
         state.insert_text("\n").unwrap();
         state.insert_text("世").unwrap();
 
-        assert!(state.undo().unwrap());
+        let undone = state.undo().unwrap().expect("undo last insert");
+        assert_eq!(undone.range, 3..4);
+        assert_eq!(undone.replacement, "");
         assert_eq!(state.active_document().unwrap().text(), "你好\n");
         assert_eq!(state.cursor(), 3);
-        assert!(state.undo().unwrap());
+        assert!(state.undo().unwrap().is_some());
         assert_eq!(state.active_document().unwrap().text(), "你好");
-        assert!(state.undo().unwrap());
+        assert!(state.undo().unwrap().is_some());
         assert_eq!(state.active_document().unwrap().text(), "");
-        assert!(!state.undo().unwrap());
+        assert!(state.undo().unwrap().is_none());
     }
 
     #[test]
@@ -1834,11 +1848,11 @@ mod tests {
         state.insert_text("c").unwrap();
         state.undo().unwrap();
         assert_eq!(state.active_document().unwrap().text(), "ab");
-        assert!(state.redo().unwrap());
+        assert!(state.redo().unwrap().is_some());
         assert_eq!(state.active_document().unwrap().text(), "abc");
         state.undo().unwrap();
         state.insert_text("d").unwrap();
-        assert!(!state.redo().unwrap());
+        assert!(state.redo().unwrap().is_none());
         assert_eq!(state.active_document().unwrap().text(), "abd");
     }
 
@@ -1893,10 +1907,10 @@ mod tests {
         state.insert_text("!").unwrap();
         assert!(state.save_active().unwrap());
         assert!(!state.tabs()[0].is_dirty);
-        assert!(state.undo().unwrap());
+        assert!(state.undo().unwrap().is_some());
         assert_eq!(state.active_document().unwrap().text(), "base");
         assert!(state.tabs()[0].is_dirty);
-        assert!(state.redo().unwrap());
+        assert!(state.redo().unwrap().is_some());
         assert_eq!(state.active_document().unwrap().text(), "base!");
         assert!(!state.tabs()[0].is_dirty);
     }
