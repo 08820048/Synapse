@@ -3,8 +3,8 @@
 **Author:** Codex  
 **Date:** 2026-08-10  
 **Status:** Approved  
-**Reviewers:** Product owner (approved through the explicit request to implement `docs/Task.md` V1)  
-**Related specs:** `docs/Task.md`, `specs/note-editing.md`, `specs/phase-0-foundation.md`
+**Reviewers:** Product owner (approved the V1 tab and layout slice)  
+**Related specs:** `specs/note-editing.md`, `specs/phase-0-foundation.md`
 
 > V2 note: `specs/v2-editor-navigation.md` supersedes the Backlinks/right-sidebar portions of FR-11 through FR-14 and AC-9. V1 tab behavior remains current.
 

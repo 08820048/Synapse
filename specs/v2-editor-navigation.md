@@ -3,8 +3,8 @@
 **Author:** Codex  
 **Date:** 2026-08-10  
 **Status:** Approved  
-**Reviewers:** Product owner (approved through the explicit request to implement `docs/Task.md` V2)  
-**Related specs:** `docs/Task.md`, `specs/v1-workspace-tabs.md`, `specs/note-editing.md`
+**Reviewers:** Product owner (approved the V2 navigation slice)  
+**Related specs:** `specs/v1-workspace-tabs.md`, `specs/note-editing.md`
 
 ## Context
 
@@ -137,9 +137,9 @@ fn build_file_tree_rows(note_paths: &[PathBuf]) -> Vec<FileTreeRow>;
 
 ## Out of Scope
 
-- OS-1: Search query entry, filtering, indexing, and result navigation — explicitly deferred by `docs/Task.md` V2.
-- OS-2: Todo persistence and task workflows — explicitly deferred by `docs/Task.md` V2.
-- OS-3: Bookmark persistence and bookmark navigation — explicitly deferred by `docs/Task.md` V2.
+- OS-1: Search query entry, filtering, indexing, and result navigation — deferred from the V2 UI-shell slice.
+- OS-2: Todo persistence and task workflows — deferred from the V2 UI-shell slice.
+- OS-3: Bookmark persistence and bookmark navigation — deferred from the V2 UI-shell slice.
 - OS-4: Settings implementation — only the navigation entry is included.
 - OS-5: Actual new-file and new-folder creation — this slice establishes the referenced UI controls without mutating the Vault.
 - OS-6: Directory collapse state, rename, drag, move, and delete — separate file-management slice.

@@ -1,116 +1,93 @@
+# Synapse project principles
 
+This file is the product and engineering constitution for humans and AI agents working in this repository.
 
-##  项目愿景与调性（Vibe）
+Repository: https://github.com/08820048/Synapse
 
-你正在帮助开发 Synapse，一款使用 Rust + GPUI 编写的高性能、本地优先的知识工作台。
-项目的远程仓库地址:git@github.com:08820048/synapase.git
-核心身份定位：
-启动速度极快，内存占用极低
-原生体验（绝不是 Electron 那种）
-以「连接」为核心（双向链接）
-干净、现代、键盘优先的界面
-采用「中心编辑器 + 浮动面板」布局
+## Product
 
-可以把它想象成：  
-「Obsidian 的功能 + Zed 的性能 + Linear 的精致感」
+Synapse is a high-performance, local-first knowledge workbench written in Rust + GPUI.
 
-始终优先考虑的顺序：
-性能与流畅度
-清晰的架构
-美观且极简的界面
-本地优先与隐私
+Identity:
 
-在早期阶段，绝不为了方便的功能而牺牲性能。
+- Extremely fast startup, very low memory
+- Native desktop experience (never Electron)
+- Connection as a core idea (wikilinks, later)
+- Clean, modern, keyboard-first UI
+- Center editor + lightweight surrounding chrome
+- Every user-facing string must ship in both Chinese and English
 
+Think: Obsidian's writing power + Zed's performance + Linear's restraint.
 
+Priority order, always:
 
-## 技术栈（严格遵守）
+1. Performance and fluidity
+2. Clear architecture
+3. Beautiful, minimal UI
+4. Local-first privacy
 
-语言：Rust（最新稳定版）
-UI 框架：GPUI（来自 zed-industries/zed）
-文本缓冲区：ropey
-解析：tree-sitter + pulldown-cmark（或 markdown-rs）
-搜索：优先使用高性能方案（后期可用 tantivy 或自研倒排索引）
-序列化：serde + toml/json
-文件监听：notify
+In early stages, never add a convenience feature that spends startup time, idle memory, or input latency.
 
-禁止引入：
-- 任何 Web 技术（不要 HTML/CSS/JS，不要 egui、iced，除非我明确要求）
-- 沉重的框架
-- 不必要的依赖
+## Hard rules
 
-##  架构原则
+- No web UI stack: no HTML/CSS/JS, no Electron, no egui, no iced, unless the maintainer explicitly asks.
+- No heavy frameworks and no casual new dependencies.
+- Prefer composition over inheritance.
+- Keep module boundaries:
+  - `synapse-core` → domain (notes, vault, filesystem)
+  - `synapse-ui` → GPUI views and session state
+  - later: editor, search, link
+- The editor buffer is the source of truth for open content.
+- The filesystem is the source of truth for notes. No required database in the current phase.
+- UI state should stay easy to serialize so layouts can be saved later.
 
-优先使用组合而非继承
-职责清晰分离：
-  core → 领域逻辑（笔记、链接、知识库）
-  editor → 文本编辑与 Markdown
-  ui → GPUI 视图和状态
-  search → 索引
-  link → 双向链接引擎
-编辑器是内容的唯一真实来源
-文件系统是笔记的真实来源（MVP 阶段不强制使用数据库）
-所有 UI 状态应易于序列化，方便保存布局
+Dangerous actions and notifications have dedicated specs:
 
-##  界面与布局规则（非常重要）
+- `docs/危险操作确认效果规范.md`
+- `docs/通知系统规范.md`
 
-默认布局风格：浮动面板 + 中心编辑器
+## UI
 
-编辑器永远是视觉中心，也是最重要的元素
-文件树、反向链接、大纲、图谱、搜索等都是浮动面板
-面板可以拖拽、吸附、调整大小、合并成标签页、关闭
-支持一键「专注模式」，隐藏所有面板
-优先支持键盘操作流程
-避免界面杂乱。留白本身就是一种功能
-动画要微妙且高性能（发挥 GPUI 的优势）
+- Native and fast, not decorative
+- Use GPUI's style system and `gpui-component`
+- Prefer declarative, composable elements
+- Use as few dividers as possible
 
-创建新 UI 时：
-- 要有原生感和速度感
-- 统一使用 GPUI 的样式系统
-- 优先使用声明式、可组合的元素
-- 尽可能少或者直接不使用分割线,提升整体一体化视觉效果体验
+## Performance (non-negotiable)
 
-##  性能要求（不可妥协）
+- Cold start target: < 0.8s
+- Idle memory target: < 80MB
+- Smooth scrolling on very large notes
+- Fast search even with thousands of notes
+- Do not block the main thread
+- Be careful with allocations on render, input, and search paths
 
-冷启动目标：< 0.8 秒
-空闲内存：尽可能低（目标 < 80MB）
-即使是非常大的笔记，滚动也要流畅
-即使有成千上万条笔记，搜索也要快
-避免阻塞主线程
-在热路径（渲染、输入、搜索）中要小心内存分配
+When unsure, pick the faster and leaner option.
 
-有疑问时，选择更快、更省内存的方案。
+## Code style
 
-## 代码风格
+- Idiomatic modern Rust
+- Use `Result` and handle errors
+- Clarity over cleverness
+- Names matter: Synapse, Vault, Note, Link, Panel
+- Comment only when the why is not obvious
+- Keep functions small
+- Write code that a future human or agent can change safely
 
-使用地道的现代 Rust
-大量使用 Result 并做好错误处理
-清晰优于技巧
-命名很重要（Synapse、Vault、Note、Link、Panel...）
-只有在「为什么」不明显时才加简洁注释
-保持函数相对小而专注
-写出对人类和未来 AI Agent 都容易修改的代码
+## Decision tests
 
----
+1. Does this keep or improve performance?
+2. Does this keep the architecture clear?
+3. Does this serve a center-editor workspace?
+4. Is this the simplest good MVP solution?
 
-## 决策指南
+If a request fights performance or simplicity, say so and propose a better alternative.
 
-做技术决策时，问自己这几个问题：
+Do not push to `origin` unless a maintainer explicitly asks. External contributions should go through a pull request. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
-这能提升性能或保持高性能吗？
-这能保持架构清晰吗？
-这符合「浮动面板 + 中心编辑器」的愿景吗？
-这是 MVP 阶段最简单且效果好的方案吗？
+## Communication
 
-如果某个功能与性能或简洁性冲突，请礼貌地指出，并提出更好的替代方案。
-没有我的明确指令,不要提交推送远程
-
-## 与我沟通的风格
-
-直接、务实
-建议代码时，优先给出完整可运行的示例
-尽早指出潜在的性能或架构风险
-如果我的需求违背了项目调性，请礼貌说明，并给出替代建议
-
-需要我把这份中文版也整理成可以直接保存的 agent.md 文件格式吗？  
-或者你想对某些部分进行修改/加强？
+- Direct and practical
+- Prefer complete, runnable examples
+- Call out performance or architecture risk early
+- If a request fights the product tone, say so politely and suggest another path

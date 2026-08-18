@@ -1,136 +1,114 @@
 # Synapse
 
-Synapse 是一款使用 Rust 与 GPUI 构建的高性能、本地优先 Markdown 编辑器。
+<p align="center">
+  <img src="assets/branding/synapse-app-icon.png" alt="Synapse icon" width="128" height="128">
+</p>
 
-产品重点是快速启动、低内存、可靠的本地文件编辑，以及接近 Zed 的原生桌面体验。Markdown 文件和本地文件夹是唯一数据源，不依赖 Web 技术、数据库或强制网络服务。
+<p align="center">
+  A fast, native, local-first Markdown editor.<br>
+  Built with Rust and <a href="https://www.gpui.rs/">GPUI</a>.
+</p>
 
-## 当前能力
+<p align="center">
+  <a href="#synapse">English</a> · <a href="#synapse-中文">中文</a>
+  · <a href="CHANGELOG.md">Changelog</a>
+  · <a href="CONTRIBUTING.md">Contributing</a>
+</p>
 
-- 无参数启动时默认创建 `1809 × 1332` 的居中窗口，并保留 `900 × 560` 最小尺寸约束。
-- 在应用内通过系统文件夹选择器打开本地 Markdown 目录。
-- 递归发现 `.md` / `.MD` 文件和空文件夹，并显示可展开/收起的分层文件树；展开目录使用 `folder-open`，空目录显示“空文件夹”。
-- 在 Vault 根目录或任意子目录直接创建 `未命名N` 文件夹或 Markdown 笔记，不需要先填写命名弹层。
-- 新建笔记会立即打开并写入 `# 未命名N`；编辑该一级标题会同步更新对应文件名。
-- 文件夹右键支持新建子文件夹、新建笔记、重命名、Finder 定位和移到废纸篓。
-- 笔记右键支持重命名、Finder 定位和移到废纸篓；危险操作使用红色提示。
-- 文件夹和笔记重命名在文件树原位置进行，支持中文 IME；Enter 提交，Escape 取消。
-- 文件夹和笔记支持拖到目标目录、同级笔记所在目录或 Vault 根目录。
-- 多文档页签、独立 Rope 缓冲区、Unicode 光标和脏状态。
-- 页签切换、关闭，以及 Close / Close Left / Close Right / Close All 右键菜单。
-- GPUI 原生文本输入，支持中文 IME、鼠标点击定位、换行、删除和上下左右/Home/End 光标导航。
-- 普通 Enter 使用 `writ 0.18.1` 的 tree-sitter Markdown 列表上下文：自动续写无序列表、有序列表、任务列表和引用；空列表项回车退出列表，Shift+Enter 插入原始换行。
-- 任务列表使用 16px 原生复选框替换 `[ ]` / `[x]` 源码标记；支持嵌套任务和大小写 `X`，点击复选框会直接切换 Markdown 缓冲区并保留当前光标位置。
-- 编辑光标按约 530ms 周期闪烁；输入、鼠标定位或方向移动后立即恢复显示并重置闪烁周期。
-- Markdown 源码在内存和磁盘中保持原样，编辑区实时呈现标题、列表、引用、代码及常用行内标记。
-- Markdown 分割线按正文页实际宽度绘制为 1px 主题 divider，并保留上下各 2em 的写作间距；不再使用固定长度的横线字符。
-- GFM 表格按连续表格块渲染为等宽列：隐藏语法分隔行，表头使用 panel 背景与半粗体，单元格使用 1px 主题边框和 6×10px 内边距；点击或输入时仍保持结构化表格呈现。
-- 引用块使用无圆角的 2px `ink` 左侧竖线和 muted 正文色；浅色主题显示深色竖线，深色主题显示亮色竖线。
-- Obsidian 风格 `> [!TYPE]` 提示块使用 Writ 的结构识别和类型标题，渲染为连续的类型色左边框与浅色背景容器；支持默认标题和自定义标题，普通引用块样式保持独立。
-- 脚注引用 `[^label]` 在正文中显示为上标，脚注定义与四空格/Tab 续写段落显示在带顶部分隔线的小号文本区域；定义内容继续呈现常用行内 Markdown，光标进入后保持渲染并继续接收原生输入。
-- Markdown 独立图片和行内图片通过 GPUI 原生异步图片加载器显示：相对路径按当前笔记目录解析，`/assets/...` 按 Vault 根目录解析；HTTP(S) 使用运行在专用 Tokio runtime 内的 Rust 网络客户端并支持 HTTPS/重定向，不会在 GPUI 非 Tokio 执行器中触发 reactor panic；另支持百分号编码路径、深浅主题错误占位和持续渲染编辑，本地路径不能越过 Vault。直接粘贴剪贴板图片会保留原格式保存到当前笔记同级 `assets/` 并自动插入相对 Markdown 图片语法。
-- H1–H4 使用 Markd 对齐的字号、精确字重与段落间距，H5/H6 回归正文大小和普通字重；所有标题继承主题 `ink`，不再被解析器重复加粗。
-- 围栏代码块会隐藏非活动围栏、显示 panel 容器，并把 writ/tree-sitter 的语言高亮颜色传入 GPUI `TextRun`；代码使用 0.86em 等宽字体、line-soft 边框和 8px 圆角。
-- Mermaid 围栏代码块由纯 Rust 的 `rusty-mermaid 0.2.0` 解析为 SVG 并通过 GPUI 原生显示；图表在默认编辑态持续渲染、随正文宽度等比缩放并适配浅色/深色主题，解析失败显示可编辑错误卡片；完整围栏源码只在右上角源码模式中显示。
-- 数学公式支持行内 `$...$`、单行 `$$...$$` 和多行 `$$` 公式块：默认编辑态使用与文本基线对齐的原生 SVG，公式块在正文区域居中并等比缩放；光标进入后保持渲染，解析错误不会阻止继续编辑，完整 LaTeX 源码可由右上角源码模式查看和修改。
-- 页签下方的 40px 笔记工具行显示当前笔记面包屑，并提供 Markdown 源码模式与笔记菜单；菜单中的导出、复制和删除分别连接系统保存面板、系统剪贴板和废纸篓安全删除。
-- 默认编辑态是持续渲染的结构化笔记视图：移动光标、重新进入已编辑内容或选择文本都不会自动暴露 Markdown 标记；源码/显示映射继续把输入写回标准 Markdown，完整源码只通过右上角源码按钮显式切换。
-- 编辑器使用 `w-full + 1120px max-width` 的响应式居中写作页，按实际编辑区宽度应用 16/24/32px 水平边距；正文为 16px 系统字体与 1.65 行高，不显示行号。
-- 宽屏编辑区正文右侧空白区域提供纯 Rust + GPUI 的磁性短线笔记目录：按文档修订提取 H1–H3，默认用等长弱化刻度表示章节，当前章节只加深；鼠标经过时中心刻度及上下邻近项按距离逐级伸长并显示自适应章节标题卡片，点击直接通过 GPUI 变高虚拟列表跳转到对应标题。目录按正文真实右边缘定位，空白不足时整体隐藏，绝不压入或遮挡正文；不使用 DOM、HTML/CSS、JavaScript、WebView 或 Web Audio。
-- 文档页签直接位于 44px 自定义标题栏；长标题在固定页签宽度内以省略号收尾。激活页签自身与编辑器使用同一表面色，底部不绘制分割线，其他边缘保持普通直角页签样式，不增加圆角、遮罩或装饰 Canvas。侧栏开关以无背景、无圆角容器的 Lucide 图标显示，同时保留 40px 点击区域；侧栏收起会立即释放全部宽度，页签和编辑区同步左移扩展。
-- 页签、文件夹、笔记和笔记操作菜单均使用左侧固定 18px 图标槽、右侧菜单名称；Lucide 图标为 15px 并显式读取主题色，避免 SVG `currentColor` 在菜单按钮内丢失或被排到文字右侧。
-- 文件树行保持普通 pointer 光标；文件树和页签右键菜单通过 GPUI 窗口级 Anchored 浮层直接锚定实际点击坐标，并按面板实测尺寸限制在窗口内，不受侧栏滚动或父级 flex 布局偏移影响；可直接从一行连续右键切换到另一行。所有右键菜单均为无项目分割线的一体化面板。
-- `Cmd/Ctrl + S` 原子保存，保存失败不会丢失内存缓冲区。
-- 可收起的左侧导航和一体化编辑区域。
-- Lucide `panel-left` / `panel-right` 侧栏开关位于首个页签左侧，保持 40px 命中区；编辑器不再显示底部工具栏。
-- 左侧 Lucide 搜索入口使用 `Search any...` 文案和右侧 `⌘K` 徽标，可打开中央命令面板。
-- 界面已接入 `gpui-component 0.5.1`：统一使用 Root、Theme、Button、Input 与 Kbd，`Cmd/Ctrl+K` 可在任意区域打开并聚焦命令搜索。
-- Settings 的 Appearance 面板支持 System、Light、Dark 三态并持久化；浅色模式使用 `#f4f4f2` 侧栏、`#fbfbfa` 编辑器、`#e9e9e6` 未激活页签，深色模式对应使用 `#151515`、`#1a1a1a`、`#0f0f0f`；两种主题的激活页签均与各自编辑器背景一致。
-- Settings 通过独立的原生应用窗口打开，拥有系统关闭、最小化、缩放和尺寸调整控制，不会覆盖主窗口中的笔记、待办或书签内容；重复打开会激活已有设置窗口。macOS 原生标题栏随全局 System / Light / Dark 偏好同步，不会与窗口内容使用两套明暗外观。
-- 删除文件夹、移到废纸篓和删除笔记使用与普通菜单项一致的无边框 ghost 行，仅图标和文字保留危险色。
-- 待办、书签和 Settings 入口；侧栏图标显式使用主题弱化前景色，浅色/深色模式均可见。
-- 点击侧边栏“待办”图标与文字区域会在编辑器位置打开纯 Rust + GPUI 待办工作区；右侧独立 Lucide `plus` / `minus` 只控制下方快捷列表展开收起，不会误触发工作区切换。快捷列表展示全部待办，完成项不会被移除，而是保留勾选、弱化文字和删除线，并可再次点击恢复。工作区主体提供标签筛选、真实使用计数以及带可见 Lucide 加号的原生待办输入框，支持中文输入、回车创建、列表置顶和完成状态切换。引导文案同行右侧会按实时完成数显示“清除已完成 · N”，可一次删除并持久化全部完成项。待办行之间没有分割线，悬停时不改变行背景，只在最右侧显示分配标签、复制、删除三个 40px 操作；标签浮层支持连续多选，分配结果以可单独取消的 `#标签` 彩色胶囊显示。标签、待办、多标签关系和完成状态均持久化到平台用户配置目录，并兼容旧单标签记录。
-- 无序列表不再直接显示系统字体中的 `•` 字形：GPUI 在 writ 保留的标记槽位中独立绘制 5px 圆形 marker，并使用与 Markd `--faint` 一致的主题层级；`-`、`*`、`+` 均统一呈现。序号同样使用 faint 色。
-- 导航、菜单和页签操作统一使用编译进应用的 Lucide 官方 SVG 图标。
-- 左侧文件树名称对齐 Markd 当前源码：内置并由 GPUI 原生注册 Inter `opsz,wght` 可变字体，文件与文件夹均为 13px/30px 行高；普通文件使用 400 字重，文件夹使用 500 字重，默认采用 muted 配色，激活或悬停切换为 ink。字体缺失时不再依赖用户系统环境，也没有引入 Web 字体加载或浏览器运行时。
-- 左侧侧栏展开/收起对齐 Markd 的容器结构：固定 248px 的侧栏内容始终挂载，外层裁切视口以 180ms 可中断 `MarkdPanelSpring` 在 248px 与 0px 之间过渡，编辑区 flex 同步占回空间；macOS 标题栏安全边距使用相同曲线联动，不会在侧栏关闭后留下空白区域。
+<p align="center">
+  <img alt="CI" src="https://github.com/08820048/Synapse/actions/workflows/ci.yml/badge.svg">
+  <img alt="License" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue">
+</p>
 
-- 待办标签栏的选中状态使用 Markd 同源的共享布局弹簧 pill（`TagPillSpring` 360/32/0.6 经 180ms 归一化）：激活行背景是带 6px 圆角的浅色胶囊，点击不同标签时胶囊在行间平滑滑动而非原地闪烁；选中行文字切为主题 `ink`，计数随选中状态在 muted/faint 间切换。
-- 待办工具栏“新建标签”按钮点击后原位展开为无边框透明输入框：容器宽度以 180ms `EaseInOutCubic` 展开，输入框与按钮以 140ms `EaseOutQuad` 交叉淡化；输入框右侧为两个 24px 圆形 hover 图标按钮（勾选/取消），支持 Enter 提交、Esc 取消和中文 IME，不再出现组件默认的输入边框。
-- 书签已具备完整原生工作区：搜索和 URL 添加共用输入框，支持裸域名补全、标签筛选/计数/创建/删除、多标签分配、标题原位编辑、系统浏览器打开、复制链接、删除、Markdown 导出，以及 Open Graph 标题/预览/favicon 后台抓取。侧栏书签入口的主区域只打开工作区，右侧 Lucide `plus` / `minus` 只展开完整书签列表；所有书签和标签关系持久化到平台用户配置目录。待办创建、筛选、多标签分配、复制、逐条删除、批量清除完成项、完成和持久化以及主题设置均已可用。V3 文件操作已经接入真实文件系统，并对路径穿越、符号链接、覆盖冲突、递归移动和未保存页签提供保护。
+Synapse opens an ordinary folder of Markdown files. There is no account, no required cloud, and no database. The filesystem is the source of truth.
 
-## 技术约束
+This is an early public preview (`0.1.0`). Daily Markdown editing works on macOS. Undo, full search, and Windows/Linux builds are not ready yet.
 
-- 语言：Rust 最新稳定版。
-- UI：GPUI，禁止引入 HTML/CSS/JavaScript、Electron、egui 或 iced。
-- 组件体系：最新正式版 `gpui-component 0.5.1` 与 `gpui-component-assets 0.5.1`；标准按钮、输入、快捷键标签和浮层宿主优先使用组件库实现。
-- 文本缓冲区：ropey。
-- 删除：使用 `trash 5.2.6` 移入操作系统废纸篓，不执行永久删除。
-- 图标：固定使用 Lucide `1.27.0`，项目只内置实际使用的 SVG，并随附上游许可证与来源记录。
-- 动画：固定使用 `gpui-animation 0.2.63`，交互时长和缓动遵循 `docs/过渡和交互动画规约.md`。
-- Markdown 编辑内核：固定接入 `writ 0.18.1` 并关闭默认 app feature；当前先复用其无头 `EditorState` 和 tree-sitter-md 列表上下文，GPUI 继续承担应用壳、输入法和绘制。
-- Markdown 呈现：当前仍是可编辑的轻量块级实时呈现；后续分阶段把 writ 的解析、位置映射和更多语法节点接入 GPUI 渲染层。
-- Mermaid：固定使用纯 Rust `rusty-mermaid 0.2.0` 的 SVG 后端，不引入 WebView 或 JavaScript Mermaid 运行时。
-- 数学公式：固定使用纯 Rust `RaTeX 0.1.14` 解析、排版并生成嵌入字形的自包含 SVG，不依赖 WebView、JavaScript、网络或系统 LaTeX。
-- 文件监听：使用 `notify 7.0.0` 递归监听当前 Vault；外部文件变化经过 180ms trailing debounce 自动刷新侧栏，不重载或覆盖已打开笔记缓冲区。
-- 文件系统始终是 Markdown 文档的真实来源。
+## Features
 
-架构保持清晰分层：
+- Recursive vault of `.md` files, including empty folders
+- Create, rename, drag-move, and trash notes from a native file tree
+- Multi-tab editing with independent Rope buffers and dirty-state protection
+- Live Markdown rendering: headings, lists, tasks, tables, callouts, footnotes, images, Mermaid, and math
+- Source mode is explicit; the default editor stays structured
+- Chinese IME, slash commands, format shortcuts, and clipboard image paste
+- Native todo and bookmark workspaces, persisted in the user config directory
+- System / Light / Dark themes and Simplified Chinese / English UI
+- External filesystem changes refresh the sidebar without touching unsaved buffers
 
-- `synapse-core`：Vault、Markdown 文档、路径安全和持久化。
-- `synapse-ui`：GPUI 窗口、页签、导航、命令面板和编辑会话状态。
-- 后续独立模块：专业编辑输入、Markdown 渲染、搜索、配置。
+## Requirements
 
-## 运行
+- Rust 1.93 or later
+- macOS is the supported development platform today
+- Xcode command-line tools (for a local `cargo run` on macOS)
+
+## Run
 
 ```bash
 cargo run -p synapse
 ```
 
-也可以直接传入初始目录：
+Or open a folder directly:
 
 ```bash
 cargo run -p synapse -- /path/to/markdown-folder
 ```
 
-不传路径时，Synapse 会自动恢复上次选择的 Vault。首次启动或保存路径已经失效时，会创建并打开 `~/Documents/Synapse Vault`，因此无需先手动选择工作区也能立即新建笔记和文件夹。当前路径可在 Settings → Workspace 中查看和更换。
+With no argument, Synapse restores the last vault. On first launch it creates `~/Documents/Synapse Vault`.
 
-### macOS 应用包
-
-开发环境直接执行 `cargo run -p synapse` 时，应用会通过 AppKit 使用内置 Synapse 图标，因此 Dock 和 `Command+Tab` 应用切换器不再显示默认可执行文件图标。
-
-生成带正式名称、Bundle Identifier 和 `.icns` 资源的本地 `.app`：
+### macOS app bundle
 
 ```bash
 ./scripts/package-macos.sh
-```
-
-产物位于 `target/release/bundle/osx/Synapse.app`。使用以下命令同时生成并安装到 `/Applications`：
-
-```bash
+# or install into /Applications
 ./scripts/package-macos.sh --install
 ```
 
-Finder、Applications、Launchpad 和固定到 Dock 的快捷入口均从 App Bundle 的 `Synapse.icns` 读取图标。脚本会执行本地 ad-hoc 签名，正式分发时仍需替换为 Developer ID 签名和公证流程。
+The bundle is written to `target/release/bundle/osx/Synapse.app`. The script applies an ad-hoc signature; distribution still needs Developer ID signing and notarization.
 
-## 编辑快捷键
+## Editor shortcuts
 
-| 操作 | 快捷键 |
-|---|---|
-| 保存 | macOS `Cmd+S`，Windows/Linux `Ctrl+S` |
-| 粗体 | macOS `Cmd+B`，Windows/Linux `Ctrl+B` |
-| 斜体 | macOS `Cmd+I`，Windows/Linux `Ctrl+I` |
-| 下划线 | macOS `Cmd+U`，Windows/Linux `Ctrl+U` |
-| 删除线 | macOS `Cmd+Shift+S`，Windows/Linux `Ctrl+Shift+S` |
-| 行内代码 | macOS `Cmd+E`，Windows/Linux `Ctrl+E` |
-| 围栏代码块 | macOS `Cmd+Option+C`，Windows/Linux `Ctrl+Alt+C` |
-| 换行 | `Enter` |
-| 原始换行（不续写 Markdown 容器） | `Shift+Enter` |
-| 删除 | `Backspace` / `Delete` |
-| 移动光标 | `Up` / `Down` / `Left` / `Right` / `Home` / `End`，或鼠标点击文本位置 |
+| Action | macOS | Windows / Linux |
+|---|---|---|
+| Save | `Cmd+S` | `Ctrl+S` |
+| Command palette | `Cmd+K` | `Ctrl+K` |
+| Bold / italic / underline | `Cmd+B` / `I` / `U` | `Ctrl+B` / `I` / `U` |
+| Strikethrough | `Cmd+Shift+S` | `Ctrl+Shift+S` |
+| Inline code | `Cmd+E` | `Ctrl+E` |
+| Fenced code block | `Cmd+Option+C` | `Ctrl+Alt+C` |
+| Soft line break | `Shift+Enter` | `Shift+Enter` |
 
-格式快捷键会包裹当前选区；没有选区时会插入成对标记并把光标放在中间。行首输入 `````rust``、`~~~typescript` 等围栏后按 `Enter`，会自动补齐闭合围栏并将光标放入代码区；下方已有匹配闭合围栏时不会重复插入。在代码块末尾连续按三次 `Enter` 会清理末尾空行并跳到代码块下方，也可以直接点击文档末尾代码块下方的空白区域创建普通段落。
+Format shortcuts wrap the current selection. With an empty selection they insert paired marks and leave the caret in the middle.
 
-## 验证
+## Architecture
+
+```
+synapse-core   Vault, path safety, directory snapshots, Rope documents, atomic saves
+synapse-ui     GPUI window, tabs, editor, todos, bookmarks, command palette
+```
+
+Pinned building blocks:
+
+- UI: GPUI 0.2.2 and `gpui-component` 0.5.1
+- Buffer: `ropey`
+- Markdown kernel: `writ` 0.18.1 (headless, tree-sitter Markdown)
+- Diagrams: `rusty-mermaid` (Rust SVG, no WebView)
+- Math: `RaTeX` (self-contained SVG)
+- Trash: OS recycle bin via `trash`
+- Watcher: `notify` with a 180ms trailing debounce
+
+Web UI stacks are out of scope. See [AGENT.md](AGENT.md) for the product constraints.
+
+## Current limitations
+
+- Undo / redo, word-wise movement, double-click word select, and find/replace
+- Filename and full-text search (the command palette is a launcher, not a search index)
+- Tab drag-reorder, session restore, and unsaved-close confirmation
+- Table caret visibility
+- Windows and Linux are not first-class yet
+- Release-grade startup, memory, and huge-file numbers are not certified
+
+## Verify
 
 ```bash
 cargo fmt --package synapse-core -- --check
@@ -139,4 +117,63 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-当前开发进度见 [PROGRESS.md](PROGRESS.md)，版本规划见 [docs/Task.md](docs/Task.md)。
+Do not run `cargo fmt --all`. The vendored `gpui-component` tree stays in upstream form.
+
+## License
+
+Licensed under either of
+
+- [Apache License, Version 2.0](LICENSE-APACHE)
+- [MIT license](LICENSE-MIT)
+
+at your option. Third-party notices are in [NOTICE](NOTICE) and [THIRD_PARTY.md](THIRD_PARTY.md).
+
+## Contributing
+
+Issues and pull requests are welcome. Please read [CONTRIBUTING.md](CONTRIBUTING.md) and the [Code of Conduct](CODE_OF_CONDUCT.md).
+
+---
+
+# Synapse (中文)
+
+Synapse 是一款使用 Rust 与 GPUI 构建的高性能、本地优先 Markdown 编辑器。它直接打开普通文件夹，不绑定账号、数据库或强制云服务。文件系统是笔记的真实来源。
+
+当前是公开预览（`0.1.0`）。macOS 上已经可以日常写 Markdown。撤销/重做、完整搜索，以及 Windows / Linux 仍未就绪。
+
+## 它能做什么
+
+- 递归发现 `.md` 文件和空文件夹，并在原生文件树中创建、重命名、拖拽和移到废纸篓
+- 多文档页签，独立 Rope 缓冲区，未保存内容受保护
+- 实时呈现标题、列表、任务、表格、提示块、脚注、图片、Mermaid 和数学公式
+- 默认是结构化编辑，源码模式需要显式切换
+- 中文输入法、斜杠指令、格式快捷键、剪贴板图片粘贴
+- 原生待办和书签工作区
+- 系统 / 浅色 / 深色主题，简体中文 / English 界面
+- 外部文件变化会刷新侧栏，不会覆盖未保存缓冲区
+
+## 运行
+
+```bash
+cargo run -p synapse
+cargo run -p synapse -- /path/to/markdown-folder
+```
+
+无参数启动会恢复上次的 Vault；首次启动会创建 `~/Documents/Synapse Vault`。
+
+打包 macOS 应用：
+
+```bash
+./scripts/package-macos.sh
+./scripts/package-macos.sh --install
+```
+
+## 已知限制
+
+- 撤销 / 重做、按词移动、双击选词、查找替换
+- 文件名和全文搜索（命令面板目前只是启动器）
+- 页签拖拽排序、会话恢复、未保存关闭确认
+- 表格内光标可见性
+- Windows / Linux 还不是一等公民
+- 发布级启动速度、内存和大文件指标尚未认证
+
+更细的产品说明见 [docs/Synapse产品需求文档.md](docs/Synapse产品需求文档.md)。变更记录见 [CHANGELOG.md](CHANGELOG.md)。

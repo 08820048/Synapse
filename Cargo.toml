@@ -8,6 +8,10 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 rust-version = "1.93"
+authors = ["xuyi <ilikexff@gmail.com>"]
+repository = "https://github.com/08820048/Synapse"
+homepage = "https://github.com/08820048/Synapse"
+description = "A fast, native, local-first Markdown editor built with Rust and GPUI"
 
 [workspace.dependencies]
 gpui = { version = "=0.2.2", features = ["runtime_shaders"] }
