@@ -63,6 +63,7 @@ mod inline_rename;
 mod math_renderer;
 mod slash_command;
 mod todo_workspace;
+mod updater;
 
 use bookmark_workspace::{
     BookmarkTagPicker, BookmarkWorkspace, BookmarkWorkspaceRenderState, fetch_link_metadata,
@@ -89,6 +90,10 @@ use slash_command::{SlashCommand, note_link_markdown, slash_command_edit, slash_
 use todo_workspace::{
     TodoTagPicker, TodoToggleOutcome, TodoWorkspace, TodoWorkspaceRenderState,
     render_todo_quick_picker, render_todo_workspace,
+};
+use updater::{
+    APP_VERSION, AvailableUpdate, UpdateCheckOrigin, UpdateCheckState, classify_release,
+    current_update_platform, fetch_latest_release, should_prompt_for_update,
 };
 
 const WINDOW_DEFAULT_WIDTH: f32 = 1809.0;
@@ -611,6 +616,26 @@ fn auto_clear_completed_todos_preference_path() -> Option<PathBuf> {
 
 fn vault_preference_path() -> Option<PathBuf> {
     synapse_config_directory().map(|directory| directory.join("vault"))
+}
+
+fn dismissed_update_path() -> Option<PathBuf> {
+    synapse_config_directory().map(|directory| directory.join("dismissed-update"))
+}
+
+fn load_dismissed_update_version() -> Option<String> {
+    dismissed_update_path()
+        .and_then(|path| fs::read_to_string(path).ok())
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+fn save_dismissed_update_version(version: &str) -> io::Result<()> {
+    let path = dismissed_update_path()
+        .ok_or_else(|| io::Error::other("unable to locate the user configuration directory"))?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, format!("{version}\n"))
 }
 
 fn synapse_config_directory() -> Option<PathBuf> {
@@ -1356,6 +1381,8 @@ struct SynapseApp {
     vault_persistence_error: Option<String>,
     settings_window: Option<AnyWindowHandle>,
     settings_window_opening: bool,
+    update_check: UpdateCheckState,
+    update_check_generation: u64,
     left_sidebar_open: bool,
     command_palette_open: bool,
     command_palette_closing: bool,
@@ -2698,6 +2725,158 @@ impl SynapseApp {
         self.left_sidebar_open = !self.left_sidebar_open;
         self.dismiss_context_menus(cx);
         cx.notify();
+    }
+
+    fn check_for_updates(
+        &mut self,
+        origin: UpdateCheckOrigin,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if matches!(self.update_check, UpdateCheckState::Checking) {
+            return;
+        }
+        self.update_check = UpdateCheckState::Checking;
+        self.update_check_generation = self.update_check_generation.wrapping_add(1);
+        let generation = self.update_check_generation;
+        let client = cx.http_client();
+        let platform = current_update_platform();
+        cx.notify();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = fetch_latest_release(client, platform).await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                if this.update_check_generation != generation {
+                    return;
+                }
+                this.apply_update_check_result(origin, result, window, cx);
+            });
+        })
+        .detach();
+    }
+
+    fn apply_update_check_result(
+        &mut self,
+        origin: UpdateCheckOrigin,
+        result: Result<AvailableUpdate, String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(current) = updater::AppVersion::current() else {
+            self.update_check = UpdateCheckState::Failed(
+                self.language
+                    .text("无法读取当前版本", "Unable to read the current version")
+                    .to_owned(),
+            );
+            cx.notify();
+            return;
+        };
+
+        match result {
+            Ok(latest) => match classify_release(latest, current) {
+                Ok(latest) => {
+                    self.update_check = UpdateCheckState::Available(latest.clone());
+                    let should_prompt = origin == UpdateCheckOrigin::Manual
+                        || should_prompt_for_update(
+                            &latest,
+                            load_dismissed_update_version().as_deref(),
+                        );
+                    if should_prompt {
+                        self.prompt_available_update(latest, window, cx);
+                    }
+                }
+                Err(UpdateCheckState::Current) => {
+                    self.update_check = UpdateCheckState::Current;
+                    if origin == UpdateCheckOrigin::Manual {
+                        push_alert_notification(
+                            window,
+                            cx,
+                            AppNotificationVariant::Success,
+                            self.language.text("已是最新版本", "You're up to date"),
+                            self.language.text(
+                                "当前安装的已经是最新的 Synapse。",
+                                "This installation is already the latest Synapse.",
+                            ),
+                        );
+                    }
+                }
+                Err(state) => self.update_check = state,
+            },
+            Err(error) => {
+                self.update_check = UpdateCheckState::Failed(error.clone());
+                if origin == UpdateCheckOrigin::Manual {
+                    push_alert_notification(
+                        window,
+                        cx,
+                        AppNotificationVariant::Error,
+                        self.language.text("检查更新失败", "Update check failed"),
+                        error,
+                    );
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    fn prompt_available_update(
+        &mut self,
+        update: AvailableUpdate,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let language = self.language;
+        let title = language.text("发现新版本", "Update available");
+        let message = match language {
+            AppLanguage::SimplifiedChinese => {
+                format!(
+                    "Synapse {} 已发布，当前版本是 {}。下载后安装即可完成更新。",
+                    update.version, APP_VERSION
+                )
+            }
+            AppLanguage::English => format!(
+                "Synapse {} is available. You're on {}.",
+                update.version, APP_VERSION
+            ),
+        };
+        let download_url = update.download_url.clone();
+        let dismissed_version = update.version.clone();
+        window.open_dialog(cx, move |dialog, _, cx| {
+            dialog
+                .title(title)
+                .confirm()
+                .button_props(
+                    DialogButtonProps::default()
+                        .ok_text(language.text("下载更新", "Download"))
+                        .cancel_text(language.text("稍后", "Later")),
+                )
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(message.clone()),
+                )
+                .on_ok({
+                    let download_url = download_url.clone();
+                    let dismissed_version = dismissed_version.clone();
+                    move |_, _, cx| {
+                        let _ = save_dismissed_update_version(&dismissed_version);
+                        cx.open_url(&download_url);
+                        true
+                    }
+                })
+                .on_cancel({
+                    let dismissed_version = dismissed_version.clone();
+                    move |_, _, _| {
+                        let _ = save_dismissed_update_version(&dismissed_version);
+                        true
+                    }
+                })
+        });
+    }
+
+    fn open_available_update_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let UpdateCheckState::Available(update) = self.update_check.clone() {
+            self.prompt_available_update(update, window, cx);
+        }
     }
 
     fn open_settings_window(&mut self, cx: &mut Context<Self>) {
@@ -5853,6 +6032,61 @@ fn render_settings_content(
                     }),
             )
     });
+    let version_field = SettingField::render(move |_options, _window, _cx| {
+        div()
+            .font_family(".SystemUIFontMonospaced")
+            .text_size(px(12.0))
+            .child(APP_VERSION)
+    });
+    let update_field_app = app_entity.clone();
+    let update_field = SettingField::render(move |options, _window, cx| {
+        let app_state = update_field_app.read(cx);
+        let language = app_state.language;
+        let checking = matches!(app_state.update_check, UpdateCheckState::Checking);
+        let status = match &app_state.update_check {
+            UpdateCheckState::Idle => language.text("尚未检查", "Not checked yet").to_owned(),
+            UpdateCheckState::Checking => language.text("正在检查…", "Checking…").to_owned(),
+            UpdateCheckState::Available(update) => match language {
+                AppLanguage::SimplifiedChinese => format!("发现新版本 {}", update.version),
+                AppLanguage::English => format!("Update {} is available", update.version),
+            },
+            UpdateCheckState::Current => language
+                .text("已是最新版本", "You're up to date")
+                .to_owned(),
+            UpdateCheckState::Failed(error) => match language {
+                AppLanguage::SimplifiedChinese => format!("检查失败：{error}"),
+                AppLanguage::English => format!("Check failed: {error}"),
+            },
+        };
+        let app = update_field_app.clone();
+        div()
+            .flex()
+            .items_center()
+            .justify_end()
+            .gap_3()
+            .child(
+                div()
+                    .max_w(px(280.0))
+                    .truncate()
+                    .text_size(px(11.0))
+                    .text_color(cx.theme().muted_foreground)
+                    .child(status),
+            )
+            .child(
+                Button::new("check-for-updates")
+                    .outline()
+                    .h(px(40.0))
+                    .with_size(options.size)
+                    .icon(IconName::ArrowDown)
+                    .label(language.text("检查", "Check"))
+                    .disabled(checking)
+                    .on_click(move |_, window, cx| {
+                        app.update(cx, |this, cx| {
+                            this.check_for_updates(UpdateCheckOrigin::Manual, window, cx);
+                        });
+                    }),
+            )
+    });
     let settings = Settings::new(SharedString::from(format!(
         "synapse-settings-workspace-{}",
         language.as_str()
@@ -5863,7 +6097,7 @@ fn render_settings_content(
             SettingPage::new(language.text("常规", "General"))
                 .default_open(true)
                 .resettable(false)
-                .description(language.text("外观、行为与工作区偏好", "Appearance, behavior and workspace preferences"))
+                .show_header(false)
                 .groups([
                     SettingGroup::new()
                         .title(language.text("外观", "Appearance"))
@@ -5900,6 +6134,24 @@ fn render_settings_content(
                             ),
                         )),
                 ]),
+        )
+        .page(
+            SettingPage::new(language.text("更新", "Updates"))
+                .default_open(false)
+                .resettable(false)
+                .show_header(false)
+                .groups([SettingGroup::new().items([
+                    SettingItem::new(language.text("当前版本", "Current version"), version_field)
+                        .description(language.text(
+                            "安装包来自 GitHub Releases。",
+                            "Installers are published on GitHub Releases.",
+                        )),
+                    SettingItem::new(language.text("检查更新", "Check for updates"), update_field)
+                        .description(language.text(
+                            "启动时会在后台检查一次。发现新版本后会打开对应的安装包下载。",
+                            "Synapse checks once at startup. If a newer build exists, it opens the installer download.",
+                        )),
+                ])]),
         );
 
     div()
@@ -8047,13 +8299,16 @@ impl Render for SynapseApp {
                 div()
                     .h(px(SIDEBAR_FOOTER_HEIGHT))
                     .flex_none()
+                    .flex()
+                    .items_center()
                     .border_t_1()
                     .border_color(theme.sidebar_border)
                     .child({
                         let app = app_entity.clone();
                         Button::new("settings-shortcut")
                             .ghost()
-                            .w_full()
+                            .flex_1()
+                            .min_w(px(0.0))
                             .h_full()
                             .justify_start()
                             .child(menu_item_content(
@@ -8066,7 +8321,33 @@ impl Render for SynapseApp {
                                     this.open_settings_window(cx);
                                 });
                             })
-                    }),
+                    })
+                    .when(
+                        matches!(self.update_check, UpdateCheckState::Available(_)),
+                        |footer| {
+                            let app = app_entity.clone();
+                            footer.child(
+                                div()
+                                    .id("sidebar-update-available")
+                                    .flex_none()
+                                    .h_full()
+                                    .flex()
+                                    .items_center()
+                                    .pr_3()
+                                    .cursor_pointer()
+                                    .text_size(px(12.0))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(theme.success)
+                                    .hover(|style| style.opacity(0.82))
+                                    .child(self.language.text("有更新", "Update"))
+                                    .on_click(move |_, window, cx| {
+                                        app.update(cx, |this, cx| {
+                                            this.open_available_update_panel(window, cx);
+                                        });
+                                    }),
+                            )
+                        },
+                    ),
             );
 
         let left_sidebar = div()
@@ -8512,6 +8793,7 @@ impl Render for SynapseApp {
             let todo_app = app_entity.clone();
             let bookmarks_app = app_entity.clone();
             let settings_app = app_entity.clone();
+            let update_app = app_entity.clone();
             div()
                 .id("command-palette-backdrop")
                 .absolute()
@@ -8640,6 +8922,30 @@ impl Render for SynapseApp {
                                 }),
                         )
                         .child(div().h(px(1.0)).mx_2().my_2().bg(theme.border))
+                        .child(
+                            Button::new("palette-check-updates")
+                                .ghost()
+                                .w_full()
+                                .h(px(38.0))
+                                .justify_start()
+                                .child(Icon::Download.render(17.0))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .child(self.language.text("检查更新", "Check for Updates")),
+                                )
+                                .on_click(move |_, window, cx| {
+                                    cx.stop_propagation();
+                                    update_app.update(cx, |this, cx| {
+                                        this.dismiss_command_palette(cx);
+                                        this.check_for_updates(
+                                            UpdateCheckOrigin::Manual,
+                                            window,
+                                            cx,
+                                        );
+                                    });
+                                }),
+                        )
                         .child(
                             Button::new("palette-settings")
                                 .ghost()
@@ -9527,6 +9833,8 @@ fn main() {
                             vault_persistence_error: None,
                             settings_window: None,
                             settings_window_opening: false,
+                            update_check: UpdateCheckState::Idle,
+                            update_check_generation: 0,
                             left_sidebar_open: true,
                             command_palette_open: false,
                             command_palette_closing: false,
@@ -9580,6 +9888,7 @@ fn main() {
                     app.update(cx, |app, cx| {
                         app.restart_editor_cursor_blink(cx);
                         app.restart_vault_watcher(cx);
+                        app.check_for_updates(UpdateCheckOrigin::Startup, window, cx);
                         cx.observe_window_appearance(window, |app, window, cx| {
                             if app.theme_preference == ThemePreference::System {
                                 apply_synapse_theme(ThemePreference::System, Some(window), cx);

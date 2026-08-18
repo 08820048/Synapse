@@ -61,6 +61,8 @@ git push origin v0.1.1
 
 You can also run the **Release** workflow manually from the Actions tab to produce artifacts without publishing.
 
+Installed builds check GitHub Releases once at startup. Settings → Updates and the command palette can run the same check manually. Synapse opens the matching DMG or EXE download; it does not replace the running app in place. Sparkle / WinSparkle can come later once the installers are signed.
+
 ## Run from source
 
 ```bash
@@ -189,6 +191,8 @@ Synapse 是一款使用 Rust 与 GPUI 构建的高性能、本地优先 Markdown
 - Windows：`Synapse-<version>-windows-x64.exe`，Inno Setup 安装包，默认按当前用户安装
 
 从 [Releases](https://github.com/08820048/Synapse/releases) 下载。当前包未公证/未签名，系统会弹出安全提示。
+
+已安装的版本会在启动时检查 GitHub Releases。设置 → 更新，或命令面板里的「检查更新」可以手动再查。发现新版本后会打开对应安装包下载，不会直接替换正在运行的应用。
 
 ## 从源码运行
 

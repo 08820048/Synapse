@@ -18,6 +18,7 @@ use crate::{
 #[derive(Clone)]
 pub struct SettingPage {
     resettable: bool,
+    show_header: bool,
     pub(super) default_open: bool,
     pub(super) title: SharedString,
     pub(super) description: Option<SharedString>,
@@ -28,6 +29,7 @@ impl SettingPage {
     pub fn new(title: impl Into<SharedString>) -> Self {
         Self {
             resettable: true,
+            show_header: true,
             default_open: false,
             title: title.into(),
             description: None,
@@ -44,6 +46,15 @@ impl SettingPage {
     /// Set the description of the setting page, default is None.
     pub fn description(mut self, description: impl Into<SharedString>) -> Self {
         self.description = Some(description.into());
+        self
+    }
+
+    /// Show the in-content page title and description, default is true.
+    ///
+    /// The sidebar already lists page titles; callers can hide this header
+    /// when the extra block is redundant.
+    pub fn show_header(mut self, show_header: bool) -> Self {
+        self.show_header = show_header;
         self
     }
 
@@ -125,38 +136,40 @@ impl SettingPage {
         v_flex()
             .id(ix)
             .size_full()
-            .child(
-                v_flex()
-                    .p_4()
-                    .gap_3()
-                    .border_b_1()
-                    .border_color(cx.theme().border)
-                    .child(h_flex().justify_between().child(self.title.clone()).when(
-                        self.is_resettable(cx),
-                        |this| {
+            .when(self.show_header, |this| {
+                this.child(
+                    v_flex()
+                        .p_4()
+                        .gap_3()
+                        .border_b_1()
+                        .border_color(cx.theme().border)
+                        .child(h_flex().justify_between().child(self.title.clone()).when(
+                            self.is_resettable(cx),
+                            |this| {
+                                this.child(
+                                    Button::new("reset")
+                                        .icon(IconName::Undo2)
+                                        .ghost()
+                                        .small()
+                                        .tooltip(t!("Settings.Reset All"))
+                                        .on_click({
+                                            let page = self.clone();
+                                            move |_, window, cx| {
+                                                page.reset_all(window, cx);
+                                            }
+                                        }),
+                                )
+                            },
+                        ))
+                        .when_some(self.description.clone(), |this, description| {
                             this.child(
-                                Button::new("reset")
-                                    .icon(IconName::Undo2)
-                                    .ghost()
-                                    .small()
-                                    .tooltip(t!("Settings.Reset All"))
-                                    .on_click({
-                                        let page = self.clone();
-                                        move |_, window, cx| {
-                                            page.reset_all(window, cx);
-                                        }
-                                    }),
+                                Label::new(description)
+                                    .text_sm()
+                                    .text_color(cx.theme().muted_foreground),
                             )
-                        },
-                    ))
-                    .when_some(self.description.clone(), |this, description| {
-                        this.child(
-                            Label::new(description)
-                                .text_sm()
-                                .text_color(cx.theme().muted_foreground),
-                        )
-                    }),
-            )
+                        }),
+                )
+            })
             .child(
                 div()
                     .px_4()
