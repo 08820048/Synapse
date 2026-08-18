@@ -35,6 +35,8 @@ cargo test --workspace
 
 Do **not** run `cargo fmt --all`. `vendor/gpui-component` must stay in upstream form.
 
+CI runs `fmt` on Ubuntu and `clippy` / tests on macOS and Windows. Installers are not built on every pull request. Push a `v*` tag (or run the **Release** workflow) to produce the macOS DMG and Windows setup EXE.
+
 ## Architecture
 
 | Crate | Responsibility |

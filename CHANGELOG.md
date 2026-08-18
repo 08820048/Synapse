@@ -2,6 +2,16 @@
 
 All notable changes to Synapse are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses a `0.y.z` preview version until the first stable editor release.
 
+## [Unreleased]
+
+### Added
+
+- Tag-triggered GitHub Release workflow that publishes a universal macOS DMG and a Windows x64 setup EXE
+- `scripts/package-macos.sh --dmg --universal` for a drag-to-Applications disk image
+- `scripts/package-windows.ps1` and an Inno Setup script for `Synapse-<version>-windows-x64.exe`
+- Windows application icon (`assets/branding/synapse-app-icon.ico`)
+- Windows job in CI (`clippy` + tests)
+
 ## [0.1.0] - 2026-08-18
 
 First public source release. This is an early macOS preview, not a finished editor.

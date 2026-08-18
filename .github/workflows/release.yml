@@ -1,0 +1,81 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  macos:
+    name: macOS DMG
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.93"
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - name: Package universal DMG
+        run: ./scripts/package-macos.sh --dmg --universal
+      - name: Upload DMG
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-dmg
+          path: target/release/bundle/osx/Synapse-*-macos-*.dmg
+          if-no-files-found: error
+
+  windows:
+    name: Windows installer
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.93"
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Inno Setup and rcedit
+        run: choco install innosetup rcedit --yes --no-progress
+      - name: Package installer
+        shell: pwsh
+        run: ./scripts/package-windows.ps1
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-installer
+          path: target/release/bundle/windows/Synapse-*-windows-x64.exe
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    needs: [macos, windows]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - name: Collect release files
+        run: |
+          mkdir -p release-files
+          find dist -type f \( -name 'Synapse-*.dmg' -o -name 'Synapse-*-windows-x64.exe' \) -exec cp {} release-files/ \;
+          ls -la release-files
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: release-files/*
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+          body: |
+            Preview installers.
+
+            - **macOS:** Universal DMG. The app is ad-hoc signed, so Gatekeeper will warn until it is notarized.
+            - **Windows:** 64-bit setup EXE. The installer is unsigned, so SmartScreen may warn.
+
+            See `CHANGELOG.md` for current product status.

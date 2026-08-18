@@ -28,8 +28,12 @@ jobs:
           cargo fmt --package synapse -- --check
 
   test:
-    name: clippy and test
-    runs-on: macos-latest
+    name: clippy and test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master

@@ -22,7 +22,7 @@
 
 Synapse opens an ordinary folder of Markdown files. There is no account, no required cloud, and no database. The filesystem is the source of truth.
 
-This is an early public preview (`0.1.0`). Daily Markdown editing works on macOS. Undo, full search, and Windows/Linux builds are not ready yet.
+This is an early public preview (`0.1.0`). Daily Markdown editing works on macOS. Windows installers are built in CI but the Windows app is not first-class yet. Undo and full search are still missing.
 
 ## Features
 
@@ -39,10 +39,29 @@ This is an early public preview (`0.1.0`). Daily Markdown editing works on macOS
 ## Requirements
 
 - Rust 1.93 or later
-- macOS is the supported development platform today
-- Xcode command-line tools (for a local `cargo run` on macOS)
+- macOS is the primary development platform
+- Xcode command-line tools for a local macOS build
+- Windows 10+ for the setup EXE; Inno Setup 6 is only needed to package locally
 
-## Run
+## Install
+
+GitHub Actions builds preview installers on each `v*` tag:
+
+- macOS: `Synapse-<version>-macos-universal.dmg` — open the disk image and drag Synapse into Applications
+- Windows: `Synapse-<version>-windows-x64.exe` — Inno Setup installer, per-user by default
+
+Download them from [Releases](https://github.com/08820048/Synapse/releases). The current packages are unsigned, so macOS Gatekeeper and Windows SmartScreen will warn.
+
+To cut a release after pushing `main`:
+
+```bash
+git tag v0.1.1
+git push origin v0.1.1
+```
+
+You can also run the **Release** workflow manually from the Actions tab to produce artifacts without publishing.
+
+## Run from source
 
 ```bash
 cargo run -p synapse
@@ -56,15 +75,25 @@ cargo run -p synapse -- /path/to/markdown-folder
 
 With no argument, Synapse restores the last vault. On first launch it creates `~/Documents/Synapse Vault`.
 
-### macOS app bundle
+### Local packages
 
 ```bash
-./scripts/package-macos.sh
-# or install into /Applications
+# Universal macOS .app + DMG (ad-hoc signed)
+./scripts/package-macos.sh --dmg --universal
+
+# Current-architecture .app, then install into /Applications
 ./scripts/package-macos.sh --install
 ```
 
-The bundle is written to `target/release/bundle/osx/Synapse.app`. The script applies an ad-hoc signature; distribution still needs Developer ID signing and notarization.
+The `.app` is written to `target/release/bundle/osx/Synapse.app`. The DMG is `Synapse-<version>-macos-universal.dmg` in the same folder. Distribution-quality macOS builds still need Developer ID signing and notarization.
+
+On Windows (PowerShell), after installing [Inno Setup 6](https://jrsoftware.org/isinfo.php) and optionally `rcedit`:
+
+```powershell
+./scripts/package-windows.ps1
+```
+
+The installer is written to `target/release/bundle/windows/Synapse-<version>-windows-x64.exe`.
 
 ## Editor shortcuts
 
@@ -105,7 +134,8 @@ Web UI stacks are out of scope. See [AGENT.md](AGENT.md) for the product constra
 - Filename and full-text search (the command palette is a launcher, not a search index)
 - Tab drag-reorder, session restore, and unsaved-close confirmation
 - Table caret visibility
-- Windows and Linux are not first-class yet
+- Windows is packaged, but the editor experience is still macOS-first
+- Linux packages are not built yet
 - Release-grade startup, memory, and huge-file numbers are not certified
 
 ## Verify
@@ -138,7 +168,7 @@ Issues and pull requests are welcome. Please read [CONTRIBUTING.md](CONTRIBUTING
 
 Synapse 是一款使用 Rust 与 GPUI 构建的高性能、本地优先 Markdown 编辑器。它直接打开普通文件夹，不绑定账号、数据库或强制云服务。文件系统是笔记的真实来源。
 
-当前是公开预览（`0.1.0`）。macOS 上已经可以日常写 Markdown。撤销/重做、完整搜索，以及 Windows / Linux 仍未就绪。
+当前是公开预览（`0.1.0`）。macOS 上已经可以日常写 Markdown。Windows 安装包会随版本标签构建，但 Windows 体验还不是一等公民。撤销/重做和完整搜索仍未就绪。
 
 ## 它能做什么
 
@@ -151,7 +181,16 @@ Synapse 是一款使用 Rust 与 GPUI 构建的高性能、本地优先 Markdown
 - 系统 / 浅色 / 深色主题，简体中文 / English 界面
 - 外部文件变化会刷新侧栏，不会覆盖未保存缓冲区
 
-## 运行
+## 安装
+
+打 `v*` 标签后，GitHub Actions 会构建预览安装包：
+
+- macOS：`Synapse-<version>-macos-universal.dmg`，打开后把 Synapse 拖进「应用程序」
+- Windows：`Synapse-<version>-windows-x64.exe`，Inno Setup 安装包，默认按当前用户安装
+
+从 [Releases](https://github.com/08820048/Synapse/releases) 下载。当前包未公证/未签名，系统会弹出安全提示。
+
+## 从源码运行
 
 ```bash
 cargo run -p synapse
@@ -160,11 +199,17 @@ cargo run -p synapse -- /path/to/markdown-folder
 
 无参数启动会恢复上次的 Vault；首次启动会创建 `~/Documents/Synapse Vault`。
 
-打包 macOS 应用：
+本地打包：
 
 ```bash
-./scripts/package-macos.sh
+./scripts/package-macos.sh --dmg --universal
 ./scripts/package-macos.sh --install
+```
+
+Windows（需安装 Inno Setup 6）：
+
+```powershell
+./scripts/package-windows.ps1
 ```
 
 ## 已知限制
@@ -173,7 +218,8 @@ cargo run -p synapse -- /path/to/markdown-folder
 - 文件名和全文搜索（命令面板目前只是启动器）
 - 页签拖拽排序、会话恢复、未保存关闭确认
 - 表格内光标可见性
-- Windows / Linux 还不是一等公民
+- Windows 已有安装包，但编辑体验仍以 macOS 为准
+- 尚未构建 Linux 安装包
 - 发布级启动速度、内存和大文件指标尚未认证
 
 更细的产品说明见 [docs/Synapse产品需求文档.md](docs/Synapse产品需求文档.md)。变更记录见 [CHANGELOG.md](CHANGELOG.md)。
