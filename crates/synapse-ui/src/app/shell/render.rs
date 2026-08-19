@@ -104,7 +104,7 @@ impl Render for SynapseApp {
                     source_mode,
                 )
             });
-            let (lines, outline, mermaid_previews, math_previews, image_previews) = if cache_hit {
+            let (lines, outline, mut mermaid_previews, mut math_previews, mut image_previews) = if cache_hit {
                 let cache = self
                     .editor_render_cache
                     .as_ref()
@@ -236,25 +236,40 @@ impl Render for SynapseApp {
                 let mermaid_previews = if source_mode {
                     Rc::new(BTreeMap::new())
                 } else {
-                    previous_mermaid_previews
-                        .unwrap_or_else(|| build_mermaid_previews(&parsed, dark_mode))
+                    previous_mermaid_previews.unwrap_or_else(|| {
+                        build_mermaid_previews(
+                            &parsed,
+                            dark_mode,
+                            initial_editor_preview_range(parsed.len()),
+                        )
+                    })
                 };
                 let math_previews = if source_mode {
                     Rc::new(BTreeMap::new())
                 } else {
-                    previous_math_previews
-                        .unwrap_or_else(|| build_math_previews(&parsed, dark_mode))
+                    previous_math_previews.unwrap_or_else(|| {
+                        build_math_previews(
+                            &parsed,
+                            dark_mode,
+                            initial_editor_preview_range(parsed.len()),
+                        )
+                    })
                 };
                 let image_previews = if source_mode {
                     Rc::new(BTreeMap::new())
                 } else {
                     previous_image_previews.unwrap_or_else(|| {
-                        build_image_previews(&parsed, &vault_root, &relative_path)
+                        build_image_previews(
+                            &parsed,
+                            &vault_root,
+                            &relative_path,
+                            initial_editor_preview_range(parsed.len()),
+                        )
                     })
                 };
                 self.editor_render_cache = Some(EditorRenderCache {
-                    vault_root,
-                    relative_path,
+                    vault_root: vault_root.clone(),
+                    relative_path: relative_path.clone(),
                     revision,
                     dark_mode,
                     source_mode,
@@ -276,6 +291,41 @@ impl Render for SynapseApp {
                     image_previews,
                 )
             };
+            if !source_mode {
+                let preview_range =
+                    editor_preview_range(self.editor_visible_range.clone(), lines.len());
+                if let Some(expanded_previews) = extend_mermaid_previews(
+                    &mermaid_previews,
+                    &lines,
+                    dark_mode,
+                    preview_range.clone(),
+                ) {
+                    mermaid_previews = expanded_previews;
+                    if let Some(cache) = self.editor_render_cache.as_mut() {
+                        cache.mermaid_previews = mermaid_previews.clone();
+                    }
+                }
+                if let Some(expanded_previews) =
+                    extend_math_previews(&math_previews, &lines, dark_mode, preview_range.clone())
+                {
+                    math_previews = expanded_previews;
+                    if let Some(cache) = self.editor_render_cache.as_mut() {
+                        cache.math_previews = math_previews.clone();
+                    }
+                }
+                if let Some(expanded_previews) = extend_image_previews(
+                    &image_previews,
+                    &lines,
+                    &vault_root,
+                    &relative_path,
+                    preview_range,
+                ) {
+                    image_previews = expanded_previews;
+                    if let Some(cache) = self.editor_render_cache.as_mut() {
+                        cache.image_previews = image_previews.clone();
+                    }
+                }
+            }
             self.editor_selection.clamp(document_len);
             let selection = self.editor_selection.range();
             if self.editor_line_layouts.borrow().len() != lines.len() {

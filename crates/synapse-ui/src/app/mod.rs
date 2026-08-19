@@ -162,6 +162,11 @@ const EDITOR_WIDE_GUTTER: f32 = 32.0;
 const EDITOR_TOP_PADDING: f32 = 24.0;
 const EDITOR_BODY_FONT_SIZE: f32 = 16.0;
 const EDITOR_BODY_LINE_HEIGHT: f32 = 26.4;
+// Render diagrams and formulas only for the viewport and its immediate surroundings. Their SVG
+// generation is substantially more expensive than ordinary Markdown layout, so doing it for an
+// entire note before its first frame makes opening long notes needlessly slow.
+const EDITOR_PREVIEW_CACHE_BEHIND_LINES: usize = 32;
+const EDITOR_PREVIEW_CACHE_AHEAD_LINES: usize = 96;
 const TASK_CHECKBOX_SIZE: f32 = 16.0;
 const TASK_CHECKBOX_GAP: f32 = 8.0;
 const FOOTNOTE_LABEL_WIDTH: f32 = 34.0;
@@ -1608,13 +1613,75 @@ fn synapse_mermaid_theme(dark: bool) -> rusty_mermaid::Theme {
     theme
 }
 
+fn initial_editor_preview_range(line_count: usize) -> Range<usize> {
+    0..line_count.min(EDITOR_PREVIEW_CACHE_AHEAD_LINES)
+}
+
+fn editor_preview_range(visible_range: Range<usize>, line_count: usize) -> Range<usize> {
+    if visible_range.is_empty() {
+        return initial_editor_preview_range(line_count);
+    }
+
+    let start = visible_range
+        .start
+        .saturating_sub(EDITOR_PREVIEW_CACHE_BEHIND_LINES)
+        .min(line_count);
+    let end = visible_range
+        .end
+        .saturating_add(EDITOR_PREVIEW_CACHE_AHEAD_LINES)
+        .min(line_count);
+    start.min(end)..end
+}
+
 fn build_mermaid_previews(
     lines: &[Rc<SourceLine>],
     dark_mode: bool,
+    line_range: Range<usize>,
 ) -> Rc<BTreeMap<usize, MermaidPreview>> {
-    let theme = synapse_mermaid_theme(dark_mode);
     let mut previews = BTreeMap::new();
-    for (index, line) in lines.iter().enumerate() {
+    populate_mermaid_previews(&mut previews, lines, dark_mode, line_range);
+    Rc::new(previews)
+}
+
+fn extend_mermaid_previews(
+    previews: &Rc<BTreeMap<usize, MermaidPreview>>,
+    lines: &[Rc<SourceLine>],
+    dark_mode: bool,
+    line_range: Range<usize>,
+) -> Option<Rc<BTreeMap<usize, MermaidPreview>>> {
+    let start = line_range.start.min(lines.len());
+    let end = line_range.end.min(lines.len()).max(start);
+    let has_missing_preview = lines[start..end].iter().enumerate().any(|(offset, line)| {
+        let index = start + offset;
+        line.presentation
+            .mermaid_block
+            .as_ref()
+            .is_some_and(|block| block.is_anchor && block.diagram_source.is_some())
+            && !previews.contains_key(&index)
+    });
+    if !has_missing_preview {
+        return None;
+    }
+
+    let mut expanded = previews.as_ref().clone();
+    populate_mermaid_previews(&mut expanded, lines, dark_mode, line_range);
+    Some(Rc::new(expanded))
+}
+
+fn populate_mermaid_previews(
+    previews: &mut BTreeMap<usize, MermaidPreview>,
+    lines: &[Rc<SourceLine>],
+    dark_mode: bool,
+    line_range: Range<usize>,
+) {
+    let theme = synapse_mermaid_theme(dark_mode);
+    let start = line_range.start.min(lines.len());
+    let end = line_range.end.min(lines.len()).max(start);
+    for (offset, line) in lines[start..end].iter().enumerate() {
+        let index = start + offset;
+        if previews.contains_key(&index) {
+            continue;
+        }
         let Some(source) = line
             .presentation
             .mermaid_block
@@ -1640,15 +1707,57 @@ fn build_mermaid_previews(
         };
         previews.insert(index, preview);
     }
-    Rc::new(previews)
 }
 
 fn build_math_previews(
     lines: &[Rc<SourceLine>],
     dark_mode: bool,
+    line_range: Range<usize>,
 ) -> Rc<BTreeMap<usize, MathPreview>> {
     let mut previews = BTreeMap::new();
-    for line in lines {
+    populate_math_previews(&mut previews, lines, dark_mode, line_range);
+    Rc::new(previews)
+}
+
+fn extend_math_previews(
+    previews: &Rc<BTreeMap<usize, MathPreview>>,
+    lines: &[Rc<SourceLine>],
+    dark_mode: bool,
+    line_range: Range<usize>,
+) -> Option<Rc<BTreeMap<usize, MathPreview>>> {
+    let start = line_range.start.min(lines.len());
+    let end = line_range.end.min(lines.len()).max(start);
+    let has_missing_preview = lines[start..end].iter().any(|line| {
+        let missing_block = line.presentation.math_block.as_ref().is_some_and(|block| {
+            block.is_anchor
+                && block.formula_source.is_some()
+                && !previews.contains_key(&block.source_start_char)
+        });
+        missing_block
+            || line
+                .presentation
+                .inline_math
+                .iter()
+                .any(|inline| !previews.contains_key(&inline.source_start_char))
+    });
+    if !has_missing_preview {
+        return None;
+    }
+
+    let mut expanded = previews.as_ref().clone();
+    populate_math_previews(&mut expanded, lines, dark_mode, line_range);
+    Some(Rc::new(expanded))
+}
+
+fn populate_math_previews(
+    previews: &mut BTreeMap<usize, MathPreview>,
+    lines: &[Rc<SourceLine>],
+    dark_mode: bool,
+    line_range: Range<usize>,
+) {
+    let start = line_range.start.min(lines.len());
+    let end = line_range.end.min(lines.len()).max(start);
+    for line in &lines[start..end] {
         if let Some(block) = line
             .presentation
             .math_block
@@ -1656,42 +1765,91 @@ fn build_math_previews(
             .filter(|block| block.is_anchor)
             && let Some(source) = block.formula_source.as_deref()
         {
-            previews.insert(
-                block.source_start_char,
-                render_math_preview(source, true, dark_mode),
-            );
+            previews
+                .entry(block.source_start_char)
+                .or_insert_with(|| render_math_preview(source, true, dark_mode));
         }
         for inline in &line.presentation.inline_math {
-            previews.insert(
-                inline.source_start_char,
-                render_math_preview(&inline.formula_source, false, dark_mode),
-            );
+            previews
+                .entry(inline.source_start_char)
+                .or_insert_with(|| render_math_preview(&inline.formula_source, false, dark_mode));
         }
     }
-    Rc::new(previews)
 }
 
 fn build_image_previews(
     lines: &[Rc<SourceLine>],
     vault_root: &Path,
     note_relative_path: &Path,
+    line_range: Range<usize>,
 ) -> Rc<BTreeMap<usize, MarkdownImagePreview>> {
     let mut previews = BTreeMap::new();
-    for line in lines {
+    populate_image_previews(
+        &mut previews,
+        lines,
+        vault_root,
+        note_relative_path,
+        line_range,
+    );
+    Rc::new(previews)
+}
+
+fn extend_image_previews(
+    previews: &Rc<BTreeMap<usize, MarkdownImagePreview>>,
+    lines: &[Rc<SourceLine>],
+    vault_root: &Path,
+    note_relative_path: &Path,
+    line_range: Range<usize>,
+) -> Option<Rc<BTreeMap<usize, MarkdownImagePreview>>> {
+    let start = line_range.start.min(lines.len());
+    let end = line_range.end.min(lines.len()).max(start);
+    let has_missing_preview = lines[start..end].iter().any(|line| {
+        line.presentation
+            .image_block
+            .as_ref()
+            .is_some_and(|image| !previews.contains_key(&image.source_start_char))
+            || line
+                .presentation
+                .inline_images
+                .iter()
+                .any(|image| !previews.contains_key(&image.source_start_char))
+    });
+    if !has_missing_preview {
+        return None;
+    }
+
+    let mut expanded = previews.as_ref().clone();
+    populate_image_previews(
+        &mut expanded,
+        lines,
+        vault_root,
+        note_relative_path,
+        line_range,
+    );
+    Some(Rc::new(expanded))
+}
+
+fn populate_image_previews(
+    previews: &mut BTreeMap<usize, MarkdownImagePreview>,
+    lines: &[Rc<SourceLine>],
+    vault_root: &Path,
+    note_relative_path: &Path,
+    line_range: Range<usize>,
+) {
+    let start = line_range.start.min(lines.len());
+    let end = line_range.end.min(lines.len()).max(start);
+    for line in &lines[start..end] {
         if let Some(image) = line.presentation.image_block.as_ref() {
-            previews.insert(
-                image.source_start_char,
-                resolve_markdown_image(vault_root, note_relative_path, &image.url),
-            );
+            previews.entry(image.source_start_char).or_insert_with(|| {
+                resolve_markdown_image(vault_root, note_relative_path, &image.url)
+            });
         }
         for image in &line.presentation.inline_images {
-            previews.insert(
-                image.source_start_char,
-                resolve_markdown_image(vault_root, note_relative_path, &image.url),
-            );
+            previews.entry(image.source_start_char).or_insert_with(|| {
+                resolve_markdown_image(vault_root, note_relative_path, &image.url)
+            });
         }
     }
-    Rc::new(previews)
 }
 
 fn resolve_markdown_image(
@@ -3253,17 +3411,18 @@ mod tests {
         changed_line_span, clipboard_image_extension, code_block_edges,
         command_palette_key_bindings, default_window_size, document_outline_horizontal_layout,
         document_outline_is_visible, document_outline_layout, editor_backtick_key_bindings,
-        editor_horizontal_gutter, editor_page_content_width, embedded_app_icon_png_metadata,
-        fenced_code_block_edit, file_manager_reveal_command, filtered_slash_commands,
-        inline_format_edit, inline_format_is_active, is_tab_context_trigger, linked_vault_note,
-        markd_panel_spring_progress, markdown_link_context, markdown_list_items_in_selection,
-        normalize_clipboard_text, normalize_markdown_link_destination, note_breadcrumb_parts,
-        note_link_candidates, parse_boolean_preference, path_is_inside_macos_app_bundle,
-        persist_clipboard_image, prune_collapsed_directories, resolve_markdown_image,
-        select_startup_vault_path, settings_language_indicator_left, settings_spring_progress,
-        settings_theme_indicator_left, settings_titlebar_options, settings_window_options,
-        source_lines_from_buffer, synapse_mermaid_theme, synapse_theme_palette,
-        synapse_titlebar_options, titlebar_left_inset,
+        editor_horizontal_gutter, editor_page_content_width, editor_preview_range,
+        embedded_app_icon_png_metadata, fenced_code_block_edit, file_manager_reveal_command,
+        filtered_slash_commands, inline_format_edit, inline_format_is_active,
+        is_tab_context_trigger, linked_vault_note, markd_panel_spring_progress,
+        markdown_link_context, markdown_list_items_in_selection, normalize_clipboard_text,
+        normalize_markdown_link_destination, note_breadcrumb_parts, note_link_candidates,
+        parse_boolean_preference, path_is_inside_macos_app_bundle, persist_clipboard_image,
+        prune_collapsed_directories, resolve_markdown_image, select_startup_vault_path,
+        settings_language_indicator_left, settings_spring_progress, settings_theme_indicator_left,
+        settings_titlebar_options, settings_window_options, source_lines_from_buffer,
+        synapse_mermaid_theme, synapse_theme_palette, synapse_titlebar_options,
+        titlebar_left_inset,
     };
     fn sfnt_table<'a>(font: &'a [u8], tag: &[u8; 4]) -> Option<&'a [u8]> {
         let table_count = usize::from(u16::from_be_bytes(font.get(4..6)?.try_into().ok()?));
@@ -3892,7 +4051,7 @@ mod tests {
         .into_iter()
         .map(Rc::new)
         .collect::<Vec<_>>();
-        let previews = build_mermaid_previews(&lines, true);
+        let previews = build_mermaid_previews(&lines, true, 0..lines.len());
         let preview = previews.get(&1).expect("mermaid preview cache entry");
 
         match preview {
@@ -3914,13 +4073,21 @@ mod tests {
     }
 
     #[test]
+    fn editor_preview_range_limits_work_to_the_viewport_neighborhood() {
+        assert_eq!(editor_preview_range(0..0, 1_000), 0..96);
+        assert_eq!(editor_preview_range(400..420, 1_000), 368..516);
+        assert_eq!(editor_preview_range(980..1_020, 1_000), 948..1_000);
+        assert_eq!(editor_preview_range(4..8, 0), 0..0);
+    }
+
+    #[test]
     fn p5_math_previews_cache_inline_and_block_svg() {
         let source = "Inline $E = mc^2$.\n$$\n\\frac{1}{2}\n$$";
         let lines = source_lines(source, source.chars().count(), false)
             .into_iter()
             .map(Rc::new)
             .collect::<Vec<_>>();
-        let previews = build_math_previews(&lines, false);
+        let previews = build_math_previews(&lines, false, 0..lines.len());
 
         assert_eq!(previews.len(), 2);
         assert!(
@@ -3995,7 +4162,8 @@ mod tests {
             .as_ref()
             .expect("image metadata")
             .source_start_char;
-        let previews = build_image_previews(&lines, vault.path(), Path::new("note.md"));
+        let previews =
+            build_image_previews(&lines, vault.path(), Path::new("note.md"), 0..lines.len());
 
         assert!(matches!(
             previews.get(&image_start),

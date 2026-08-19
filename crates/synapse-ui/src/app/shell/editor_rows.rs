@@ -144,7 +144,7 @@ fn render_table_row(
     let cursor_color = style.cursor;
     let selection_color = style.selection;
     let cells = table.cells.clone();
-    let cell_ranges = table.cell_ranges.clone();
+    let cell_presentations = table.cell_presentations.clone();
     let column_count = table.column_count;
     let is_header = table.is_header;
     let table_cell_layouts = Rc::new(RefCell::new(Vec::with_capacity(column_count)));
@@ -177,16 +177,12 @@ fn render_table_row(
                         .text_size(px(TABLE_FONT_SIZE))
                         .line_height(px(24.0))
                         .text_color(foreground)
-                        .children(cells.into_iter().enumerate().map(|(cell_index, cell)| {
-                            let source_range = cell_ranges
+                        .children(cells.into_iter().enumerate().map(|(cell_index, _)| {
+                            let cell_presentation = cell_presentations
                                 .get(cell_index)
-                                .cloned()
-                                .unwrap_or(line.source_len_chars..line.source_len_chars);
-                            let source_line = editor_surface::table_cell_editor_line(
-                                &line,
-                                source_range.clone(),
-                                cell,
-                            );
+                                .expect("every rendered table column has a cached presentation");
+                            let source_line =
+                                editor_surface::table_cell_editor_line(&line, cell_presentation);
                             let cell_start = source_line.start_char;
                             let cell_end = cell_start + source_line.source_len_chars;
                             let cell_active =

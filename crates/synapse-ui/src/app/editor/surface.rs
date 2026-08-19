@@ -312,11 +312,20 @@ pub struct MarkdownImage {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MarkdownTableCell {
+    /// Character range of the cell's visible source relative to the row.
+    pub source_range: Range<usize>,
+    /// Precomputed inline Markdown rendering and source/display mapping.
+    pub presentation: MarkdownLinePresentation,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MarkdownTableRow {
     pub cells: Vec<String>,
-    /// Character ranges of visible cell content relative to the source row.
-    /// They let the rich table surface place native editing affordances inside
-    /// the actual cell rather than on the invisible Markdown source line.
+    /// Rich cell presentations are prepared while the document is parsed,
+    /// never while a virtual-list row is painted or scrolled.
+    pub cell_presentations: Vec<MarkdownTableCell>,
+    /// Kept with the row metadata for table editing and direct source lookup.
     pub cell_ranges: Vec<Range<usize>>,
     pub column_count: usize,
     pub is_header: bool,
@@ -415,7 +424,7 @@ pub fn source_lines_from_buffer_with_syntax_cache(
         })
         .collect();
 
-    let mut lines: Vec<_> = raw_line_storage
+    let (mut lines, table_cell_presentations): (Vec<_>, Vec<_>) = raw_line_storage
         .iter()
         .enumerate()
         .map(|(line_index, source)| {
@@ -460,6 +469,13 @@ pub fn source_lines_from_buffer_with_syntax_cache(
                 list_marker: list_marker_range.as_ref(),
                 hidden_bullet_marker,
             };
+            let table_cell_presentations = matches!(kind, MarkdownBlockKind::Table)
+                .then(|| {
+                    table_cell_presentations_from_line_render(
+                        &snapshot, line_index, source, &render, dark_mode,
+                    )
+                })
+                .unwrap_or_default();
             let presentation = presentation_from_writ(
                 source,
                 byte_range.start,
@@ -474,9 +490,9 @@ pub fn source_lines_from_buffer_with_syntax_cache(
                 presentation,
             };
             start_char += source_len_chars + 1;
-            line
+            (line, table_cell_presentations)
         })
-        .collect();
+        .unzip();
 
     let raw_lines: Vec<_> = raw_line_storage.iter().map(String::as_str).collect();
     for index in 1..lines.len().min(raw_lines.len()) {
@@ -490,7 +506,7 @@ pub fn source_lines_from_buffer_with_syntax_cache(
         lines[index].presentation = hidden_source_presentation(raw_lines[index]);
     }
     annotate_inline_underlines(&mut lines, &raw_lines, dark_mode);
-    annotate_table_rows(&mut lines, &raw_lines);
+    annotate_table_rows(&mut lines, &raw_lines, &table_cell_presentations);
     annotate_quote_lines(&mut lines);
     annotate_callout_lines(&mut lines, snapshot.callouts());
     annotate_code_lines(
@@ -2165,7 +2181,11 @@ fn table_row_preview(source: &str) -> String {
     }
 }
 
-fn annotate_table_rows(lines: &mut [SourceLine], raw_lines: &[&str]) {
+fn annotate_table_rows(
+    lines: &mut [SourceLine],
+    raw_lines: &[&str],
+    table_cell_presentations: &[Vec<MarkdownTableCell>],
+) {
     let limit = lines.len().min(raw_lines.len());
     let mut start = 0;
     while start < limit {
@@ -2197,11 +2217,40 @@ fn annotate_table_rows(lines: &mut [SourceLine], raw_lines: &[&str]) {
             .rposition(|cells| !is_table_delimiter(cells))
             .unwrap_or(rows.len().saturating_sub(1));
 
-        for (offset, cells) in rows.iter_mut().enumerate() {
+        for (offset, fallback_cells) in rows.iter_mut().enumerate() {
+            fallback_cells.resize(column_count, String::new());
+            let source = raw_lines[start + offset];
+            let mut cell_presentations = table_cell_presentations
+                .get(start + offset)
+                .cloned()
+                .unwrap_or_default();
+            let has_cached_presentations = !cell_presentations.is_empty();
+            let cell_ranges = if cell_presentations.is_empty() {
+                table_cell_ranges(source, column_count)
+            } else {
+                cell_presentations
+                    .iter()
+                    .map(|cell| cell.source_range.clone())
+                    .collect()
+            };
+            let empty_range = source.chars().count()..source.chars().count();
+            cell_presentations.resize_with(column_count, || MarkdownTableCell {
+                source_range: empty_range.clone(),
+                presentation: raw_source_presentation(""),
+            });
+            let mut cells = if !has_cached_presentations {
+                fallback_cells.clone()
+            } else {
+                cell_presentations
+                    .iter()
+                    .map(|cell| cell.presentation.display.clone())
+                    .collect()
+            };
             cells.resize(column_count, String::new());
             lines[start + offset].presentation.table_row = Some(MarkdownTableRow {
-                cells: cells.clone(),
-                cell_ranges: table_cell_ranges(raw_lines[start + offset], column_count),
+                cells,
+                cell_presentations,
+                cell_ranges,
                 column_count,
                 is_header: delimiter.is_some_and(|index| offset + 1 == index),
                 is_delimiter: delimiter == Some(offset),
@@ -2211,6 +2260,140 @@ fn annotate_table_rows(lines: &mut [SourceLine], raw_lines: &[&str]) {
         }
         start = end;
     }
+}
+
+fn table_cell_presentations_from_line_render(
+    snapshot: &writ::buffer::RenderSnapshot,
+    line_index: usize,
+    source: &str,
+    render: &writ::render::LineRender,
+    dark_mode: bool,
+) -> Vec<MarkdownTableCell> {
+    let Some((table, kind)) = snapshot.table_row_at_line(line_index) else {
+        return Vec::new();
+    };
+    let cells = match kind {
+        writ::table::RowKind::Header => &table.header.cells,
+        writ::table::RowKind::Delimiter => return Vec::new(),
+        writ::table::RowKind::Body(index) => table
+            .body
+            .get(index)
+            .map_or_else(|| &[][..], |row| row.cells.as_slice()),
+    };
+    let line_start_byte = snapshot.line_byte_range(line_index).start;
+    let source_char_bytes = char_byte_boundaries(source);
+    cells
+        .iter()
+        .filter_map(|cell| {
+            let start_byte = cell.content.start.checked_sub(line_start_byte)?;
+            let end_byte = cell.content.end.checked_sub(line_start_byte)?;
+            let cell_source = source.get(start_byte..end_byte)?;
+            let source_range = char_index_for_byte(&source_char_bytes, start_byte)
+                ..char_index_for_byte(&source_char_bytes, end_byte);
+            let presentation = if cell_source.contains('\\') {
+                table_cell_presentation_from_source(cell_source, dark_mode)
+            } else {
+                table_cell_presentation_from_line_render(
+                    source,
+                    line_start_byte,
+                    cell.content.clone(),
+                    render,
+                )
+            };
+            Some(MarkdownTableCell {
+                source_range,
+                presentation,
+            })
+        })
+        .collect()
+}
+
+fn table_cell_presentation_from_line_render(
+    source: &str,
+    line_start_byte: usize,
+    cell_range: Range<usize>,
+    render: &writ::render::LineRender,
+) -> MarkdownLinePresentation {
+    let source_start = cell_range.start.saturating_sub(line_start_byte);
+    let source_end = cell_range.end.saturating_sub(line_start_byte);
+    let cell_source = source
+        .get(source_start..source_end)
+        .expect("table cell range is contained in its source line");
+    let display_range = render.map.buffer_range_to_display(cell_range.clone());
+    let display = render
+        .text
+        .get(display_range.clone())
+        .expect("table cell display range is valid")
+        .to_owned();
+    let source_char_bytes = char_byte_boundaries(cell_source);
+    let display_char_bytes = char_byte_boundaries(&display);
+    let source_to_display = source_char_bytes
+        .iter()
+        .map(|source_byte| {
+            char_index_for_byte(
+                &display_char_bytes,
+                render
+                    .map
+                    .buffer_to_display(cell_range.start + source_byte)
+                    .saturating_sub(display_range.start)
+                    .min(display.len()),
+            )
+        })
+        .collect();
+    let display_to_source = display_char_bytes
+        .iter()
+        .map(|display_byte| {
+            let source_byte = render
+                .map
+                .display_to_buffer(display_range.start + display_byte)
+                .saturating_sub(cell_range.start)
+                .min(cell_source.len());
+            char_index_for_byte(&source_char_bytes, source_byte)
+        })
+        .collect();
+    MarkdownLinePresentation {
+        display: display.clone(),
+        kind: MarkdownBlockKind::Paragraph,
+        runs: flatten_writ_runs(
+            display.len(),
+            &table_cell_style_runs(&render.runs, &display_range),
+            MarkdownRunRanges {
+                muted: &[],
+                list_marker: None,
+                hidden_bullet_marker: None,
+            },
+            MarkdownBlockKind::Paragraph,
+        ),
+        table_row: None,
+        quote_line: None,
+        code_line: None,
+        mermaid_block: None,
+        math_block: None,
+        inline_math: Vec::new(),
+        task_item: None,
+        callout_line: None,
+        footnote_definition: None,
+        inline_footnotes: Vec::new(),
+        image_block: None,
+        inline_images: Vec::new(),
+        source_to_display,
+        display_to_source,
+    }
+}
+
+fn table_cell_style_runs(
+    runs: &[writ::text_engine::StyleRun],
+    display_range: &Range<usize>,
+) -> Vec<writ::text_engine::StyleRun> {
+    runs.iter()
+        .filter(|run| run.range.start < display_range.end && run.range.end > display_range.start)
+        .cloned()
+        .map(|mut run| {
+            run.range = run.range.start.max(display_range.start) - display_range.start
+                ..run.range.end.min(display_range.end) - display_range.start;
+            run
+        })
+        .collect()
 }
 
 fn table_cell_ranges(source: &str, column_count: usize) -> Vec<Range<usize>> {
@@ -2260,45 +2443,88 @@ fn trim_table_cell_range(characters: &[char], mut range: Range<usize>) -> Range<
     range
 }
 
-/// Builds a small source line for a rendered table cell. It shares the regular
-/// editor element's caret and selection drawing while preserving the table's
-/// visual cell layout.
+/// Builds a source line from a table cell presentation prepared during document
+/// parsing. Rendering a virtual table row only clones this small result; it never
+/// reparses Markdown while the user scrolls.
 pub(in crate::app) fn table_cell_editor_line(
     row: &SourceLine,
-    source_range: Range<usize>,
-    display: String,
+    cell: &MarkdownTableCell,
 ) -> Rc<SourceLine> {
-    let source_len_chars = source_range.len();
-    let display_len_chars = display.chars().count();
-    let display_len_bytes = display.len();
-    let presentation = MarkdownLinePresentation {
-        display,
-        kind: MarkdownBlockKind::Paragraph,
-        runs: vec![plain_style_run(display_len_bytes)],
-        table_row: None,
-        quote_line: None,
-        code_line: None,
-        mermaid_block: None,
-        math_block: None,
-        inline_math: Vec::new(),
-        task_item: None,
-        callout_line: None,
-        footnote_definition: None,
-        inline_footnotes: Vec::new(),
-        image_block: None,
-        inline_images: Vec::new(),
-        source_to_display: (0..=source_len_chars)
-            .map(|index| index.min(display_len_chars))
-            .collect(),
-        display_to_source: (0..=display_len_chars)
-            .map(|index| index.min(source_len_chars))
-            .collect(),
-    };
     Rc::new(SourceLine {
-        start_char: row.start_char + source_range.start,
-        source_len_chars,
-        presentation,
+        start_char: row.start_char + cell.source_range.start,
+        source_len_chars: cell.source_range.len(),
+        presentation: cell.presentation.clone(),
     })
+}
+
+fn table_cell_presentation_from_source(source: &str, dark_mode: bool) -> MarkdownLinePresentation {
+    let (render_source, source_to_render, render_to_source) = unescape_table_cell_source(source);
+    let mut presentation = source_lines(&render_source, 0, dark_mode)
+        .into_iter()
+        .next()
+        .map(|line| line.presentation)
+        .unwrap_or_else(|| raw_source_presentation(&render_source));
+    // Cells accept inline Markdown, not block-level structures. Keep their
+    // inline runs and cursor maps, but render them as ordinary table content.
+    presentation.kind = MarkdownBlockKind::Paragraph;
+    presentation.table_row = None;
+    presentation.quote_line = None;
+    presentation.code_line = None;
+    presentation.mermaid_block = None;
+    presentation.math_block = None;
+    presentation.task_item = None;
+    presentation.callout_line = None;
+    presentation.footnote_definition = None;
+    presentation.image_block = None;
+    presentation.source_to_display = source_to_render
+        .iter()
+        .map(|source| presentation.display_char_for_source(*source))
+        .collect();
+    presentation.display_to_source = presentation
+        .display_to_source
+        .iter()
+        .map(|source| render_to_source[*source.min(&(render_to_source.len() - 1))])
+        .collect();
+    presentation
+}
+
+/// Table parsing reserves an escaped pipe for literal cell content and strips
+/// the escape character from the displayed cell. Mirror that normalization
+/// while retaining cursor boundaries in the original table source.
+fn unescape_table_cell_source(source: &str) -> (String, Vec<usize>, Vec<usize>) {
+    let mut display = String::with_capacity(source.len());
+    let mut source_to_display = Vec::with_capacity(source.chars().count() + 1);
+    let mut display_to_source = Vec::with_capacity(source.chars().count() + 1);
+    source_to_display.push(0);
+    display_to_source.push(0);
+
+    let mut escaped = false;
+    let mut display_chars = 0;
+    for (source_char, character) in source.chars().enumerate() {
+        if escaped {
+            display.push(character);
+            display_chars += 1;
+            display_to_source.push(source_char + 1);
+            escaped = false;
+        } else if character == '\\' {
+            escaped = true;
+        } else {
+            display.push(character);
+            display_chars += 1;
+            display_to_source.push(source_char + 1);
+        }
+        source_to_display.push(display_chars);
+    }
+    if escaped {
+        display.push('\\');
+        display_chars += 1;
+        display_to_source.push(source.chars().count());
+        *source_to_display
+            .last_mut()
+            .expect("source mapping includes its final boundary") = display_chars;
+    }
+
+    (display, source_to_display, display_to_source)
 }
 
 fn is_table_delimiter(cells: &[String]) -> bool {
@@ -3583,6 +3809,14 @@ mod tests {
             .as_ref()
             .expect("table body metadata");
         assert_eq!(header.cells, ["A", "B"]);
+        assert_eq!(
+            header
+                .cell_presentations
+                .iter()
+                .map(|cell| cell.presentation.display.as_str())
+                .collect::<Vec<_>>(),
+            ["A", "B"]
+        );
         assert_eq!(header.cell_ranges, [2..3, 6..7]);
         assert_eq!(header.column_count, 2);
         assert!(header.is_header && header.is_first);
@@ -4083,11 +4317,34 @@ mod tests {
             .expect("escaped table row metadata");
         assert_eq!(row.cells, ["a | b", "ok"]);
         assert_eq!(row.cell_ranges, [2..8, 11..13]);
-        let cell =
-            table_cell_editor_line(&lines[4], row.cell_ranges[0].clone(), row.cells[0].clone());
+        let cell = table_cell_editor_line(&lines[4], &row.cell_presentations[0]);
         assert_eq!(cell.start_char, lines[4].start_char + 2);
         assert_eq!(cell.presentation.display, "a | b");
-        assert_eq!(cell.presentation.display_char_for_source(3), 3);
+        assert_eq!(cell.presentation.display_char_for_source(3), 2);
+    }
+
+    #[test]
+    fn table_cells_reuse_the_inline_markdown_presentation() {
+        let lines = source_lines(
+            "| **粗体** *斜体* `code` | other |\n| --- | --- |\n| body | value |",
+            0,
+            true,
+        );
+        let row = lines[0]
+            .presentation
+            .table_row
+            .as_ref()
+            .expect("table row metadata");
+        let cell = table_cell_editor_line(&lines[0], &row.cell_presentations[0]);
+
+        assert_eq!(cell.presentation.display, "粗体 斜体 code");
+        assert!(cell.presentation.runs.iter().any(|run| run.bold));
+        assert!(cell.presentation.runs.iter().any(|run| run.italic));
+        assert!(cell.presentation.runs.iter().any(|run| run.mono));
+        assert_eq!(
+            inline_code_byte_ranges(&cell.presentation.runs, cell.presentation.kind),
+            vec!["粗体 斜体 ".len().."粗体 斜体 code".len()]
+        );
     }
 
     #[test]
