@@ -3108,7 +3108,7 @@ mod tests {
     use std::{hint::black_box, time::Instant};
 
     use super::{
-        CodeSyntaxCache, CodeSyntaxEdit, EditorSelection, INLINE_STRONG_WEIGHT,
+        Buffer, CodeSyntaxCache, CodeSyntaxEdit, EditorSelection, INLINE_STRONG_WEIGHT,
         LIST_BULLET_DIAMETER, MarkdownBlockKind, char_byte_boundaries, char_to_byte,
         code_block_language, footnote_preview_line, hidden_bullet_marker_range,
         inline_code_byte_ranges, source_lines, source_lines_from_buffer_with_syntax_cache,
@@ -3562,6 +3562,29 @@ mod tests {
                 .is_some_and(|line| line.is_closing_fence)
         );
         assert_eq!(complete[0].presentation.kind, MarkdownBlockKind::Code);
+    }
+
+    #[test]
+    fn incremental_buffer_recognizes_a_completed_fence_on_its_first_enter() {
+        let mut buffer: Buffer = "```java".parse().expect("Writ buffer");
+        buffer.replace(7..7, "\n\n```", 7);
+        let mut cache = CodeSyntaxCache::default();
+        let lines = source_lines_from_buffer_with_syntax_cache(
+            &mut buffer,
+            8,
+            false,
+            &mut cache,
+            Some(&CodeSyntaxEdit::new(7..7, "\n\n```")),
+        );
+
+        assert!(
+            lines[0]
+                .presentation
+                .code_line
+                .as_ref()
+                .is_some_and(|line| line.is_opening_fence)
+        );
+        assert_eq!(lines[0].presentation.kind, MarkdownBlockKind::Code);
     }
 
     #[test]

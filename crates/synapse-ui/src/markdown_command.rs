@@ -148,8 +148,10 @@ fn matching_opening_fence_before(
             continue;
         }
         let info = rest.chars().skip(length).collect::<String>();
-        if (closing.marker != '`' || !info.contains('`')) && !info.chars().any(char::is_whitespace)
-        {
+        // An opening fence may carry a full info string: language attributes
+        // and trailing whitespace are both valid Markdown. Backticks remain
+        // forbidden in backtick-fence info strings.
+        if closing.marker != '`' || !info.contains('`') {
             matching_content_start = Some(start_char + segment.chars().count());
         }
         start_char += segment.chars().count();
@@ -194,11 +196,7 @@ fn fenced_code_block_enter_edit(source: &str, cursor_char: usize) -> Option<Mark
         return None;
     }
     let info = rest.chars().skip(marker_len).collect::<String>();
-    if (marker == '`' && info.contains('`')) || info.contains('\t') || info.contains('\n') {
-        return None;
-    }
-    let info = info.trim();
-    if info.chars().any(char::is_whitespace) {
+    if marker == '`' && info.contains('`') {
         return None;
     }
 
@@ -313,6 +311,10 @@ mod tests {
         assert_eq!(
             apply("  ~~~typescript", 15),
             ("  ~~~typescript\n  \n  ~~~".to_owned(), 18)
+        );
+        assert_eq!(
+            apply("```java  title=example", 22),
+            ("```java  title=example\n\n```".to_owned(), 23)
         );
     }
 

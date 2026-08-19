@@ -115,6 +115,7 @@ struct OpenFence {
     fence: Fence,
     language: CodeLanguage,
     content_start: usize,
+    opening_line_terminated: bool,
 }
 
 /// Finds the code block containing `range`. A caret immediately before the
@@ -145,6 +146,7 @@ pub(super) fn fenced_code_block_at(source: &str, range: &Range<usize>) -> Option
                 fence,
                 language,
                 content_start: next_line_start,
+                opening_line_terminated: segment.ends_with('\n'),
             });
         }
 
@@ -152,6 +154,12 @@ pub(super) fn fenced_code_block_at(source: &str, range: &Range<usize>) -> Option
     }
 
     open.and_then(|candidate| {
+        // A fence on the current line has no content area yet. Treating its
+        // end position as code made the first Enter insert only `\n`, which
+        // prevented Markdown's normal `\n\n``` ` completion from running.
+        if candidate.content_start == source_len && !candidate.opening_line_terminated {
+            return None;
+        }
         let block = FencedCodeBlock {
             language: candidate.language,
             content: candidate.content_start..source_len,
@@ -739,6 +747,14 @@ mod tests {
         assert_eq!(block.content, 21..39);
         assert_eq!(block.language.indent_unit(), "  ");
         assert!(fenced_code_block_at(source, &(1..1)).is_none());
+    }
+
+    #[test]
+    fn opening_fence_line_end_is_not_code_until_it_has_a_content_line() {
+        assert!(fenced_code_block_at("```java", &(7..7)).is_none());
+        assert!(code_newline_edit("```java", 7, &[]).is_none());
+
+        assert!(fenced_code_block_at("```java\n", &(8..8)).is_some());
     }
 
     #[test]
