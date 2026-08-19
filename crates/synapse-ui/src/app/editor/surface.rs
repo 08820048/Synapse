@@ -314,6 +314,10 @@ pub struct MarkdownImage {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MarkdownTableRow {
     pub cells: Vec<String>,
+    /// Character ranges of visible cell content relative to the source row.
+    /// They let the rich table surface place native editing affordances inside
+    /// the actual cell rather than on the invisible Markdown source line.
+    pub cell_ranges: Vec<Range<usize>>,
     pub column_count: usize,
     pub is_header: bool,
     pub is_delimiter: bool,
@@ -2197,6 +2201,7 @@ fn annotate_table_rows(lines: &mut [SourceLine], raw_lines: &[&str]) {
             cells.resize(column_count, String::new());
             lines[start + offset].presentation.table_row = Some(MarkdownTableRow {
                 cells: cells.clone(),
+                cell_ranges: table_cell_ranges(raw_lines[start + offset], column_count),
                 column_count,
                 is_header: delimiter.is_some_and(|index| offset + 1 == index),
                 is_delimiter: delimiter == Some(offset),
@@ -2206,6 +2211,94 @@ fn annotate_table_rows(lines: &mut [SourceLine], raw_lines: &[&str]) {
         }
         start = end;
     }
+}
+
+fn table_cell_ranges(source: &str, column_count: usize) -> Vec<Range<usize>> {
+    let characters = source.chars().collect::<Vec<_>>();
+    let mut start = 0;
+    let mut end = characters.len();
+    while start < end && characters[start].is_whitespace() {
+        start += 1;
+    }
+    while end > start && characters[end - 1].is_whitespace() {
+        end -= 1;
+    }
+    if characters.get(start) == Some(&'|') {
+        start += 1;
+    }
+    if end > start && characters[end - 1] == '|' {
+        end -= 1;
+    }
+
+    let mut ranges = Vec::with_capacity(column_count);
+    let mut cell_start = start;
+    let mut escaped = false;
+    for index in start..end {
+        let character = characters[index];
+        if escaped {
+            escaped = false;
+        } else if character == '\\' {
+            escaped = true;
+        } else if character == '|' {
+            ranges.push(trim_table_cell_range(&characters, cell_start..index));
+            cell_start = index + 1;
+        }
+    }
+    ranges.push(trim_table_cell_range(&characters, cell_start..end));
+    ranges.resize(column_count, end..end);
+    ranges.truncate(column_count);
+    ranges
+}
+
+fn trim_table_cell_range(characters: &[char], mut range: Range<usize>) -> Range<usize> {
+    while range.start < range.end && characters[range.start].is_whitespace() {
+        range.start += 1;
+    }
+    while range.end > range.start && characters[range.end - 1].is_whitespace() {
+        range.end -= 1;
+    }
+    range
+}
+
+/// Builds a small source line for a rendered table cell. It shares the regular
+/// editor element's caret and selection drawing while preserving the table's
+/// visual cell layout.
+pub(in crate::app) fn table_cell_editor_line(
+    row: &SourceLine,
+    source_range: Range<usize>,
+    display: String,
+) -> Rc<SourceLine> {
+    let source_len_chars = source_range.len();
+    let display_len_chars = display.chars().count();
+    let display_len_bytes = display.len();
+    let presentation = MarkdownLinePresentation {
+        display,
+        kind: MarkdownBlockKind::Paragraph,
+        runs: vec![plain_style_run(display_len_bytes)],
+        table_row: None,
+        quote_line: None,
+        code_line: None,
+        mermaid_block: None,
+        math_block: None,
+        inline_math: Vec::new(),
+        task_item: None,
+        callout_line: None,
+        footnote_definition: None,
+        inline_footnotes: Vec::new(),
+        image_block: None,
+        inline_images: Vec::new(),
+        source_to_display: (0..=source_len_chars)
+            .map(|index| index.min(display_len_chars))
+            .collect(),
+        display_to_source: (0..=display_len_chars)
+            .map(|index| index.min(source_len_chars))
+            .collect(),
+    };
+    Rc::new(SourceLine {
+        start_char: row.start_char + source_range.start,
+        source_len_chars,
+        presentation,
+    })
 }
 
 fn is_table_delimiter(cells: &[String]) -> bool {
@@ -2381,27 +2474,51 @@ pub struct EditorLineLayout {
     pub wrapped_line: Option<WrappedLine>,
     pub line_height: Pixels,
     pub source_line: Rc<SourceLine>,
+    /// Table rows contain several independently shaped text elements. The row
+    /// keeps their layouts so pointer hit-testing uses the glyph geometry of
+    /// the clicked cell instead of distributing the source row proportionally
+    /// across the whole table width.
+    pub table_cells: Option<Rc<RefCell<Vec<EditorTableCellLayout>>>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct EditorTableCellLayout {
+    pub bounds: Bounds<Pixels>,
+    pub wrapped_line: WrappedLine,
+    pub line_height: Pixels,
+    pub source_line: Rc<SourceLine>,
 }
 
 impl EditorLineLayout {
     pub fn source_char_for_position(&self, position: gpui::Point<Pixels>) -> usize {
+        if let Some(table_cells) = &self.table_cells {
+            let table_cells = table_cells.borrow();
+            if let Some(cell) = table_cells
+                .iter()
+                .find(|cell| point_is_inside_bounds(position, cell.bounds))
+            {
+                return cell.source_char_for_position(position);
+            }
+            if let Some(cell) = table_cells.iter().min_by(|left, right| {
+                distance_to_bounds(position, left.bounds)
+                    .total_cmp(&distance_to_bounds(position, right.bounds))
+            }) {
+                return cell.source_char_for_position(clamp_point_to_bounds(position, cell.bounds));
+            }
+        }
         let Some(wrapped_line) = self.wrapped_line.as_ref() else {
             let width = f32::from(self.bounds.size.width).max(1.0);
             let x = f32::from(position.x - self.bounds.origin.x).clamp(0.0, width);
             let local = ((x / width) * self.source_line.source_len_chars as f32).round() as usize;
             return self.source_line.start_char + local.min(self.source_line.source_len_chars);
         };
-        let local_position = position - self.bounds.origin;
-        let byte = wrapped_line
-            .closest_index_for_position(local_position, self.line_height)
-            .unwrap_or_else(|index| index)
-            .min(wrapped_line.text.len());
-        let display_char = wrapped_line.text[..byte].chars().count();
-        self.source_line.start_char
-            + self
-                .source_line
-                .presentation
-                .source_char_for_display(display_char)
+        source_char_for_shaped_line(
+            &self.source_line,
+            wrapped_line,
+            self.line_height,
+            self.bounds,
+            position,
+        )
     }
 
     pub fn contains_source_char(&self, char_index: usize) -> bool {
@@ -2411,6 +2528,15 @@ impl EditorLineLayout {
     }
 
     pub fn point_for_source_char(&self, char_index: usize) -> gpui::Point<Pixels> {
+        if let Some(table_cells) = &self.table_cells {
+            let table_cells = table_cells.borrow();
+            if let Some(cell) = table_cells
+                .iter()
+                .find(|cell| cell.contains_source_char(char_index))
+            {
+                return cell.point_for_source_char(char_index);
+            }
+        }
         let local_source = char_index.saturating_sub(self.source_line.start_char);
         let Some(wrapped_line) = self.wrapped_line.as_ref() else {
             let fraction = local_source.min(self.source_line.source_len_chars) as f32
@@ -2420,21 +2546,122 @@ impl EditorLineLayout {
                 self.bounds.origin.y,
             );
         };
-        let display_char = self
-            .source_line
-            .presentation
-            .display_char_for_source(local_source.min(self.source_line.source_len_chars));
-        let byte = char_to_byte(&wrapped_line.text, display_char);
-        wrapped_line
-            .position_for_index(byte, self.line_height)
-            .map_or(self.bounds.origin, |position| self.bounds.origin + position)
+        point_for_shaped_line(
+            &self.source_line,
+            wrapped_line,
+            self.line_height,
+            self.bounds,
+            char_index,
+        )
     }
+}
+
+impl EditorTableCellLayout {
+    fn source_char_for_position(&self, position: gpui::Point<Pixels>) -> usize {
+        source_char_for_shaped_line(
+            &self.source_line,
+            &self.wrapped_line,
+            self.line_height,
+            self.bounds,
+            position,
+        )
+    }
+
+    fn contains_source_char(&self, char_index: usize) -> bool {
+        (self.source_line.start_char
+            ..=self.source_line.start_char + self.source_line.source_len_chars)
+            .contains(&char_index)
+    }
+
+    fn point_for_source_char(&self, char_index: usize) -> gpui::Point<Pixels> {
+        point_for_shaped_line(
+            &self.source_line,
+            &self.wrapped_line,
+            self.line_height,
+            self.bounds,
+            char_index,
+        )
+    }
+}
+
+fn source_char_for_shaped_line(
+    source_line: &SourceLine,
+    wrapped_line: &WrappedLine,
+    line_height: Pixels,
+    bounds: Bounds<Pixels>,
+    position: gpui::Point<Pixels>,
+) -> usize {
+    let local_position = position - bounds.origin;
+    let byte = wrapped_line
+        .closest_index_for_position(local_position, line_height)
+        .unwrap_or_else(|index| index)
+        .min(wrapped_line.text.len());
+    let display_char = wrapped_line.text[..byte].chars().count();
+    source_line.start_char
+        + source_line
+            .presentation
+            .source_char_for_display(display_char)
+}
+
+fn point_for_shaped_line(
+    source_line: &SourceLine,
+    wrapped_line: &WrappedLine,
+    line_height: Pixels,
+    bounds: Bounds<Pixels>,
+    char_index: usize,
+) -> gpui::Point<Pixels> {
+    let local_source = char_index.saturating_sub(source_line.start_char);
+    let display_char = source_line
+        .presentation
+        .display_char_for_source(local_source.min(source_line.source_len_chars));
+    let byte = char_to_byte(&wrapped_line.text, display_char);
+    wrapped_line
+        .position_for_index(byte, line_height)
+        .map_or(bounds.origin, |position| bounds.origin + position)
+}
+
+fn point_is_inside_bounds(position: gpui::Point<Pixels>, bounds: Bounds<Pixels>) -> bool {
+    position.x >= bounds.left()
+        && position.x <= bounds.right()
+        && position.y >= bounds.top()
+        && position.y <= bounds.bottom()
+}
+
+fn clamp_point_to_bounds(
+    position: gpui::Point<Pixels>,
+    bounds: Bounds<Pixels>,
+) -> gpui::Point<Pixels> {
+    point(
+        position.x.max(bounds.left()).min(bounds.right()),
+        position.y.max(bounds.top()).min(bounds.bottom()),
+    )
+}
+
+fn distance_to_bounds(position: gpui::Point<Pixels>, bounds: Bounds<Pixels>) -> f32 {
+    let x_distance = if position.x < bounds.left() {
+        f32::from(bounds.left() - position.x)
+    } else if position.x > bounds.right() {
+        f32::from(position.x - bounds.right())
+    } else {
+        0.0
+    };
+    let y_distance = if position.y < bounds.top() {
+        f32::from(bounds.top() - position.y)
+    } else if position.y > bounds.bottom() {
+        f32::from(position.y - bounds.bottom())
+    } else {
+        0.0
+    };
+    x_distance.hypot(y_distance)
 }
 
 pub struct MarkdownLineElement {
     pub app: Entity<SynapseApp>,
     pub line_layouts: Rc<RefCell<Vec<Option<EditorLineLayout>>>>,
     pub line_index: usize,
+    /// When this element renders a table cell, report its shaped layout to
+    /// the containing row instead of replacing that row's line layout.
+    pub table_cell_layouts: Option<Rc<RefCell<Vec<EditorTableCellLayout>>>>,
     pub source_line: Rc<SourceLine>,
     pub active: bool,
     pub cursor: usize,
@@ -2701,11 +2928,19 @@ impl Element for MarkdownLineElement {
         }
         let layout = EditorLineLayout {
             bounds,
-            wrapped_line: Some(line),
+            wrapped_line: Some(line.clone()),
             line_height: prepaint.line_height,
             source_line: self.source_line.clone(),
+            table_cells: None,
         };
-        if let Some(slot) = self.line_layouts.borrow_mut().get_mut(self.line_index) {
+        if let Some(table_cell_layouts) = &self.table_cell_layouts {
+            table_cell_layouts.borrow_mut().push(EditorTableCellLayout {
+                bounds,
+                wrapped_line: line,
+                line_height: prepaint.line_height,
+                source_line: self.source_line.clone(),
+            });
+        } else if let Some(slot) = self.line_layouts.borrow_mut().get_mut(self.line_index) {
             *slot = Some(layout);
         }
     }
@@ -3112,7 +3347,8 @@ mod tests {
         LIST_BULLET_DIAMETER, MarkdownBlockKind, char_byte_boundaries, char_to_byte,
         code_block_language, footnote_preview_line, hidden_bullet_marker_range,
         inline_code_byte_ranges, source_lines, source_lines_from_buffer_with_syntax_cache,
-        source_lines_with_mode, task_preview_line, text_run_from_markdown, visual_row_byte_ranges,
+        source_lines_with_mode, table_cell_editor_line, task_preview_line, text_run_from_markdown,
+        visual_row_byte_ranges,
     };
 
     fn present_markdown_line(source: &str) -> super::MarkdownLinePresentation {
@@ -3347,6 +3583,7 @@ mod tests {
             .as_ref()
             .expect("table body metadata");
         assert_eq!(header.cells, ["A", "B"]);
+        assert_eq!(header.cell_ranges, [2..3, 6..7]);
         assert_eq!(header.column_count, 2);
         assert!(header.is_header && header.is_first);
         assert!(delimiter.is_delimiter);
@@ -3845,6 +4082,12 @@ mod tests {
             .as_ref()
             .expect("escaped table row metadata");
         assert_eq!(row.cells, ["a | b", "ok"]);
+        assert_eq!(row.cell_ranges, [2..8, 11..13]);
+        let cell =
+            table_cell_editor_line(&lines[4], row.cell_ranges[0].clone(), row.cells[0].clone());
+        assert_eq!(cell.start_char, lines[4].start_char + 2);
+        assert_eq!(cell.presentation.display, "a | b");
+        assert_eq!(cell.presentation.display_char_for_source(3), 3);
     }
 
     #[test]

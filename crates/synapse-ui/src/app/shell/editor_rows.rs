@@ -49,6 +49,15 @@ struct FootnotePreviewStyle {
     dark_mode: bool,
 }
 
+#[derive(Clone, Copy)]
+struct TablePreviewStyle {
+    border: Hsla,
+    header_background: Hsla,
+    foreground: Hsla,
+    cursor: Hsla,
+    selection: Hsla,
+}
+
 fn editor_block_layout_canvas(
     index: usize,
     line: Rc<SourceLine>,
@@ -70,6 +79,7 @@ fn editor_block_layout_canvas(
                     wrapped_line: None,
                     line_height: bounds.size.height,
                     source_line: line,
+                    table_cells: None,
                 });
             }
         },
@@ -120,9 +130,7 @@ fn render_table_row(
     line: Rc<SourceLine>,
     row_context: &EditorRowContext,
     table: &MarkdownTableRow,
-    border_color: Hsla,
-    header_background: Hsla,
-    foreground: Hsla,
+    style: TablePreviewStyle,
 ) -> AnyElement {
     let active =
         (line.start_char..=line.start_char + line.source_len_chars).contains(&row_context.cursor);
@@ -130,9 +138,16 @@ fn render_table_row(
         return div().h(px(0.0)).overflow_hidden().into_any_element();
     }
 
+    let border_color = style.border;
+    let header_background = style.header_background;
+    let foreground = style.foreground;
+    let cursor_color = style.cursor;
+    let selection_color = style.selection;
     let cells = table.cells.clone();
+    let cell_ranges = table.cell_ranges.clone();
     let column_count = table.column_count;
     let is_header = table.is_header;
+    let table_cell_layouts = Rc::new(RefCell::new(Vec::with_capacity(column_count)));
     div()
         .w_full()
         .min_w(px(0.0))
@@ -152,16 +167,30 @@ fn render_table_row(
                         .min_w(px(0.0))
                         .min_h(px(TABLE_ROW_MIN_HEIGHT))
                         .flex()
+                        .cursor(CursorStyle::IBeam)
                         .border_l_1()
                         .border_r_1()
                         .border_b_1()
                         .when(table.is_first, |style| style.border_t_1())
                         .border_color(border_color)
-                        .when(is_header, |style| style.bg(header_background))
+                        .when(is_header, |row| row.bg(header_background))
                         .text_size(px(TABLE_FONT_SIZE))
                         .line_height(px(24.0))
                         .text_color(foreground)
                         .children(cells.into_iter().enumerate().map(|(cell_index, cell)| {
+                            let source_range = cell_ranges
+                                .get(cell_index)
+                                .cloned()
+                                .unwrap_or(line.source_len_chars..line.source_len_chars);
+                            let source_line = editor_surface::table_cell_editor_line(
+                                &line,
+                                source_range.clone(),
+                                cell,
+                            );
+                            let cell_start = source_line.start_char;
+                            let cell_end = cell_start + source_line.source_len_chars;
+                            let cell_active =
+                                active && (cell_start..=cell_end).contains(&row_context.cursor);
                             div()
                                 .flex_1()
                                 .min_w(px(0.0))
@@ -171,12 +200,69 @@ fn render_table_row(
                                     style.border_r_1().border_color(border_color)
                                 })
                                 .when(is_header, |style| style.font_weight(FontWeight::SEMIBOLD))
-                                .child(cell)
+                                .child(MarkdownLineElement {
+                                    app: row_context.app.clone(),
+                                    // The full-row canvas remains responsible for hit-testing.
+                                    // Do not let each cell overwrite its table-row layout.
+                                    line_layouts: row_context.line_layouts.clone(),
+                                    line_index: usize::MAX,
+                                    table_cell_layouts: Some(table_cell_layouts.clone()),
+                                    source_line,
+                                    active: cell_active,
+                                    cursor: row_context.cursor,
+                                    selection: row_context.selection.clone(),
+                                    cursor_visible: row_context.cursor_visible,
+                                    marker_color: style.foreground,
+                                    list_marker_color: style.foreground,
+                                    mono_font_family: "Inter".into(),
+                                    inline_code_background_color: foreground.alpha(0.0),
+                                    cursor_color,
+                                    cursor_width: px(EDITOR_CURSOR_WIDTH),
+                                    selection_color,
+                                })
                         }))
-                        .child(editor_block_layout_canvas(index, line, row_context, active)),
+                        .child(editor_table_layout_canvas(
+                            index,
+                            line,
+                            row_context,
+                            active,
+                            table_cell_layouts,
+                        )),
                 ),
         )
         .into_any_element()
+}
+
+fn editor_table_layout_canvas(
+    index: usize,
+    line: Rc<SourceLine>,
+    row_context: &EditorRowContext,
+    active: bool,
+    table_cells: Rc<RefCell<Vec<editor_surface::EditorTableCellLayout>>>,
+) -> AnyElement {
+    let app = row_context.app.clone();
+    let line_layouts = row_context.line_layouts.clone();
+    canvas(
+        |_, _, _| (),
+        move |bounds, _, window, cx| {
+            if active {
+                let focus = app.read(cx).editor_focus.clone();
+                window.handle_input(&focus, ElementInputHandler::new(bounds, app.clone()), cx);
+            }
+            if let Some(slot) = line_layouts.borrow_mut().get_mut(index) {
+                *slot = Some(EditorLineLayout {
+                    bounds,
+                    wrapped_line: None,
+                    line_height: bounds.size.height,
+                    source_line: line,
+                    table_cells: Some(table_cells),
+                });
+            }
+        },
+    )
+    .absolute()
+    .size_full()
+    .into_any_element()
 }
 
 fn render_mermaid_preview_row(
@@ -611,6 +697,7 @@ fn render_task_row(
                             app: row_context.app.clone(),
                             line_layouts: row_context.line_layouts.clone(),
                             line_index: index,
+                            table_cell_layouts: None,
                             source_line: preview,
                             active,
                             cursor: row_context.cursor,
@@ -692,6 +779,7 @@ fn render_footnote_definition_row(
                                 app: row_context.app.clone(),
                                 line_layouts: row_context.line_layouts.clone(),
                                 line_index: index,
+                                table_cell_layouts: None,
                                 source_line: preview,
                                 active,
                                 cursor: row_context.cursor,
@@ -1045,9 +1133,13 @@ pub(super) fn render_editor_row(
             line.clone(),
             row_context,
             table,
-            theme.border,
-            theme.sidebar,
-            theme.foreground,
+            TablePreviewStyle {
+                border: theme.border,
+                header_background: theme.sidebar,
+                foreground: theme.foreground,
+                cursor: theme.caret,
+                selection: theme.selection,
+            },
         );
     }
     if !line.presentation.inline_math.is_empty()
@@ -1289,6 +1381,7 @@ pub(super) fn render_editor_row(
                             app: row_context.app.clone(),
                             line_layouts: row_context.line_layouts.clone(),
                             line_index: index,
+                            table_cell_layouts: None,
                             source_line: line,
                             active,
                             cursor: row_context.cursor,
