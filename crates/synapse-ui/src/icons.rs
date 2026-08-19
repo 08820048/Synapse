@@ -46,10 +46,12 @@ pub enum Icon {
     ListOrdered,
     TextQuote,
     Table,
+    Pin,
+    PinOff,
 }
 
 impl Icon {
-    const ALL: [Self; 41] = [
+    const ALL: [Self; 43] = [
         Self::Search,
         Self::Todo,
         Self::Bookmark,
@@ -91,6 +93,8 @@ impl Icon {
         Self::ListOrdered,
         Self::TextQuote,
         Self::Table,
+        Self::Pin,
+        Self::PinOff,
     ];
 
     pub fn path(self) -> &'static str {
@@ -136,6 +140,8 @@ impl Icon {
             Self::ListOrdered => "lucide/list-ordered.svg",
             Self::TextQuote => "lucide/text-quote.svg",
             Self::Table => "lucide/table.svg",
+            Self::Pin => "lucide/pin.svg",
+            Self::PinOff => "lucide/pin-off.svg",
         }
     }
 
@@ -240,6 +246,10 @@ impl AssetSource for SynapseAssets {
                 "../../../assets/icons/lucide/text-quote.svg"
             )),
             "lucide/table.svg" => Some(include_bytes!("../../../assets/icons/lucide/table.svg")),
+            "lucide/pin.svg" => Some(include_bytes!("../../../assets/icons/lucide/pin.svg")),
+            "lucide/pin-off.svg" => {
+                Some(include_bytes!("../../../assets/icons/lucide/pin-off.svg"))
+            }
             _ => None,
         };
 

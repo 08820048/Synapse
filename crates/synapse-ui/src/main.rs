@@ -3158,6 +3158,11 @@ impl SynapseApp {
         cx.notify();
     }
 
+    fn toggle_tab_pin(&mut self, index: usize, cx: &mut Context<Self>) {
+        let _ = self.state.toggle_tab_pin(index);
+        self.dismiss_context_menus(cx);
+    }
+
     fn close_tab(&mut self, index: usize, cx: &mut Context<Self>) {
         let _ = self.state.close_tab(index);
         self.editor_selection.collapse(self.state.cursor());
@@ -7325,6 +7330,7 @@ impl Render for SynapseApp {
                 let close_id = SharedString::from(format!("close-tab-{index}"));
                 let is_active = note_workspace_active && active_tab == Some(index);
                 let close_app = tab_app.clone();
+                let pinned = tab.is_pinned;
                 div()
                     .id(tab_id)
                     .h_full()
@@ -7361,7 +7367,16 @@ impl Render for SynapseApp {
                                 .bg(tab_warning),
                         )
                     })
-                    .child(
+                    .child(if pinned {
+                        div()
+                            .size(px(40.0))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(Icon::Pin.render(14.0).text_color(tab_muted))
+                            .into_any_element()
+                    } else {
                         Button::new(close_id)
                             .ghost()
                             .xsmall()
@@ -7375,8 +7390,9 @@ impl Render for SynapseApp {
                                         this.close_tab(index, cx);
                                     });
                                 }
-                            }),
-                    )
+                            })
+                            .into_any_element()
+                    })
                     .on_mouse_down(
                         MouseButton::Right,
                         cx.listener(move |this, event: &MouseDownEvent, _, cx| {
@@ -8467,6 +8483,12 @@ impl Render for SynapseApp {
 
         let context_menu = self.tab_context_menu.clone().map(|menu| {
             let index = menu.index;
+            let pinned = self
+                .state
+                .tabs()
+                .get(index)
+                .is_some_and(|tab| tab.is_pinned);
+            let pin_app = app_entity.clone();
             let close_app = app_entity.clone();
             let close_left_app = app_entity.clone();
             let close_right_app = app_entity.clone();
@@ -8481,6 +8503,27 @@ impl Render for SynapseApp {
                 .bg(theme.popover)
                 .text_sm()
                 .text_color(theme.popover_foreground)
+                .child(
+                    Button::new("context-pin")
+                        .ghost()
+                        .w_full()
+                        .justify_start()
+                        .child(menu_item_content(
+                            if pinned { Icon::PinOff } else { Icon::Pin },
+                            if pinned {
+                                self.language.text("取消固定", "Unpin")
+                            } else {
+                                self.language.text("固定", "Pin")
+                            },
+                            theme.muted_foreground,
+                        ))
+                        .on_click(move |_, _, cx| {
+                            cx.stop_propagation();
+                            pin_app.update(cx, |this, cx| {
+                                this.toggle_tab_pin(index, cx);
+                            });
+                        }),
+                )
                 .child(
                     Button::new("context-close")
                         .ghost()

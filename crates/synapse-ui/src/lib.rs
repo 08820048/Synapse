@@ -25,6 +25,7 @@ struct OpenTab {
     cursor: usize,
     preferred_column: Option<usize>,
     title_linked: bool,
+    pinned: bool,
     history: EditHistory,
 }
 
@@ -33,6 +34,7 @@ pub struct TabInfo {
     pub relative_path: PathBuf,
     pub title: String,
     pub is_dirty: bool,
+    pub is_pinned: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -376,6 +378,7 @@ impl ShellState {
                     .map(|name| name.to_string_lossy().into_owned())
                     .unwrap_or_else(|| tab.document.relative_path().display().to_string()),
                 is_dirty: tab.history.is_dirty(),
+                is_pinned: tab.pinned,
             })
             .collect()
     }
@@ -417,6 +420,7 @@ impl ShellState {
                     cursor: 0,
                     preferred_column: None,
                     title_linked: false,
+                    pinned: false,
                     history: EditHistory::default(),
                 });
                 self.active_tab = Some(self.tabs.len() - 1);
@@ -692,6 +696,13 @@ impl ShellState {
         }
     }
 
+    pub fn toggle_tab_pin(&mut self, index: usize) -> Result<bool, SessionError> {
+        self.ensure_valid_tab(index)?;
+        let tab = &mut self.tabs[index];
+        tab.pinned = !tab.pinned;
+        Ok(tab.pinned)
+    }
+
     pub fn close_tab(&mut self, index: usize) -> Result<bool, SessionError> {
         self.ensure_valid_tab(index)?;
         self.ensure_tabs_clean(index..index + 1)?;
@@ -710,42 +721,20 @@ impl ShellState {
 
     pub fn close_tabs_left(&mut self, index: usize) -> Result<usize, SessionError> {
         self.ensure_valid_tab(index)?;
-        self.ensure_tabs_clean(0..index)?;
-        if index == 0 {
-            return Ok(0);
-        }
-
-        let old_active = self.active_tab;
-        self.tabs.drain(0..index);
-        self.active_tab = old_active.map(|active| active.saturating_sub(index));
-        self.refresh_active_status();
-        Ok(index)
+        let close_indices = self.unpinned_indices_in(0..index);
+        self.close_tabs_at_indices(close_indices, Some(index))
     }
 
     pub fn close_tabs_right(&mut self, index: usize) -> Result<usize, SessionError> {
         self.ensure_valid_tab(index)?;
-        let start = index + 1;
-        let count = self.tabs.len() - start;
-        self.ensure_tabs_clean(start..self.tabs.len())?;
-        if count == 0 {
-            return Ok(0);
-        }
-
-        self.tabs.drain(start..);
-        if self.active_tab.is_some_and(|active| active >= start) {
-            self.active_tab = Some(index);
-        }
-        self.refresh_active_status();
-        Ok(count)
+        let close_indices = self.unpinned_indices_in(index + 1..self.tabs.len());
+        self.close_tabs_at_indices(close_indices, Some(index))
     }
 
     pub fn close_all_tabs(&mut self) -> Result<usize, SessionError> {
-        let count = self.tabs.len();
-        self.ensure_tabs_clean(0..count)?;
-        self.tabs.clear();
-        self.active_tab = None;
-        self.refresh_active_status();
-        Ok(count)
+        let remaining = self.tabs.iter().filter(|tab| tab.pinned).count();
+        let close_indices = self.unpinned_indices_in(0..self.tabs.len());
+        self.close_tabs_at_indices(close_indices, (remaining > 0).then_some(0))
     }
 
     fn ensure_valid_tab(&mut self, index: usize) -> Result<(), SessionError> {
@@ -836,6 +825,49 @@ impl ShellState {
         self.notes = notes_from_entries(&entries);
         self.entries = entries;
         Ok(true)
+    }
+
+    fn unpinned_indices_in(&self, range: std::ops::Range<usize>) -> Vec<usize> {
+        range.filter(|&index| !self.tabs[index].pinned).collect()
+    }
+
+    fn close_tabs_at_indices(
+        &mut self,
+        indices: Vec<usize>,
+        closed_active: Option<usize>,
+    ) -> Result<usize, SessionError> {
+        if indices
+            .iter()
+            .any(|&index| self.tabs[index].history.is_dirty())
+        {
+            let error = SessionError::UnsavedChanges;
+            self.record_error(&error);
+            return Err(error);
+        }
+
+        let count = indices.len();
+        if count == 0 {
+            return Ok(0);
+        }
+
+        let old_active = self.active_tab;
+        let new_active = match old_active {
+            None => None,
+            Some(active) if indices.contains(&active) => closed_active.map(|index| {
+                let shift = indices.iter().filter(|&&closed| closed < index).count();
+                index - shift
+            }),
+            Some(active) => {
+                let shift = indices.iter().filter(|&&closed| closed < active).count();
+                Some(active - shift)
+            }
+        };
+        for index in indices.into_iter().rev() {
+            self.tabs.remove(index);
+        }
+        self.active_tab = new_active.filter(|&index| index < self.tabs.len());
+        self.refresh_active_status();
+        Ok(count)
     }
 
     fn ensure_tabs_clean(&mut self, range: std::ops::Range<usize>) -> Result<(), SessionError> {
@@ -1514,6 +1546,70 @@ mod tests {
         );
         assert_eq!(state.close_tabs_right(0).unwrap(), 1);
         assert_eq!(state.tabs()[0].relative_path, Path::new("c.md"));
+    }
+
+    #[test]
+    fn pin_tab_replaces_close_control_and_survives_bulk_close() {
+        let directory = tempfile::tempdir().unwrap();
+        for name in ["a.md", "b.md", "c.md"] {
+            fs::write(directory.path().join(name), name).unwrap();
+        }
+        let mut state =
+            ShellState::from_vault_argument(Some(OsString::from(directory.path().as_os_str())));
+        for name in ["a.md", "b.md", "c.md"] {
+            state.select_note(Path::new(name)).unwrap();
+        }
+
+        assert!(state.toggle_tab_pin(1).unwrap());
+        assert!(state.tabs()[1].is_pinned);
+        assert!(!state.toggle_tab_pin(1).unwrap());
+        assert!(!state.tabs()[1].is_pinned);
+        assert!(state.toggle_tab_pin(1).unwrap());
+
+        assert_eq!(state.close_all_tabs().unwrap(), 2);
+        assert_eq!(state.tabs().len(), 1);
+        assert!(state.tabs()[0].is_pinned);
+        assert_eq!(state.tabs()[0].relative_path, Path::new("b.md"));
+        assert_eq!(state.active_tab_index(), Some(0));
+
+        assert!(state.close_tab(0).unwrap());
+        assert!(state.tabs().is_empty());
+    }
+
+    #[test]
+    fn bulk_close_skips_pinned_tabs_and_still_protects_dirty_unpinned_tabs() {
+        let directory = tempfile::tempdir().unwrap();
+        for name in ["a.md", "b.md", "c.md", "d.md"] {
+            fs::write(directory.path().join(name), name).unwrap();
+        }
+        let mut state =
+            ShellState::from_vault_argument(Some(OsString::from(directory.path().as_os_str())));
+        for name in ["a.md", "b.md", "c.md", "d.md"] {
+            state.select_note(Path::new(name)).unwrap();
+        }
+        assert!(state.toggle_tab_pin(0).unwrap());
+        assert!(state.toggle_tab_pin(2).unwrap());
+
+        assert_eq!(state.close_tabs_left(3).unwrap(), 1);
+        assert_eq!(
+            state
+                .tabs()
+                .into_iter()
+                .map(|tab| (tab.relative_path, tab.is_pinned))
+                .collect::<Vec<_>>(),
+            vec![
+                (PathBuf::from("a.md"), true),
+                (PathBuf::from("c.md"), true),
+                (PathBuf::from("d.md"), false),
+            ]
+        );
+
+        state.activate_tab(2).unwrap();
+        state.insert_text("dirty ").unwrap();
+        assert!(state.close_tabs_right(0).is_err());
+        assert_eq!(state.tabs().len(), 3);
+        assert!(state.tabs()[1].is_pinned);
+        assert!(state.tabs()[2].is_dirty);
     }
 
     #[test]
