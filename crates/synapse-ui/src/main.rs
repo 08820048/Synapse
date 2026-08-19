@@ -848,6 +848,18 @@ enum FileTreeRow {
     },
 }
 
+fn prune_collapsed_directories(
+    collapsed_directories: &mut BTreeSet<PathBuf>,
+    entries: &[VaultEntry],
+) {
+    let existing_directories = entries
+        .iter()
+        .filter(|entry| entry.kind == VaultEntryKind::Directory)
+        .map(|entry| entry.relative_path.clone())
+        .collect::<BTreeSet<_>>();
+    collapsed_directories.retain(|path| existing_directories.contains(path));
+}
+
 fn build_file_tree_rows(
     entries: &[VaultEntry],
     collapsed_directories: &BTreeSet<PathBuf>,
@@ -1850,15 +1862,10 @@ impl SynapseApp {
                 }
                 match this.state.refresh_vault_entries() {
                     Ok(true) => {
-                        let existing_directories = this
-                            .state
-                            .entries
-                            .iter()
-                            .filter(|entry| entry.kind == VaultEntryKind::Directory)
-                            .map(|entry| entry.relative_path.clone())
-                            .collect::<BTreeSet<_>>();
-                        this.collapsed_directories
-                            .retain(|path| existing_directories.contains(path));
+                        prune_collapsed_directories(
+                            &mut this.collapsed_directories,
+                            &this.state.entries,
+                        );
                         cx.notify();
                     }
                     Ok(false) => {}
@@ -2532,7 +2539,7 @@ impl SynapseApp {
                 self.state
                     .trash_entry(&target.relative_path)
                     .map_err(|error| error.to_string())?;
-                self.collapsed_directories.clear();
+                prune_collapsed_directories(&mut self.collapsed_directories, &self.state.entries);
             }
             DangerousAction::TrashActiveNote { relative_path, .. } => {
                 self.state
@@ -3373,7 +3380,10 @@ impl SynapseApp {
                     match this.state.rename_entry(&target.relative_path, value) {
                         Ok(_) => {
                             this.inline_rename = None;
-                            this.collapsed_directories.clear();
+                            prune_collapsed_directories(
+                                &mut this.collapsed_directories,
+                                &this.state.entries,
+                            );
                             window.focus(&this.editor_focus);
                         }
                         Err(error) => input.update(cx, |input, cx| {
@@ -3440,7 +3450,7 @@ impl SynapseApp {
             .move_entry(&target.relative_path, destination)
             .is_ok()
         {
-            self.collapsed_directories.clear();
+            prune_collapsed_directories(&mut self.collapsed_directories, &self.state.entries);
         }
         self.dismiss_context_menus(cx);
     }
@@ -10006,6 +10016,7 @@ mod tests {
         markd_panel_spring_progress, markdown_link_context, normalize_clipboard_text,
         normalize_markdown_link_destination, note_breadcrumb_parts, note_link_candidates,
         parse_boolean_preference, path_is_inside_macos_app_bundle, persist_clipboard_image,
+        prune_collapsed_directories,
         resolve_markdown_image, select_startup_vault_path, settings_language_indicator_left,
         settings_spring_progress, settings_theme_indicator_left, settings_titlebar_options,
         settings_window_options, source_lines_from_buffer, synapse_mermaid_theme,
@@ -10931,6 +10942,31 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn pruning_collapsed_directories_keeps_folders_that_still_exist() {
+        let entries = [
+            VaultEntry {
+                relative_path: PathBuf::from("keep"),
+                name: "keep".to_owned(),
+                kind: VaultEntryKind::Directory,
+            },
+            VaultEntry {
+                relative_path: PathBuf::from("keep/note.md"),
+                name: "note".to_owned(),
+                kind: VaultEntryKind::Note,
+            },
+        ];
+        let mut collapsed = BTreeSet::from([
+            PathBuf::from("keep"),
+            PathBuf::from("deleted"),
+            PathBuf::from("deleted/nested"),
+        ]);
+
+        prune_collapsed_directories(&mut collapsed, &entries);
+
+        assert_eq!(collapsed, BTreeSet::from([PathBuf::from("keep")]));
     }
 
     #[test]
