@@ -1448,6 +1448,7 @@ impl SynapseApp {
             self.clear_slash_surfaces_immediately();
             self.tab_context_menu = None;
             self.tree_context_menu = None;
+            self.editor_context_menu = None;
             window.focus(&self.editor_focus);
             self.restart_editor_cursor_blink(cx);
         }
@@ -1468,6 +1469,7 @@ impl SynapseApp {
             self.clear_slash_surfaces_immediately();
             self.tab_context_menu = None;
             self.tree_context_menu = None;
+            self.editor_context_menu = None;
             window.focus(&self.editor_focus);
             self.restart_editor_cursor_blink(cx);
         }
@@ -1522,6 +1524,7 @@ impl SynapseApp {
         self.command_palette_generation = self.command_palette_generation.wrapping_add(1);
         self.tab_context_menu = None;
         self.tree_context_menu = None;
+        self.editor_context_menu = None;
         window.focus(&self.command_search.focus_handle(cx));
         cx.notify();
     }
@@ -1560,6 +1563,7 @@ impl SynapseApp {
     pub(in crate::app) fn dismiss_context_menus(&mut self, cx: &mut Context<Self>) {
         if (self.tab_context_menu.is_none()
             && self.tree_context_menu.is_none()
+            && self.editor_context_menu.is_none()
             && !self.note_actions_menu_open)
             || self.context_menu_closing
         {
@@ -1575,6 +1579,7 @@ impl SynapseApp {
                 if this.context_menu_generation == generation {
                     this.tab_context_menu = None;
                     this.tree_context_menu = None;
+                    this.editor_context_menu = None;
                     this.note_actions_menu_open = false;
                     this.context_menu_closing = false;
                     cx.notify();
@@ -1598,6 +1603,7 @@ impl SynapseApp {
         self.note_actions_menu_open = !self.note_actions_menu_open;
         self.tab_context_menu = None;
         self.tree_context_menu = None;
+        self.editor_context_menu = None;
         self.context_menu_closing = false;
         self.context_menu_generation = self.context_menu_generation.wrapping_add(1);
         cx.notify();
@@ -1746,6 +1752,7 @@ impl SynapseApp {
         self.dismiss_command_palette(cx);
         self.tab_context_menu = None;
         self.tree_context_menu = None;
+        self.editor_context_menu = None;
         window.focus(&input.focus_handle(cx));
         cx.notify();
     }
@@ -1760,6 +1767,7 @@ impl SynapseApp {
         self.context_menu_closing = false;
         self.context_menu_generation = self.context_menu_generation.wrapping_add(1);
         self.tab_context_menu = None;
+        self.editor_context_menu = None;
         self.note_actions_menu_open = false;
         self.command_palette_open = false;
         cx.notify();
@@ -2105,6 +2113,13 @@ impl SynapseApp {
         cx.stop_propagation();
     }
 
+    pub(in crate::app) fn copy_editor_context_selection(&mut self, cx: &mut Context<Self>) {
+        if let Some(text) = self.selected_editor_text() {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
+        self.dismiss_context_menus(cx);
+    }
+
     pub(in crate::app) fn cut(&mut self, _: &Cut, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(text) = self.selected_editor_text() {
             cx.write_to_clipboard(ClipboardItem::new_string(text));
@@ -2168,6 +2183,63 @@ impl SynapseApp {
             cx.notify();
         }
         cx.stop_propagation();
+    }
+
+    pub(in crate::app) fn paste_editor_context_selection(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.paste(&Paste, window, cx);
+        self.dismiss_context_menus(cx);
+    }
+
+    pub(in crate::app) fn add_selected_list_to_todos(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(text) = self.state.active_document().map(|document| document.text()) else {
+            return;
+        };
+        let items = markdown_list_items_in_selection(&text, self.editor_selection.range());
+        if items.is_empty() {
+            self.dismiss_context_menus(cx);
+            return;
+        }
+
+        match self.todo_workspace.add_todos(&items) {
+            Ok(count) => match self.todo_workspace.save_default() {
+                Ok(()) => push_alert_notification(
+                    window,
+                    cx,
+                    AppNotificationVariant::Success,
+                    self.language.text("已添加到待办", "Added to Todo"),
+                    match self.language {
+                        AppLanguage::SimplifiedChinese => format!("已添加 {count} 条待办"),
+                        AppLanguage::English => format!("Added {count} todo items"),
+                    },
+                ),
+                Err(error) => push_alert_notification(
+                    window,
+                    cx,
+                    AppNotificationVariant::Warning,
+                    self.language.text(
+                        "待办已添加，但无法保存",
+                        "Todo added but could not be saved",
+                    ),
+                    error.to_string(),
+                ),
+            },
+            Err(error) => push_alert_notification(
+                window,
+                cx,
+                AppNotificationVariant::Error,
+                self.language.text("无法添加待办", "Could not add Todo"),
+                error.message(self.language),
+            ),
+        }
+        self.dismiss_context_menus(cx);
     }
 
     pub(in crate::app) fn insert_backtick(
@@ -2965,6 +3037,38 @@ impl SynapseApp {
         self.editor_selection
             .start_drag(cursor, event.modifiers.shift);
         self.state.set_cursor(cursor);
+        window.focus(&self.editor_focus);
+        self.restart_editor_cursor_blink(cx);
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    pub(in crate::app) fn editor_context_menu_mouse_down(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(cursor) = self.editor_char_for_position(event.position) else {
+            return;
+        };
+        let selection = self.editor_selection.range();
+        if selection.is_empty() || cursor < selection.start || cursor >= selection.end {
+            self.editor_selection.collapse(cursor);
+            self.state.set_cursor(cursor);
+        }
+        self.editor_selection.finish_drag();
+        self.editor_marked_range = None;
+        self.selection_menu_mode = SelectionMenuMode::Formatting;
+        self.clear_slash_surfaces_immediately();
+        self.tab_context_menu = None;
+        self.tree_context_menu = None;
+        self.note_actions_menu_open = false;
+        self.context_menu_closing = false;
+        self.context_menu_generation = self.context_menu_generation.wrapping_add(1);
+        self.editor_context_menu = Some(EditorContextMenu {
+            position: event.position,
+        });
         window.focus(&self.editor_focus);
         self.restart_editor_cursor_blink(cx);
         cx.stop_propagation();

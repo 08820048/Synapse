@@ -280,6 +280,7 @@ fn markd_panel_spring_progress(progress: f32) -> f32 {
 }
 const TAB_CONTEXT_MENU_WIDTH: f32 = 176.0;
 const TREE_CONTEXT_MENU_WIDTH: f32 = 218.0;
+const EDITOR_CONTEXT_MENU_WIDTH: f32 = 196.0;
 const MERMAID_PREVIEW_MAX_HEIGHT: f32 = 520.0;
 const MERMAID_PREVIEW_VERTICAL_PADDING: f32 = 16.0;
 const MATH_BLOCK_MAX_HEIGHT: f32 = 420.0;
@@ -1201,6 +1202,11 @@ struct TabContextMenu {
     position: Point<Pixels>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct EditorContextMenu {
+    position: Point<Pixels>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct TreeDrag {
     target: TreeTarget,
@@ -1371,6 +1377,7 @@ struct SynapseApp {
     command_palette_generation: u64,
     tab_context_menu: Option<TabContextMenu>,
     tree_context_menu: Option<TreeContextMenu>,
+    editor_context_menu: Option<EditorContextMenu>,
     note_actions_menu_open: bool,
     context_menu_closing: bool,
     context_menu_generation: u64,
@@ -2449,6 +2456,69 @@ fn normalize_clipboard_text(text: &str) -> String {
     text.replace("\r\n", "\n").replace('\r', "\n")
 }
 
+/// Returns one todo title for every complete Markdown list item touched by a selection.
+///
+/// A selection may begin or end inside its first/last list row, but it must not include
+/// non-empty content outside of ordered or unordered list items. This prevents a mixed text
+/// selection from silently creating incomplete todos.
+fn markdown_list_items_in_selection(text: &str, selection: Range<usize>) -> Vec<String> {
+    if selection.is_empty() || selection.end > text.chars().count() {
+        return Vec::new();
+    }
+
+    let mut items = Vec::new();
+    let mut line_start = 0;
+    for raw_line in text.split_inclusive('\n') {
+        let line = raw_line.strip_suffix('\n').unwrap_or(raw_line);
+        let line_end = line_start + line.chars().count();
+        let intersects_selection = line_start < selection.end && line_end > selection.start;
+        if intersects_selection {
+            if let Some(item) = markdown_list_item_text(line) {
+                items.push(item);
+            } else if !line.trim().is_empty() {
+                return Vec::new();
+            }
+        }
+        line_start += raw_line.chars().count();
+    }
+
+    items
+}
+
+fn markdown_list_item_text(line: &str) -> Option<String> {
+    let trimmed = line.trim_start_matches([' ', '\t']);
+    let content = match trimmed.as_bytes().first() {
+        Some(b'-' | b'+' | b'*')
+            if trimmed
+                .as_bytes()
+                .get(1)
+                .is_some_and(u8::is_ascii_whitespace) =>
+        {
+            trimmed[1..].trim_start()
+        }
+        Some(byte) if byte.is_ascii_digit() => {
+            let digits = trimmed
+                .as_bytes()
+                .iter()
+                .take_while(|byte| byte.is_ascii_digit())
+                .count();
+            let marker_end = digits + 1;
+            if digits == 0
+                || !matches!(trimmed.as_bytes().get(digits), Some(b'.' | b')'))
+                || !trimmed
+                    .as_bytes()
+                    .get(marker_end)
+                    .is_some_and(u8::is_ascii_whitespace)
+            {
+                return None;
+            }
+            trimmed[marker_end..].trim_start()
+        }
+        _ => return None,
+    };
+    (!content.trim().is_empty()).then(|| content.trim().to_owned())
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct MarkdownLinkContext {
     outer: Range<usize>,
@@ -3040,6 +3110,7 @@ pub(crate) fn run() {
                             command_palette_generation: 0,
                             tab_context_menu: None,
                             tree_context_menu: None,
+                            editor_context_menu: None,
                             note_actions_menu_open: false,
                             context_menu_closing: false,
                             context_menu_generation: 0,
@@ -3143,14 +3214,14 @@ mod tests {
         editor_horizontal_gutter, editor_page_content_width, embedded_app_icon_png_metadata,
         fenced_code_block_edit, file_manager_reveal_command, filtered_slash_commands,
         inline_format_edit, inline_format_is_active, is_tab_context_trigger, linked_vault_note,
-        markd_panel_spring_progress, markdown_link_context, normalize_clipboard_text,
-        normalize_markdown_link_destination, note_breadcrumb_parts, note_link_candidates,
-        parse_boolean_preference, path_is_inside_macos_app_bundle, persist_clipboard_image,
-        prune_collapsed_directories, resolve_markdown_image, select_startup_vault_path,
-        settings_language_indicator_left, settings_spring_progress, settings_theme_indicator_left,
-        settings_titlebar_options, settings_window_options, source_lines_from_buffer,
-        synapse_mermaid_theme, synapse_theme_palette, synapse_titlebar_options,
-        titlebar_left_inset,
+        markd_panel_spring_progress, markdown_link_context, markdown_list_items_in_selection,
+        normalize_clipboard_text, normalize_markdown_link_destination, note_breadcrumb_parts,
+        note_link_candidates, parse_boolean_preference, path_is_inside_macos_app_bundle,
+        persist_clipboard_image, prune_collapsed_directories, resolve_markdown_image,
+        select_startup_vault_path, settings_language_indicator_left, settings_spring_progress,
+        settings_theme_indicator_left, settings_titlebar_options, settings_window_options,
+        source_lines_from_buffer, synapse_mermaid_theme, synapse_theme_palette,
+        synapse_titlebar_options, titlebar_left_inset,
     };
     fn sfnt_table<'a>(font: &'a [u8], tag: &[u8; 4]) -> Option<&'a [u8]> {
         let table_count = usize::from(u16::from_be_bytes(font.get(4..6)?.try_into().ok()?));
@@ -3266,6 +3337,28 @@ mod tests {
             4..6,
             InlineFormat::Italic
         ));
+    }
+
+    #[test]
+    fn selected_markdown_lists_expand_into_clean_todo_titles() {
+        let source = "前言\n  - 写文档\n  * 修复问题\n  + 发布版本\n后记";
+        let selection_start = source.find('-').unwrap();
+        let selection_start = source[..selection_start].chars().count() + 1;
+        let selection_end = source.find("\n后记").unwrap();
+        let selection_end = source[..selection_end].chars().count();
+        assert_eq!(
+            markdown_list_items_in_selection(source, selection_start..selection_end),
+            ["写文档", "修复问题", "发布版本"]
+        );
+
+        let ordered = "3. 规划\n4) 实现\n5. 验证";
+        assert_eq!(
+            markdown_list_items_in_selection(ordered, 0..ordered.chars().count()),
+            ["规划", "实现", "验证"]
+        );
+
+        let mixed = "- 可转换\n这不是列表";
+        assert!(markdown_list_items_in_selection(mixed, 0..mixed.chars().count()).is_empty());
     }
 
     #[test]

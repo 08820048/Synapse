@@ -239,6 +239,25 @@ impl TodoWorkspace {
         Ok(id)
     }
 
+    /// Adds a batch without reordering the supplied list in the visible todo workspace.
+    /// Validation happens before mutation, so a malformed list cannot leave a partial import.
+    pub(in crate::app) fn add_todos(&mut self, texts: &[String]) -> Result<usize, TodoTextError> {
+        let normalized = texts.iter().map(|text| text.trim()).collect::<Vec<_>>();
+        for text in &normalized {
+            if text.is_empty() {
+                return Err(TodoTextError::Empty);
+            }
+            if text.chars().count() > TODO_TEXT_MAX_CHARS {
+                return Err(TodoTextError::TooLong);
+            }
+        }
+
+        for text in normalized.into_iter().rev() {
+            self.add_todo(text)?;
+        }
+        Ok(texts.len())
+    }
+
     /// Replace the text of an existing todo. Text is trimmed and validated with
     /// the same rules as creation; returns `false` when the todo does not exist
     /// or the normalized text is unchanged, so callers can skip persistence.
@@ -1625,6 +1644,31 @@ mod tests {
         assert!(workspace.toggle_todo(1));
         assert!(workspace.visible_todos()[0].done);
         assert!(!workspace.toggle_todo(99));
+    }
+
+    #[test]
+    fn adding_todos_as_a_batch_keeps_list_order_and_rejects_partial_imports() {
+        let mut workspace = TodoWorkspace::default();
+        let items = [
+            "第一项".to_owned(),
+            "第二项".to_owned(),
+            "第三项".to_owned(),
+        ];
+        assert_eq!(workspace.add_todos(&items), Ok(3));
+        assert_eq!(
+            workspace
+                .visible_todos()
+                .iter()
+                .map(|todo| todo.text.as_str())
+                .collect::<Vec<_>>(),
+            ["第一项", "第二项", "第三项"]
+        );
+
+        assert_eq!(
+            workspace.add_todos(&["有效条目".to_owned(), " ".to_owned()]),
+            Err(TodoTextError::Empty)
+        );
+        assert_eq!(workspace.total_count(), 3);
     }
 
     #[test]

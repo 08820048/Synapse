@@ -5,6 +5,10 @@ impl Render for SynapseApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let component_layers = render_component_root_layers(window, cx);
         let theme = cx.theme().clone();
+        // Deferred context menus retain their element identity while open. Include the active
+        // appearance in that identity so a settings-window theme change remounts their copied
+        // palette immediately instead of waiting for the next time the menu is opened.
+        let context_menu_theme_key = if theme.is_dark() { "dark" } else { "light" };
         let app_entity = cx.entity();
         let command_kbd = Kbd::binding_for_action(&OpenCommandPalette, None, window);
         let todo_workspace_active = self.workspace_view == WorkspaceView::Todo;
@@ -369,6 +373,10 @@ impl Render for SynapseApp {
                 .on_action(cx.listener(Self::accept_slash_command))
                 .on_action(cx.listener(Self::dismiss_slash_menu_action))
                 .on_mouse_down(MouseButton::Left, cx.listener(Self::editor_mouse_down))
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(Self::editor_context_menu_mouse_down),
+                )
                 .on_mouse_move(cx.listener(Self::editor_mouse_move))
                 .on_mouse_up(MouseButton::Left, cx.listener(Self::editor_mouse_up))
                 .on_mouse_up_out(MouseButton::Left, cx.listener(Self::editor_mouse_up))
@@ -1132,6 +1140,7 @@ impl Render for SynapseApp {
                                 this.context_menu_generation =
                                     this.context_menu_generation.wrapping_add(1);
                                 this.note_actions_menu_open = false;
+                                this.editor_context_menu = None;
                                 this.tab_context_menu = Some(TabContextMenu {
                                     index,
                                     position: event.position,
@@ -2233,7 +2242,9 @@ impl Render for SynapseApp {
             let close_right_app = app_entity.clone();
             let close_all_app = app_entity.clone();
             let panel = div()
-                .id("tab-context-menu")
+                .id(SharedString::from(format!(
+                    "tab-context-menu-{context_menu_theme_key}"
+                )))
                 .w(px(TAB_CONTEXT_MENU_WIDTH))
                 .p_1()
                 .rounded_md()
@@ -2333,7 +2344,7 @@ impl Render for SynapseApp {
                 )
                 .opacity(0.0)
                 .with_transition(SharedString::from(format!(
-                    "tab-context-menu-transition-{index}"
+                    "tab-context-menu-transition-{index}-{context_menu_theme_key}"
                 )))
                 .transition_when_else(
                     !self.context_menu_closing,
@@ -2358,7 +2369,9 @@ impl Render for SynapseApp {
             let rename_target = target.clone();
             let trash_target = target.clone();
             let base = div()
-                .id("tree-context-menu")
+                .id(SharedString::from(format!(
+                    "tree-context-menu-{context_menu_theme_key}"
+                )))
                 .w(px(TREE_CONTEXT_MENU_WIDTH))
                 .p_1()
                 .rounded_lg()
@@ -2368,7 +2381,9 @@ impl Render for SynapseApp {
                 .text_sm()
                 .text_color(theme.popover_foreground)
                 .opacity(0.0)
-                .with_transition("tree-context-menu-transition")
+                .with_transition(SharedString::from(format!(
+                    "tree-context-menu-transition-{context_menu_theme_key}"
+                )))
                 .transition_when_else(
                     !self.context_menu_closing,
                     QUICK_TRANSITION,
@@ -2551,6 +2566,105 @@ impl Render for SynapseApp {
                     .into_any_element()
                 }
             };
+            deferred(
+                anchored()
+                    .snap_to_window_with_margin(px(8.0))
+                    .anchor(Corner::TopLeft)
+                    .position(menu.position)
+                    .child(panel),
+            )
+            .into_any_element()
+        });
+
+        let editor_context_menu = self.editor_context_menu.map(|menu| {
+            let copy_app = app_entity.clone();
+            let paste_app = app_entity.clone();
+            let add_todos_app = app_entity.clone();
+            let has_selection = !self.editor_selection.is_empty();
+            let has_list_items = self.state.active_document().is_some_and(|document| {
+                !markdown_list_items_in_selection(&document.text(), self.editor_selection.range())
+                    .is_empty()
+            });
+            let panel = div()
+                .id(SharedString::from(format!(
+                    "editor-context-menu-{context_menu_theme_key}"
+                )))
+                .w(px(EDITOR_CONTEXT_MENU_WIDTH))
+                .p_1()
+                .rounded_lg()
+                .border_1()
+                .border_color(theme.border)
+                .bg(theme.popover)
+                .text_sm()
+                .text_color(theme.popover_foreground)
+                .child(
+                    Button::new("editor-context-copy")
+                        .ghost()
+                        .w_full()
+                        .h(px(40.0))
+                        .justify_start()
+                        .disabled(!has_selection)
+                        .child(menu_item_content(
+                            Icon::Copy,
+                            self.language.text("复制", "Copy"),
+                            theme.muted_foreground,
+                        ))
+                        .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                            cx.stop_propagation();
+                            copy_app.update(cx, |this, cx| {
+                                this.copy_editor_context_selection(cx);
+                            });
+                        }),
+                )
+                .child(
+                    Button::new("editor-context-paste")
+                        .ghost()
+                        .w_full()
+                        .h(px(40.0))
+                        .justify_start()
+                        .child(menu_item_content(
+                            Icon::Paste,
+                            self.language.text("粘贴", "Paste"),
+                            theme.muted_foreground,
+                        ))
+                        .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                            cx.stop_propagation();
+                            paste_app.update(cx, |this, cx| {
+                                this.paste_editor_context_selection(window, cx);
+                            });
+                        }),
+                )
+                .child(div().h(px(1.0)).mx_2().my(px(2.0)).bg(theme.border))
+                .child(
+                    Button::new("editor-context-add-to-todo")
+                        .ghost()
+                        .w_full()
+                        .h(px(40.0))
+                        .justify_start()
+                        .disabled(!has_list_items)
+                        .child(menu_item_content(
+                            Icon::Todo,
+                            self.language.text("添加到待办", "Add to Todo"),
+                            theme.muted_foreground,
+                        ))
+                        .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                            cx.stop_propagation();
+                            add_todos_app.update(cx, |this, cx| {
+                                this.add_selected_list_to_todos(window, cx);
+                            });
+                        }),
+                )
+                .opacity(0.0)
+                .with_transition(SharedString::from(format!(
+                    "editor-context-menu-transition-{context_menu_theme_key}"
+                )))
+                .transition_when_else(
+                    !self.context_menu_closing,
+                    QUICK_TRANSITION,
+                    EaseOutQuad,
+                    |style| style.opacity(1.0),
+                    |style| style.opacity(0.0),
+                );
             deferred(
                 anchored()
                     .snap_to_window_with_margin(px(8.0))
@@ -2880,6 +2994,7 @@ impl Render for SynapseApp {
             )
             .children(context_menu)
             .children(tree_context_menu)
+            .children(editor_context_menu)
             .children(note_actions_menu)
             .children(command_palette)
             .children(component_layers)

@@ -28,6 +28,7 @@ pub enum Icon {
     MoreVertical,
     Download,
     Copy,
+    Paste,
     CloseAll,
     Check,
     Tag,
@@ -51,7 +52,7 @@ pub enum Icon {
 }
 
 impl Icon {
-    const ALL: [Self; 43] = [
+    const ALL: [Self; 44] = [
         Self::Search,
         Self::Todo,
         Self::Bookmark,
@@ -75,6 +76,7 @@ impl Icon {
         Self::MoreVertical,
         Self::Download,
         Self::Copy,
+        Self::Paste,
         Self::CloseAll,
         Self::Check,
         Self::Tag,
@@ -122,6 +124,7 @@ impl Icon {
             Self::MoreVertical => "lucide/ellipsis-vertical.svg",
             Self::Download => "lucide/download.svg",
             Self::Copy => "lucide/copy.svg",
+            Self::Paste => "lucide/clipboard-paste.svg",
             Self::CloseAll => "lucide/circle-x.svg",
             Self::Check => "lucide/check.svg",
             Self::Tag => "lucide/tag.svg",
@@ -221,6 +224,9 @@ impl AssetSource for SynapseAssets {
             )),
             "lucide/copy.svg" => Some(include_bytes!(
                 "../../../../../assets/icons/lucide/copy.svg"
+            )),
+            "lucide/clipboard-paste.svg" => Some(include_bytes!(
+                "../../../../../assets/icons/lucide/clipboard-paste.svg"
             )),
             "lucide/circle-x.svg" => Some(include_bytes!(
                 "../../../../../assets/icons/lucide/circle-x.svg"
