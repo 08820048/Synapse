@@ -10016,11 +10016,11 @@ mod tests {
         markd_panel_spring_progress, markdown_link_context, normalize_clipboard_text,
         normalize_markdown_link_destination, note_breadcrumb_parts, note_link_candidates,
         parse_boolean_preference, path_is_inside_macos_app_bundle, persist_clipboard_image,
-        prune_collapsed_directories,
-        resolve_markdown_image, select_startup_vault_path, settings_language_indicator_left,
-        settings_spring_progress, settings_theme_indicator_left, settings_titlebar_options,
-        settings_window_options, source_lines_from_buffer, synapse_mermaid_theme,
-        synapse_theme_palette, synapse_titlebar_options, titlebar_left_inset,
+        prune_collapsed_directories, resolve_markdown_image, select_startup_vault_path,
+        settings_language_indicator_left, settings_spring_progress, settings_theme_indicator_left,
+        settings_titlebar_options, settings_window_options, source_lines_from_buffer,
+        synapse_mermaid_theme, synapse_theme_palette, synapse_titlebar_options,
+        titlebar_left_inset,
     };
     fn sfnt_table<'a>(font: &'a [u8], tag: &[u8; 4]) -> Option<&'a [u8]> {
         let table_count = usize::from(u16::from_be_bytes(font.get(4..6)?.try_into().ok()?));
