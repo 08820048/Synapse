@@ -1151,8 +1151,18 @@ impl Render for SynapseApp {
                         is_active,
                         QUICK_TRANSITION,
                         EaseOutQuad,
-                        move |style| style.bg(tab_active).text_color(tab_active_foreground),
-                        move |style| style.bg(tab_inactive).text_color(tab_inactive_foreground),
+                        move |style| {
+                            style
+                                .bg(tab_active)
+                                .text_color(tab_active_foreground)
+                                .border_color(tab_border)
+                        },
+                        move |style| {
+                            style
+                                .bg(tab_inactive)
+                                .text_color(tab_inactive_foreground)
+                                .border_color(tab_border)
+                        },
                     )
             }))
             .child(

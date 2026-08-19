@@ -524,14 +524,14 @@ fn apply_native_application_appearance(preference: ThemePreference) {
     let _ = preference;
 }
 
-fn apply_synapse_theme(preference: ThemePreference, mut window: Option<&mut Window>, cx: &mut App) {
+fn apply_synapse_theme(preference: ThemePreference, window: Option<&mut Window>, cx: &mut App) {
     // GPUI Component changes content colors only. Keep native titlebars, traffic lights, system
     // panels and other AppKit chrome on the same global System/Light/Dark preference.
     apply_native_application_appearance(preference);
     match preference {
-        ThemePreference::System => Theme::sync_system_appearance(window.as_deref_mut(), cx),
-        ThemePreference::Light => Theme::change(ThemeMode::Light, window.as_deref_mut(), cx),
-        ThemePreference::Dark => Theme::change(ThemeMode::Dark, window.as_deref_mut(), cx),
+        ThemePreference::System => Theme::sync_system_appearance(window, cx),
+        ThemePreference::Light => Theme::change(ThemeMode::Light, window, cx),
+        ThemePreference::Dark => Theme::change(ThemeMode::Dark, window, cx),
     }
 
     let palette = synapse_theme_palette(Theme::global(cx).is_dark());
@@ -593,9 +593,9 @@ fn apply_synapse_theme(preference: ThemePreference, mut window: Option<&mut Wind
     theme.table_head = palette.panel;
     theme.table_head_foreground = palette.foreground;
 
-    if let Some(window) = window {
-        window.refresh();
-    }
+    // Theme is global, while Settings is a separate window. Refresh every window only after
+    // applying the Synapse palette so cached tab borders and other copied theme colors update.
+    cx.refresh_windows();
 }
 
 fn register_bundled_fonts(cx: &mut App) {
