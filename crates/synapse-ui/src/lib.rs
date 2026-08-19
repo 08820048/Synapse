@@ -153,6 +153,7 @@ impl ShellState {
     }
 
     pub fn create_untitled_note(&mut self, parent: &Path) -> Result<PathBuf, SessionError> {
+        self.autosave_active_if_dirty()?;
         let name = next_untitled_name(&self.entries, parent);
         let path = self.create_note(parent, &name)?;
         self.select_note(&path)?;
@@ -394,6 +395,10 @@ impl ShellState {
             return Err(error);
         }
 
+        if self.active_tab != Some(index) {
+            self.autosave_active_if_dirty()?;
+        }
+
         self.active_tab = Some(index);
         self.refresh_active_status();
         Ok(())
@@ -407,6 +412,8 @@ impl ShellState {
         {
             return self.activate_tab(index);
         }
+
+        self.autosave_active_if_dirty()?;
 
         let result = self
             .vault
@@ -656,6 +663,16 @@ impl ShellState {
                 .unwrap_or(chars.len());
             tab.cursor = next_start + column.min(next_end - next_start);
         }
+    }
+
+    fn autosave_active_if_dirty(&mut self) -> Result<(), SessionError> {
+        let Some(index) = self.active_tab else {
+            return Ok(());
+        };
+        if !self.tabs[index].history.is_dirty() {
+            return Ok(());
+        }
+        self.save_active().map(|_| ())
     }
 
     pub fn save_active(&mut self) -> Result<bool, SessionError> {
@@ -1400,7 +1417,7 @@ mod tests {
     }
 
     #[test]
-    fn v1_ac1_dirty_document_is_preserved_when_opening_another_tab() {
+    fn switching_notes_autosaves_the_dirty_active_note() {
         let directory = tempfile::tempdir().unwrap();
         fs::write(directory.path().join("first.md"), "first").unwrap();
         fs::write(directory.path().join("second.md"), "second").unwrap();
@@ -1416,9 +1433,39 @@ mod tests {
             Path::new("second.md")
         );
         assert_eq!(state.tabs().len(), 2);
+        assert_eq!(
+            fs::read_to_string(directory.path().join("first.md")).unwrap(),
+            "changed first"
+        );
         state.activate_tab(0).unwrap();
         assert_eq!(state.active_document().unwrap().text(), "changed first");
+        assert!(!state.active_document().unwrap().is_dirty());
+        assert!(!state.tabs()[0].is_dirty);
+    }
+
+    #[test]
+    fn failed_autosave_keeps_the_current_note_and_does_not_switch() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir(directory.path().join("nested")).unwrap();
+        fs::write(directory.path().join("nested/note.md"), "before").unwrap();
+        fs::write(directory.path().join("other.md"), "other").unwrap();
+        let mut state =
+            ShellState::from_vault_argument(Some(OsString::from(directory.path().as_os_str())));
+        state.select_note(Path::new("nested/note.md")).unwrap();
+        state.move_end();
+        state.insert_text(" after").unwrap();
+        fs::remove_file(directory.path().join("nested/note.md")).unwrap();
+        fs::remove_dir(directory.path().join("nested")).unwrap();
+
+        assert!(state.select_note(Path::new("other.md")).is_err());
+
+        assert_eq!(
+            state.active_document().unwrap().relative_path(),
+            Path::new("nested/note.md")
+        );
+        assert_eq!(state.active_document().unwrap().text(), "before after");
         assert!(state.active_document().unwrap().is_dirty());
+        assert_eq!(state.tabs().len(), 1);
     }
 
     #[test]

@@ -3131,30 +3131,32 @@ impl SynapseApp {
     }
 
     fn select_note(&mut self, relative_path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
-        let _ = self.state.select_note(&relative_path);
-        self.workspace_view = WorkspaceView::Note;
-        self.editor_selection.collapse(self.state.cursor());
-        self.editor_marked_range = None;
-        self.selection_menu_mode = SelectionMenuMode::Formatting;
-        self.clear_slash_surfaces_immediately();
-        self.tab_context_menu = None;
-        self.tree_context_menu = None;
-        window.focus(&self.editor_focus);
-        self.restart_editor_cursor_blink(cx);
+        if self.state.select_note(&relative_path).is_ok() {
+            self.workspace_view = WorkspaceView::Note;
+            self.editor_selection.collapse(self.state.cursor());
+            self.editor_marked_range = None;
+            self.selection_menu_mode = SelectionMenuMode::Formatting;
+            self.clear_slash_surfaces_immediately();
+            self.tab_context_menu = None;
+            self.tree_context_menu = None;
+            window.focus(&self.editor_focus);
+            self.restart_editor_cursor_blink(cx);
+        }
         cx.notify();
     }
 
     fn activate_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let _ = self.state.activate_tab(index);
-        self.workspace_view = WorkspaceView::Note;
-        self.editor_selection.collapse(self.state.cursor());
-        self.editor_marked_range = None;
-        self.selection_menu_mode = SelectionMenuMode::Formatting;
-        self.clear_slash_surfaces_immediately();
-        self.tab_context_menu = None;
-        self.tree_context_menu = None;
-        window.focus(&self.editor_focus);
-        self.restart_editor_cursor_blink(cx);
+        if self.state.activate_tab(index).is_ok() {
+            self.workspace_view = WorkspaceView::Note;
+            self.editor_selection.collapse(self.state.cursor());
+            self.editor_marked_range = None;
+            self.selection_menu_mode = SelectionMenuMode::Formatting;
+            self.clear_slash_surfaces_immediately();
+            self.tab_context_menu = None;
+            self.tree_context_menu = None;
+            window.focus(&self.editor_focus);
+            self.restart_editor_cursor_blink(cx);
+        }
         cx.notify();
     }
 
