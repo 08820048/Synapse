@@ -14,7 +14,7 @@ futures.workspace = true
 notify.workspace = true
 gpui.workspace = true
 gpui-animation.workspace = true
-gpui-component.workspace = true
+gpui-component = { workspace = true, features = ["tree-sitter-languages"] }
 gpui-component-assets.workspace = true
 ratex-layout.workspace = true
 ratex-parser.workspace = true
@@ -25,6 +25,7 @@ reqwest.workspace = true
 synapse-core.workspace = true
 tokio.workspace = true
 writ.workspace = true
+ropey2 = { package = "ropey", version = "=2.0.0-beta.1", features = ["metric_lines_lf", "metric_utf16"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 cocoa = "=0.26.0"

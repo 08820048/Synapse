@@ -41,6 +41,47 @@ pub struct SyntaxHighlighter {
     tree: Option<Tree>,
 }
 
+/// A byte position in a source document, used to incrementally update a
+/// [`SyntaxHighlighter`] without exposing Tree-sitter types to consumers.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SyntaxHighlightPoint {
+    pub row: usize,
+    pub column: usize,
+}
+
+/// A source edit used to preserve Tree-sitter's incremental parse tree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SyntaxHighlightEdit {
+    pub start_byte: usize,
+    pub old_end_byte: usize,
+    pub new_end_byte: usize,
+    pub start_position: SyntaxHighlightPoint,
+    pub old_end_position: SyntaxHighlightPoint,
+    pub new_end_position: SyntaxHighlightPoint,
+}
+
+impl From<SyntaxHighlightPoint> for Point {
+    fn from(point: SyntaxHighlightPoint) -> Self {
+        Self {
+            row: point.row,
+            column: point.column,
+        }
+    }
+}
+
+impl From<SyntaxHighlightEdit> for InputEdit {
+    fn from(edit: SyntaxHighlightEdit) -> Self {
+        Self {
+            start_byte: edit.start_byte,
+            old_end_byte: edit.old_end_byte,
+            new_end_byte: edit.new_end_byte,
+            start_position: edit.start_position.into(),
+            old_end_position: edit.old_end_position.into(),
+            new_end_position: edit.new_end_position.into(),
+        }
+    }
+}
+
 struct TextProvider<'a>(&'a Rope);
 struct ByteChunks<'a> {
     cursor: ChunkCursor<'a>,
@@ -351,6 +392,13 @@ impl SyntaxHighlighter {
 
         self.tree = Some(new_tree);
         self.text = text.clone();
+    }
+
+    /// Apply an edit while preserving the existing parser tree. This is much
+    /// cheaper than reparsing a large document from its first byte on each key
+    /// press.
+    pub fn update_incremental(&mut self, edit: SyntaxHighlightEdit, text: &Rope) {
+        self.update(Some(edit.into()), text);
     }
 
     /// Match the visible ranges of nodes in the Tree for highlighting.

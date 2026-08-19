@@ -933,7 +933,7 @@ fn char_slice(text: &str, start: usize, end: usize) -> String {
 }
 
 pub(in crate::app) fn code_block_edges(
-    code_line: Option<editor_surface::MarkdownCodeLine>,
+    code_line: Option<&editor_surface::MarkdownCodeLine>,
 ) -> (bool, bool) {
     (
         code_line.is_some_and(|code| code.is_first_content),
@@ -1081,11 +1081,17 @@ pub(super) fn render_editor_row(
             .presentation
             .quote_line
             .is_some_and(|quote| quote.is_last);
-    let code_line = line.presentation.code_line;
+    let code_line = line.presentation.code_line.as_ref();
     if code_line.is_some_and(|code| code.is_fence) {
         return div().h(px(0.0)).overflow_hidden().into_any_element();
     }
     let (code_first, code_last) = code_block_edges(code_line);
+    let code_header = code_line.filter(|code| code.is_first_content).map(|code| {
+        (
+            code.language.clone(),
+            code.content_start_char..code.content_end_char,
+        )
+    });
     div()
         .w_full()
         .min_w(px(0.0))
@@ -1188,6 +1194,7 @@ pub(super) fn render_editor_row(
                         )
                         .when(matches!(kind, MarkdownBlockKind::Code), |style| {
                             style
+                                .flex_col()
                                 .text_size(px(CODE_BLOCK_FONT_SIZE))
                                 .line_height(px(CODE_BLOCK_LINE_HEIGHT))
                                 .font_family(theme.mono_font_family.clone())
@@ -1196,9 +1203,7 @@ pub(super) fn render_editor_row(
                                 .border_l_1()
                                 .border_r_1()
                                 .border_color(theme.tab_bar_segmented)
-                                .when(code_first, |style| {
-                                    style.border_t_1().rounded_t_lg().pt(px(14.0))
-                                })
+                                .when(code_first, |style| style.border_t_1().rounded_t_lg())
                                 .when(code_last, |style| {
                                     style.border_b_1().rounded_b_lg().pb(px(14.0))
                                 })
@@ -1226,6 +1231,59 @@ pub(super) fn render_editor_row(
                                 .px(px(12.0))
                                 .when(callout_first, |style| style.rounded_t_lg().pt(px(8.0)))
                                 .when(callout_last, |style| style.rounded_b_lg().pb(px(8.0)))
+                        })
+                        .when_some(code_header, |content, (language, content_range)| {
+                            let copy_app = row_context.app.clone();
+                            content.child(
+                                div()
+                                    .w_full()
+                                    .h(px(40.0))
+                                    .flex_none()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .border_b_1()
+                                    .border_color(theme.tab_bar_segmented)
+                                    .font_family("Inter")
+                                    .text_xs()
+                                    .child(
+                                        div()
+                                            .min_w(px(0.0))
+                                            .truncate()
+                                            .text_color(theme.muted_foreground)
+                                            .child(language),
+                                    )
+                                    .child(
+                                        Button::new(("code-block-copy", index))
+                                            .ghost()
+                                            .h(px(40.0))
+                                            .px_2()
+                                            .rounded_md()
+                                            .tooltip(
+                                                row_context.language.text("复制代码", "Copy code"),
+                                            )
+                                            .child(
+                                                div()
+                                                    .flex()
+                                                    .items_center()
+                                                    .gap_1()
+                                                    .child(
+                                                        Icon::Copy
+                                                            .render(13.0)
+                                                            .text_color(theme.muted_foreground),
+                                                    )
+                                                    .child(
+                                                        row_context.language.text("复制", "Copy"),
+                                                    ),
+                                            )
+                                            .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                                                cx.stop_propagation();
+                                                copy_app.update(cx, |this, cx| {
+                                                    this.copy_code_block(content_range.clone(), cx);
+                                                });
+                                            }),
+                                    ),
+                            )
                         })
                         .child(MarkdownLineElement {
                             app: row_context.app.clone(),

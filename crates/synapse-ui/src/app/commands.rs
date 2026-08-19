@@ -1820,6 +1820,7 @@ impl SynapseApp {
             .active_document()
             .map_or(0, |document| document.revision());
         if let Ok(Some(edit)) = self.state.undo() {
+            self.clear_code_auto_pairs();
             self.sync_writ_render_buffer(previous_revision, edit.range, &edit.replacement);
             self.editor_marked_range = None;
             self.editor_selection.collapse(self.state.cursor());
@@ -1837,6 +1838,7 @@ impl SynapseApp {
             .active_document()
             .map_or(0, |document| document.revision());
         if let Ok(Some(edit)) = self.state.redo() {
+            self.clear_code_auto_pairs();
             self.sync_writ_render_buffer(previous_revision, edit.range, &edit.replacement);
             self.editor_marked_range = None;
             self.editor_selection.collapse(self.state.cursor());
@@ -1863,6 +1865,112 @@ impl SynapseApp {
         self.editor_visible_range = line..line.saturating_add(1);
     }
 
+    fn ensure_code_auto_pairs_for_active_document(&mut self) {
+        let active_path = self
+            .state
+            .active_document()
+            .map(|document| document.relative_path().to_path_buf());
+        if self.code_auto_pair_document != active_path {
+            self.code_auto_pair_document = active_path;
+            self.code_auto_pairs.clear();
+        }
+    }
+
+    pub(in crate::app) fn code_text_input_behavior(
+        &mut self,
+        source: &str,
+        range: Range<usize>,
+        inserted: &str,
+    ) -> Option<CodeTextInput> {
+        self.ensure_code_auto_pairs_for_active_document();
+        code_text_input(source, range, inserted, &self.code_auto_pairs)
+    }
+
+    pub(in crate::app) fn apply_code_editor_edit(
+        &mut self,
+        edit: CodeEdit,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let previous_revision = self
+            .state
+            .active_document()
+            .map_or(0, |document| document.revision());
+        let cache_range = edit.range.clone();
+        if self
+            .state
+            .replace_active_range(edit.range, &edit.replacement)
+            .is_err()
+        {
+            return false;
+        }
+        self.sync_writ_render_buffer(previous_revision, cache_range, &edit.replacement);
+        if let Some(pair) = edit.new_pair {
+            self.ensure_code_auto_pairs_for_active_document();
+            self.code_auto_pairs.push(pair);
+        }
+        if let Some(selection) = edit.selection {
+            self.editor_selection.collapse(selection.start);
+            self.editor_selection.select_to(selection.end);
+            self.state.set_cursor(selection.end);
+            self.selection_menu_mode = SelectionMenuMode::Formatting;
+        } else {
+            self.state.set_cursor(edit.cursor);
+            self.editor_selection.collapse(edit.cursor);
+        }
+        self.editor_marked_range = None;
+        self.refresh_slash_menu(cx);
+        self.restart_editor_cursor_blink(cx);
+        cx.notify();
+        true
+    }
+
+    pub(in crate::app) fn skip_code_auto_pair_closer(
+        &mut self,
+        cursor: usize,
+        cx: &mut Context<Self>,
+    ) {
+        self.ensure_code_auto_pairs_for_active_document();
+        self.code_auto_pairs.retain(|pair| pair.close != cursor - 1);
+        self.state.set_cursor(cursor);
+        self.editor_selection.collapse(cursor);
+        self.editor_marked_range = None;
+        self.restart_editor_cursor_blink(cx);
+        cx.notify();
+    }
+
+    pub(in crate::app) fn indent_code_block(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(source) = self.state.active_document().map(|document| document.text()) else {
+            return false;
+        };
+        let Some(edit) = code_indent_edit(&source, self.editor_selection.range()) else {
+            return false;
+        };
+        self.apply_code_editor_edit(edit, cx)
+    }
+
+    pub(in crate::app) fn outdent_code_block(
+        &mut self,
+        _: &OutdentCodeBlock,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(source) = self.state.active_document().map(|document| document.text()) else {
+            return;
+        };
+        if let Some(edit) = code_outdent_edit(&source, self.editor_selection.range()) {
+            self.apply_code_editor_edit(edit, cx);
+        }
+        cx.stop_propagation();
+    }
+
+    fn clear_code_auto_pairs(&mut self) {
+        self.code_auto_pairs.clear();
+        self.code_auto_pair_document = self
+            .state
+            .active_document()
+            .map(|document| document.relative_path().to_path_buf());
+    }
+
     pub(in crate::app) fn backspace(
         &mut self,
         _: &Backspace,
@@ -1870,14 +1978,24 @@ impl SynapseApp {
         cx: &mut Context<Self>,
     ) {
         self.editor_marked_range = None;
+        let source = self.state.active_document().map(|document| document.text());
         let previous_revision = self
             .state
             .active_document()
             .map_or(0, |document| document.revision());
         let edit = if self.editor_selection.is_empty() {
             let cursor = self.state.cursor();
-            let _ = self.state.backspace();
-            cursor.checked_sub(1).map(|start| start..cursor)
+            self.ensure_code_auto_pairs_for_active_document();
+            let paired_range: Option<Range<usize>> = source
+                .as_deref()
+                .and_then(|source| paired_backspace_range(source, cursor, &self.code_auto_pairs));
+            if let Some(range) = paired_range {
+                let _ = self.state.replace_active_range(range.clone(), "");
+                Some(range)
+            } else {
+                let _ = self.state.backspace();
+                cursor.checked_sub(1).map(|start| start..cursor)
+            }
         } else {
             let range = self.editor_selection.range();
             let _ = self.state.replace_active_range(range.clone(), "");
@@ -1900,6 +2018,7 @@ impl SynapseApp {
         cx: &mut Context<Self>,
     ) {
         self.editor_marked_range = None;
+        let source = self.state.active_document().map(|document| document.text());
         let previous_revision = self
             .state
             .active_document()
@@ -1910,8 +2029,17 @@ impl SynapseApp {
             .map_or(0, |document| document.len_chars());
         let edit = if self.editor_selection.is_empty() {
             let cursor = self.state.cursor();
-            let _ = self.state.delete_forward();
-            (cursor < document_len).then_some(cursor..cursor + 1)
+            self.ensure_code_auto_pairs_for_active_document();
+            let paired_range: Option<Range<usize>> = source.as_deref().and_then(|source| {
+                paired_delete_forward_range(source, cursor, &self.code_auto_pairs)
+            });
+            if let Some(range) = paired_range {
+                let _ = self.state.replace_active_range(range.clone(), "");
+                Some(range)
+            } else {
+                let _ = self.state.delete_forward();
+                (cursor < document_len).then_some(cursor..cursor + 1)
+            }
         } else {
             let range = self.editor_selection.range();
             let _ = self.state.replace_active_range(range.clone(), "");
@@ -2120,16 +2248,36 @@ impl SynapseApp {
         self.dismiss_context_menus(cx);
     }
 
+    pub(in crate::app) fn copy_code_block(&mut self, range: Range<usize>, cx: &mut Context<Self>) {
+        let Some(text) = self.state.active_document().map(|document| document.text()) else {
+            return;
+        };
+        if range.start > range.end || range.end > text.chars().count() {
+            return;
+        }
+        let code = text
+            .chars()
+            .skip(range.start)
+            .take(range.len())
+            .collect::<String>();
+        cx.write_to_clipboard(ClipboardItem::new_string(code));
+    }
+
     pub(in crate::app) fn cut(&mut self, _: &Cut, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(text) = self.selected_editor_text() {
             cx.write_to_clipboard(ClipboardItem::new_string(text));
-            let _ = self
+            let previous_revision = self
                 .state
-                .replace_active_range(self.editor_selection.range(), "");
-            self.editor_selection.collapse(self.state.cursor());
-            self.refresh_slash_menu(cx);
-            self.restart_editor_cursor_blink(cx);
-            cx.notify();
+                .active_document()
+                .map_or(0, |document| document.revision());
+            let range = self.editor_selection.range();
+            if self.state.replace_active_range(range.clone(), "").is_ok() {
+                self.sync_writ_render_buffer(previous_revision, range, "");
+                self.editor_selection.collapse(self.state.cursor());
+                self.refresh_slash_menu(cx);
+                self.restart_editor_cursor_blink(cx);
+                cx.notify();
+            }
         }
         cx.stop_propagation();
     }
@@ -2158,14 +2306,23 @@ impl SynapseApp {
                 });
             match image_markdown {
                 Ok(markdown) => {
-                    let _ = self
+                    let previous_revision = self
                         .state
-                        .replace_active_range(self.editor_selection.range(), &markdown);
-                    self.editor_selection.collapse(self.state.cursor());
-                    self.editor_marked_range = None;
-                    self.refresh_slash_menu(cx);
-                    self.restart_editor_cursor_blink(cx);
-                    cx.notify();
+                        .active_document()
+                        .map_or(0, |document| document.revision());
+                    let range = self.editor_selection.range();
+                    if self
+                        .state
+                        .replace_active_range(range.clone(), &markdown)
+                        .is_ok()
+                    {
+                        self.sync_writ_render_buffer(previous_revision, range, &markdown);
+                        self.editor_selection.collapse(self.state.cursor());
+                        self.editor_marked_range = None;
+                        self.refresh_slash_menu(cx);
+                        self.restart_editor_cursor_blink(cx);
+                        cx.notify();
+                    }
                 }
                 Err(error) => self
                     .state
@@ -2173,14 +2330,23 @@ impl SynapseApp {
             }
         } else if let Some(text) = item.text() {
             let text = normalize_clipboard_text(&text);
-            let _ = self
+            let previous_revision = self
                 .state
-                .replace_active_range(self.editor_selection.range(), &text);
-            self.editor_selection.collapse(self.state.cursor());
-            self.editor_marked_range = None;
-            self.refresh_slash_menu(cx);
-            self.restart_editor_cursor_blink(cx);
-            cx.notify();
+                .active_document()
+                .map_or(0, |document| document.revision());
+            let range = self.editor_selection.range();
+            if self
+                .state
+                .replace_active_range(range.clone(), &text)
+                .is_ok()
+            {
+                self.sync_writ_render_buffer(previous_revision, range, &text);
+                self.editor_selection.collapse(self.state.cursor());
+                self.editor_marked_range = None;
+                self.refresh_slash_menu(cx);
+                self.restart_editor_cursor_blink(cx);
+                cx.notify();
+            }
         }
         cx.stop_propagation();
     }
@@ -2248,11 +2414,26 @@ impl SynapseApp {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let Some(source) = self.state.active_document().map(|document| document.text()) else {
+            return;
+        };
+        let range = self.editor_selection.range();
+        if let Some(input) = self.code_text_input_behavior(&source, range.clone(), "`") {
+            match input {
+                CodeTextInput::Edit(edit) => {
+                    self.apply_code_editor_edit(edit, cx);
+                }
+                CodeTextInput::SkipTrackedCloser { cursor } => {
+                    self.skip_code_auto_pair_closer(cursor, cx);
+                }
+            }
+            cx.stop_propagation();
+            return;
+        }
         let previous_revision = self
             .state
             .active_document()
             .map_or(0, |document| document.revision());
-        let range = self.editor_selection.range();
         if self.state.replace_active_range(range.clone(), "`").is_ok() {
             self.sync_writ_render_buffer(previous_revision, range, "`");
             self.editor_marked_range = None;
@@ -2274,18 +2455,61 @@ impl SynapseApp {
             return;
         }
         self.editor_marked_range = None;
-        if self.editor_selection.is_empty() {
-            let _ = self.state.smart_enter();
+        let Some(source) = self.state.active_document().map(|document| document.text()) else {
+            return;
+        };
+        let selection = self.editor_selection.range();
+        if selection.is_empty() {
+            let cursor = self.state.cursor();
+            // Preserve Markdown's third-Enter code-fence exit behavior before
+            // applying language-aware indentation within the block.
+            let markdown_edit = smart_enter_edit(&source, cursor);
+            if code_block_exit_requested(&source, cursor) {
+                self.apply_code_editor_edit(
+                    CodeEdit {
+                        range: markdown_edit.range,
+                        replacement: markdown_edit.replacement,
+                        cursor: markdown_edit.cursor,
+                        selection: None,
+                        new_pair: None,
+                    },
+                    cx,
+                );
+                self.begin_close_slash_menu(cx);
+                cx.stop_propagation();
+                return;
+            }
+            self.ensure_code_auto_pairs_for_active_document();
+            if let Some(edit) = code_newline_edit(&source, cursor, &self.code_auto_pairs) {
+                self.apply_code_editor_edit(edit, cx);
+                self.begin_close_slash_menu(cx);
+                cx.stop_propagation();
+                return;
+            }
+            self.apply_code_editor_edit(
+                CodeEdit {
+                    range: markdown_edit.range,
+                    replacement: markdown_edit.replacement,
+                    cursor: markdown_edit.cursor,
+                    selection: None,
+                    new_pair: None,
+                },
+                cx,
+            );
         } else {
-            let _ = self
-                .state
-                .replace_active_range(self.editor_selection.range(), "\n");
+            self.apply_code_editor_edit(
+                CodeEdit {
+                    range: selection,
+                    replacement: "\n".to_owned(),
+                    cursor: self.editor_selection.range().start + 1,
+                    selection: None,
+                    new_pair: None,
+                },
+                cx,
+            );
         }
-        self.editor_selection.collapse(self.state.cursor());
         self.begin_close_slash_menu(cx);
-        self.restart_editor_cursor_blink(cx);
         cx.stop_propagation();
-        cx.notify();
     }
 
     pub(in crate::app) fn insert_raw_newline(
@@ -2295,14 +2519,19 @@ impl SynapseApp {
         cx: &mut Context<Self>,
     ) {
         self.editor_marked_range = None;
-        let _ = self
-            .state
-            .replace_active_range(self.editor_selection.range(), "\n");
-        self.editor_selection.collapse(self.state.cursor());
+        let range = self.editor_selection.range();
+        self.apply_code_editor_edit(
+            CodeEdit {
+                cursor: range.start + 1,
+                range,
+                replacement: "\n".to_owned(),
+                selection: None,
+                new_pair: None,
+            },
+            cx,
+        );
         self.begin_close_slash_menu(cx);
-        self.restart_editor_cursor_blink(cx);
         cx.stop_propagation();
-        cx.notify();
     }
 
     pub(in crate::app) fn extend_editor_selection(&mut self, cx: &mut Context<Self>) {
@@ -2686,6 +2915,10 @@ impl SynapseApp {
         cx: &mut Context<Self>,
     ) {
         if self.execute_selected_slash_command(window, cx) {
+            cx.stop_propagation();
+            return;
+        }
+        if self.indent_code_block(cx) {
             cx.stop_propagation();
         }
     }
@@ -3155,6 +3388,8 @@ impl SynapseApp {
         range: Range<usize>,
         replacement: &str,
     ) {
+        self.ensure_code_auto_pairs_for_active_document();
+        adjust_auto_pairs(&mut self.code_auto_pairs, &range, replacement);
         let Some(cache) = self.editor_render_cache.as_mut() else {
             return;
         };
@@ -3174,5 +3409,14 @@ impl SynapseApp {
             .writ_buffer
             .replace(byte_start..byte_end, replacement, byte_start);
         cache.writ_revision = document.revision();
+        // Multiple IME events can be coalesced before the next render. In that
+        // uncommon case, fall back to one fresh parse instead of applying an
+        // incremental edit against the wrong source revision.
+        if cache.code_syntax_edit.is_some() {
+            cache.code_syntax_cache = CodeSyntaxCache::default();
+            cache.code_syntax_edit = None;
+        } else {
+            cache.code_syntax_edit = Some(CodeSyntaxEdit::new(range, replacement));
+        }
     }
 }

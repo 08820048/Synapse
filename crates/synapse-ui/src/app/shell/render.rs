@@ -167,7 +167,7 @@ impl Render for SynapseApp {
                         )
                     })
                     .map(|cache| cache.image_previews.clone());
-                let cached_writ_buffer = self
+                let (cached_writ_buffer, mut code_syntax_cache, code_syntax_edit) = self
                     .editor_render_cache
                     .take()
                     .filter(|cache| {
@@ -177,7 +177,14 @@ impl Render for SynapseApp {
                             && cache.relative_path == relative_path
                             && cache.writ_revision == revision
                     })
-                    .map(|cache| cache.writ_buffer);
+                    .map(|cache| {
+                        (
+                            Some(cache.writ_buffer),
+                            cache.code_syntax_cache,
+                            cache.code_syntax_edit,
+                        )
+                    })
+                    .unwrap_or_else(|| (None, CodeSyntaxCache::default(), None));
                 let text = (source_mode || cached_writ_buffer.is_none()).then(|| document.text());
                 let mut writ_buffer = cached_writ_buffer.unwrap_or_else(|| {
                     text.as_deref()
@@ -194,7 +201,13 @@ impl Render for SynapseApp {
                         true,
                     )
                 } else {
-                    source_lines_from_buffer(&mut writ_buffer, cursor, dark_mode)
+                    source_lines_from_buffer_with_syntax_cache(
+                        &mut writ_buffer,
+                        cursor,
+                        dark_mode,
+                        &mut code_syntax_cache,
+                        code_syntax_edit.as_ref(),
+                    )
                 };
                 let parsed = Rc::new(parsed_lines.into_iter().map(Rc::new).collect::<Vec<_>>());
                 if let Some(previous_lines) = previous_lines {
@@ -247,6 +260,8 @@ impl Render for SynapseApp {
                     source_mode,
                     writ_revision: revision,
                     writ_buffer,
+                    code_syntax_cache,
+                    code_syntax_edit: None,
                     lines: parsed.clone(),
                     outline: outline.clone(),
                     mermaid_previews: mermaid_previews.clone(),
@@ -370,6 +385,7 @@ impl Render for SynapseApp {
                 .on_action(cx.listener(Self::toggle_code_block))
                 .on_action(cx.listener(Self::insert_newline))
                 .on_action(cx.listener(Self::insert_raw_newline))
+                .on_action(cx.listener(Self::outdent_code_block))
                 .on_action(cx.listener(Self::accept_slash_command))
                 .on_action(cx.listener(Self::dismiss_slash_menu_action))
                 .on_mouse_down(MouseButton::Left, cx.listener(Self::editor_mouse_down))

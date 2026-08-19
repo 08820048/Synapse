@@ -6,6 +6,10 @@ use gpui::{
     PaintQuad, Pixels, SharedString, StrikethroughStyle, Style, TextRun, UTF16Selection,
     UnderlineStyle, Window, WrappedLine, fill, point, px, relative, rgba, size,
 };
+use gpui_component::highlighter::{
+    HighlightTheme, SyntaxHighlightEdit, SyntaxHighlightPoint, SyntaxHighlighter,
+};
+use ropey2::Rope as HighlightRope;
 use writ::{
     buffer::Buffer,
     callout::{CalloutInfo, CalloutKind},
@@ -15,7 +19,7 @@ use writ::{
     segment_map::{SegmentMap, Special},
 };
 
-use super::super::SynapseApp;
+use super::{super::SynapseApp, code_block::CodeTextInput};
 
 const LIST_BULLET_DIAMETER: f32 = 5.0;
 const LIST_BULLET_OPTICAL_Y_OFFSET: f32 = -0.5;
@@ -142,6 +146,41 @@ pub struct MarkdownStyleRun {
     pub syntax_rgba: Option<u32>,
 }
 
+/// A document edit expressed in character offsets for incremental code parsing.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CodeSyntaxEdit {
+    pub range: Range<usize>,
+    pub replacement: String,
+}
+
+impl CodeSyntaxEdit {
+    pub fn new(range: Range<usize>, replacement: impl Into<String>) -> Self {
+        Self {
+            range,
+            replacement: replacement.into(),
+        }
+    }
+}
+
+/// Retains one Tree-sitter parser per rendered code block between editor frames.
+///
+/// The cache is deliberately owned by the editor render cache rather than a global
+/// singleton: it follows the active document and is discarded with it.
+#[derive(Default)]
+pub struct CodeSyntaxCache {
+    entries: Vec<CachedCodeSyntax>,
+    staged_entries: Vec<CachedCodeSyntax>,
+}
+
+struct CachedCodeSyntax {
+    language: String,
+    source: String,
+    content_range: Range<usize>,
+    dark_mode: bool,
+    highlighter: SyntaxHighlighter,
+    rendered_runs: Vec<Vec<MarkdownStyleRun>>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MarkdownLinePresentation {
     pub display: String,
@@ -169,13 +208,18 @@ pub struct MarkdownQuoteLine {
     pub is_last: bool,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MarkdownCodeLine {
     pub is_fence: bool,
     pub is_opening_fence: bool,
     pub is_closing_fence: bool,
     pub is_first_content: bool,
     pub is_last_content: bool,
+    /// Human-readable language label from the opening code fence.
+    pub language: String,
+    /// Source-character bounds of the code content, excluding its fences.
+    pub content_start_char: usize,
+    pub content_end_char: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -324,6 +368,23 @@ pub fn source_lines_from_buffer(
     cursor: usize,
     dark_mode: bool,
 ) -> Vec<SourceLine> {
+    let mut code_syntax_cache = CodeSyntaxCache::default();
+    source_lines_from_buffer_with_syntax_cache(
+        buffer,
+        cursor,
+        dark_mode,
+        &mut code_syntax_cache,
+        None,
+    )
+}
+
+pub fn source_lines_from_buffer_with_syntax_cache(
+    buffer: &mut Buffer,
+    cursor: usize,
+    dark_mode: bool,
+    code_syntax_cache: &mut CodeSyntaxCache,
+    code_syntax_edit: Option<&CodeSyntaxEdit>,
+) -> Vec<SourceLine> {
     let snapshot = buffer.render_snapshot();
     let styles_by_line = snapshot.inline_styles_by_line();
     // The default editor is a persistent rich presentation. Keep the render caret
@@ -428,7 +489,13 @@ pub fn source_lines_from_buffer(
     annotate_table_rows(&mut lines, &raw_lines);
     annotate_quote_lines(&mut lines);
     annotate_callout_lines(&mut lines, snapshot.callouts());
-    annotate_code_lines(&mut lines, &raw_lines);
+    annotate_code_lines(
+        &mut lines,
+        &raw_lines,
+        dark_mode,
+        code_syntax_cache,
+        code_syntax_edit,
+    );
     reveal_incomplete_fence_input(&mut lines, &raw_lines, cursor);
     annotate_mermaid_blocks(&mut lines, &raw_lines);
     annotate_math(&mut lines, &raw_lines);
@@ -956,7 +1023,14 @@ fn markdown_callout_kind(kind: CalloutKind) -> MarkdownCalloutKind {
     }
 }
 
-fn annotate_code_lines(lines: &mut [SourceLine], raw_lines: &[&str]) {
+fn annotate_code_lines(
+    lines: &mut [SourceLine],
+    raw_lines: &[&str],
+    dark_mode: bool,
+    code_syntax_cache: &mut CodeSyntaxCache,
+    code_syntax_edit: Option<&CodeSyntaxEdit>,
+) {
+    code_syntax_cache.begin_render();
     let limit = lines.len().min(raw_lines.len());
     let mut start = 0;
     while start < limit {
@@ -978,6 +1052,18 @@ fn annotate_code_lines(lines: &mut [SourceLine], raw_lines: &[&str]) {
         let first_fence = fences.iter().position(|is_fence| *is_fence);
         let last_fence = fences.iter().rposition(|is_fence| *is_fence);
         let has_closing_fence = first_fence.is_some() && last_fence != first_fence;
+        let language = first_fence
+            .map(|offset| code_block_language(raw_lines[start + offset]))
+            .unwrap_or_else(CodeBlockLanguage::plain);
+        let content_start_char = first_content
+            .map(|offset| lines[start + offset].start_char)
+            .unwrap_or_else(|| lines[start].start_char + lines[start].source_len_chars);
+        let content_end_char = last_content
+            .map(|offset| {
+                let line = &lines[start + offset];
+                line.start_char + line.source_len_chars
+            })
+            .unwrap_or(content_start_char);
 
         for (offset, is_fence) in fences.into_iter().enumerate() {
             lines[start + offset].presentation.code_line = Some(MarkdownCodeLine {
@@ -988,7 +1074,22 @@ fn annotate_code_lines(lines: &mut [SourceLine], raw_lines: &[&str]) {
                     && last_fence != first_fence,
                 is_first_content: first_content == Some(offset),
                 is_last_content: last_content == Some(offset),
+                language: language.label.clone(),
+                content_start_char,
+                content_end_char,
             });
+        }
+        if let (Some(first_content), Some(last_content), Some(highlighter_language)) =
+            (first_content, last_content, language.highlighter)
+        {
+            code_syntax_cache.apply(
+                &mut lines[start + first_content..=start + last_content],
+                &raw_lines[start + first_content..=start + last_content],
+                highlighter_language,
+                content_start_char..content_end_char,
+                dark_mode,
+                code_syntax_edit,
+            );
         }
         if !has_closing_fence && let Some(opening_offset) = first_fence {
             // A newly typed fence must remain visible until Enter inserts the closing fence;
@@ -999,6 +1100,352 @@ fn annotate_code_lines(lines: &mut [SourceLine], raw_lines: &[&str]) {
         }
         start = end;
     }
+    code_syntax_cache.finish_render();
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CodeBlockLanguage {
+    label: String,
+    highlighter: Option<&'static str>,
+}
+
+impl CodeBlockLanguage {
+    fn plain() -> Self {
+        Self {
+            label: "Plain text".to_owned(),
+            highlighter: None,
+        }
+    }
+}
+
+fn code_block_language(fence: &str) -> CodeBlockLanguage {
+    let Some(identifier) = code_fence_language_identifier(fence) else {
+        return CodeBlockLanguage::plain();
+    };
+    let normalized = identifier.to_ascii_lowercase();
+    let (label, highlighter) = match normalized.as_str() {
+        "bash" | "sh" | "shell" | "zsh" | "fish" => ("Shell", Some("bash")),
+        "c" => ("C", Some("c")),
+        "cpp" | "c++" | "cc" | "cxx" | "hpp" | "hxx" => ("C++", Some("cpp")),
+        "csharp" | "c#" | "cs" | "dotnet" => ("C#", Some("csharp")),
+        "cmake" => ("CMake", Some("cmake")),
+        "css" | "scss" | "less" => ("CSS", Some("css")),
+        "diff" | "patch" => ("Diff", Some("diff")),
+        "ejs" => ("EJS", Some("ejs")),
+        "elixir" | "ex" | "exs" => ("Elixir", Some("elixir")),
+        "erb" => ("ERB", Some("erb")),
+        "go" | "golang" => ("Go", Some("go")),
+        "graphql" | "gql" => ("GraphQL", Some("graphql")),
+        "html" | "htm" | "xml" | "svg" | "vue" | "svelte" => ("HTML", Some("html")),
+        "java" => ("Java", Some("java")),
+        "javascript" | "js" | "mjs" | "cjs" | "node" | "nodejs" => {
+            ("JavaScript", Some("javascript"))
+        }
+        "jsx" => ("JSX", Some("tsx")),
+        "jsdoc" => ("JSDoc", Some("jsdoc")),
+        "json" | "jsonc" | "json5" => ("JSON", Some("json")),
+        "make" | "makefile" => ("Makefile", Some("make")),
+        "markdown" | "md" | "mdx" => ("Markdown", Some("markdown")),
+        "mermaid" => ("Mermaid", None),
+        "proto" | "protobuf" => ("Protocol Buffers", Some("proto")),
+        "python" | "py" | "py3" | "python3" => ("Python", Some("python")),
+        "ruby" | "rb" => ("Ruby", Some("ruby")),
+        "rust" | "rs" => ("Rust", Some("rust")),
+        "scala" | "sc" => ("Scala", Some("scala")),
+        "sql" | "postgres" | "mysql" | "sqlite" => ("SQL", Some("sql")),
+        "swift" => ("Swift", Some("swift")),
+        "toml" => ("TOML", Some("toml")),
+        "tsx" => ("TSX", Some("tsx")),
+        "typescript" | "ts" | "dts" => ("TypeScript", Some("typescript")),
+        "yaml" | "yml" => ("YAML", Some("yaml")),
+        "zig" => ("Zig", Some("zig")),
+        "latex" | "tex" => ("LaTeX", None),
+        "plaintext" | "text" | "txt" | "plain" | "none" => ("Plain text", None),
+        "dockerfile" => ("Dockerfile", Some("bash")),
+        "kotlin" | "kt" => ("Kotlin", None),
+        "lua" => ("Lua", None),
+        "php" => ("PHP", None),
+        "powershell" | "ps1" | "pwsh" => ("PowerShell", None),
+        "dart" => ("Dart", None),
+        "r" => ("R", None),
+        "haskell" | "hs" => ("Haskell", None),
+        "clojure" | "clj" => ("Clojure", None),
+        "ini" | "cfg" | "conf" => ("INI", None),
+        _ => {
+            return CodeBlockLanguage {
+                label: identifier.chars().take(32).collect(),
+                highlighter: None,
+            };
+        }
+    };
+    CodeBlockLanguage {
+        label: label.to_owned(),
+        highlighter,
+    }
+}
+
+fn code_fence_language_identifier(source: &str) -> Option<&str> {
+    let trimmed = source.trim_start();
+    let marker = trimmed
+        .chars()
+        .next()
+        .filter(|marker| matches!(marker, '`' | '~'))?;
+    let marker_len = trimmed
+        .chars()
+        .take_while(|character| *character == marker)
+        .count();
+    (marker_len >= 3)
+        .then(|| trimmed[marker_len..].split_whitespace().next())
+        .flatten()
+        .filter(|identifier| !identifier.is_empty())
+}
+
+impl CodeSyntaxCache {
+    fn begin_render(&mut self) {
+        self.staged_entries.clear();
+    }
+
+    fn finish_render(&mut self) {
+        self.entries = std::mem::take(&mut self.staged_entries);
+    }
+
+    fn apply(
+        &mut self,
+        lines: &mut [SourceLine],
+        raw_lines: &[&str],
+        language: &str,
+        content_range: Range<usize>,
+        dark_mode: bool,
+        document_edit: Option<&CodeSyntaxEdit>,
+    ) {
+        let source = raw_lines.join("\n");
+        if source.is_empty() {
+            return;
+        }
+
+        let exact_entry = self
+            .entries
+            .iter()
+            .position(|entry| entry.language == language && entry.source == source);
+        let incremental_entry = exact_entry.or_else(|| {
+            document_edit.and_then(|edit| {
+                self.entries.iter().position(|entry| {
+                    entry.language == language
+                        && incremental_syntax_edit(entry, edit, &source).is_some()
+                })
+            })
+        });
+        let mut entry = incremental_entry
+            .map(|index| self.entries.swap_remove(index))
+            .unwrap_or_else(|| CachedCodeSyntax {
+                language: language.to_owned(),
+                source: String::new(),
+                content_range: content_range.clone(),
+                dark_mode,
+                highlighter: SyntaxHighlighter::new(language),
+                rendered_runs: Vec::new(),
+            });
+
+        let source_changed = entry.source != source;
+        if source_changed {
+            let source_rope = HighlightRope::from_str(&source);
+            if let Some(edit) =
+                document_edit.and_then(|edit| incremental_syntax_edit(&entry, edit, &source))
+            {
+                entry.highlighter.update_incremental(edit, &source_rope);
+            } else {
+                entry.highlighter = SyntaxHighlighter::new(language);
+                entry.highlighter.update(None, &source_rope);
+            }
+            entry.source = source;
+        }
+
+        if !source_changed
+            && entry.dark_mode == dark_mode
+            && cached_runs_match(lines, &entry.rendered_runs)
+        {
+            for (line, runs) in lines.iter_mut().zip(entry.rendered_runs.iter()) {
+                line.presentation.runs = runs.clone();
+            }
+        } else {
+            let styles = syntax_highlight_styles(&entry.highlighter, entry.source.len(), dark_mode);
+            apply_code_syntax_styles(lines, raw_lines, &styles);
+            entry.dark_mode = dark_mode;
+            entry.rendered_runs = lines
+                .iter()
+                .map(|line| line.presentation.runs.clone())
+                .collect();
+        }
+        entry.content_range = content_range;
+        self.staged_entries.push(entry);
+    }
+}
+
+fn cached_runs_match(lines: &[SourceLine], cached_runs: &[Vec<MarkdownStyleRun>]) -> bool {
+    lines.len() == cached_runs.len()
+        && lines.iter().zip(cached_runs).all(|(line, runs)| {
+            line.presentation.display.len() == runs.iter().map(|run| run.len).sum::<usize>()
+        })
+}
+
+fn syntax_highlight_styles(
+    highlighter: &SyntaxHighlighter,
+    source_len: usize,
+    dark_mode: bool,
+) -> Vec<(Range<usize>, u32)> {
+    let highlight_theme = if dark_mode {
+        HighlightTheme::default_dark()
+    } else {
+        HighlightTheme::default_light()
+    };
+    highlighter
+        .styles(&(0..source_len), &highlight_theme)
+        .into_iter()
+        .filter_map(|(range, style)| style.color.map(|color| (range, u32::from(color.to_rgb()))))
+        .collect()
+}
+
+fn apply_code_syntax_styles(
+    lines: &mut [SourceLine],
+    raw_lines: &[&str],
+    styles: &[(Range<usize>, u32)],
+) {
+    if styles.is_empty() {
+        return;
+    }
+    let mut source_offset = 0;
+    for (line, source) in lines.iter_mut().zip(raw_lines.iter().copied()) {
+        apply_code_syntax_to_line(
+            &mut line.presentation.runs,
+            line.presentation.display.len(),
+            source_offset,
+            styles,
+        );
+        source_offset += source.len() + 1;
+    }
+}
+
+fn incremental_syntax_edit(
+    entry: &CachedCodeSyntax,
+    document_edit: &CodeSyntaxEdit,
+    updated_source: &str,
+) -> Option<SyntaxHighlightEdit> {
+    if document_edit.range.start < entry.content_range.start
+        || document_edit.range.end > entry.content_range.end
+    {
+        return None;
+    }
+    let local_range = document_edit.range.start - entry.content_range.start
+        ..document_edit.range.end - entry.content_range.start;
+    let start_byte = char_to_byte(&entry.source, local_range.start);
+    let old_end_byte = char_to_byte(&entry.source, local_range.end);
+    let mut expected_source = String::with_capacity(
+        entry.source.len() + document_edit.replacement.len() - (old_end_byte - start_byte),
+    );
+    expected_source.push_str(&entry.source[..start_byte]);
+    expected_source.push_str(&document_edit.replacement);
+    expected_source.push_str(&entry.source[old_end_byte..]);
+    if expected_source != updated_source {
+        return None;
+    }
+
+    let start_position = syntax_highlight_point(&entry.source, start_byte);
+    Some(SyntaxHighlightEdit {
+        start_byte,
+        old_end_byte,
+        new_end_byte: start_byte + document_edit.replacement.len(),
+        start_position,
+        old_end_position: syntax_highlight_point(&entry.source, old_end_byte),
+        new_end_position: syntax_highlight_point_after(start_position, &document_edit.replacement),
+    })
+}
+
+fn syntax_highlight_point(source: &str, byte_offset: usize) -> SyntaxHighlightPoint {
+    let prefix = &source[..byte_offset];
+    let row = prefix.bytes().filter(|byte| *byte == b'\n').count();
+    let column = prefix
+        .rfind('\n')
+        .map_or(prefix.len(), |newline| prefix.len() - newline - 1);
+    SyntaxHighlightPoint { row, column }
+}
+
+fn syntax_highlight_point_after(
+    start: SyntaxHighlightPoint,
+    inserted: &str,
+) -> SyntaxHighlightPoint {
+    let inserted_rows = inserted.bytes().filter(|byte| *byte == b'\n').count();
+    if inserted_rows == 0 {
+        return SyntaxHighlightPoint {
+            row: start.row,
+            column: start.column + inserted.len(),
+        };
+    }
+    SyntaxHighlightPoint {
+        row: start.row + inserted_rows,
+        column: inserted
+            .rfind('\n')
+            .map_or(inserted.len(), |newline| inserted.len() - newline - 1),
+    }
+}
+
+fn apply_code_syntax_to_line(
+    runs: &mut Vec<MarkdownStyleRun>,
+    line_len: usize,
+    source_offset: usize,
+    styles: &[(Range<usize>, u32)],
+) {
+    if runs.is_empty() || line_len == 0 {
+        return;
+    }
+    let line_range = source_offset..source_offset + line_len;
+    let mut boundaries = vec![0, line_len];
+    let mut run_offset = 0;
+    for run in runs.iter() {
+        run_offset = (run_offset + run.len).min(line_len);
+        boundaries.push(run_offset);
+    }
+    for (range, _) in styles {
+        if range.start < line_range.end && range.end > line_range.start {
+            boundaries.push(range.start.max(line_range.start) - line_range.start);
+            boundaries.push(range.end.min(line_range.end) - line_range.start);
+        }
+    }
+    boundaries.sort_unstable();
+    boundaries.dedup();
+
+    let previous_runs = std::mem::take(runs);
+    let mut result = Vec::with_capacity(boundaries.len().saturating_sub(1));
+    let mut run_index = 0;
+    let mut run_end = previous_runs.first().map_or(0, |run| run.len);
+    for boundary in boundaries.windows(2) {
+        let start = boundary[0];
+        let end = boundary[1];
+        if start == end {
+            continue;
+        }
+        while start >= run_end && run_index + 1 < previous_runs.len() {
+            run_index += 1;
+            run_end += previous_runs[run_index].len;
+        }
+        let Some(previous) = previous_runs.get(run_index) else {
+            continue;
+        };
+        let mut next = previous.clone();
+        next.len = end - start;
+        if let Some((_, color)) = styles.iter().rev().find(|(range, _)| {
+            range.start <= source_offset + start && source_offset + end <= range.end
+        }) {
+            next.syntax_rgba = Some(*color);
+        }
+        if let Some(last) = result.last_mut()
+            && same_markdown_style(last, &next)
+        {
+            last.len += next.len;
+        } else {
+            result.push(next);
+        }
+    }
+    *runs = result;
 }
 
 fn annotate_mermaid_blocks(lines: &mut [SourceLine], raw_lines: &[&str]) {
@@ -1008,6 +1455,7 @@ fn annotate_mermaid_blocks(lines: &mut [SourceLine], raw_lines: &[&str]) {
         let opening = lines[start]
             .presentation
             .code_line
+            .as_ref()
             .is_some_and(|code| code.is_opening_fence);
         if !opening || !is_mermaid_fence(raw_lines[start]) {
             start += 1;
@@ -1018,6 +1466,7 @@ fn annotate_mermaid_blocks(lines: &mut [SourceLine], raw_lines: &[&str]) {
             lines[*index]
                 .presentation
                 .code_line
+                .as_ref()
                 .is_some_and(|code| code.is_closing_fence)
         }) else {
             start += 1;
@@ -2497,6 +2946,22 @@ impl EntityInputHandler for SynapseApp {
             .map(|range| utf16_range_to_char(&source, range))
             .or_else(|| self.editor_marked_range.clone())
             .unwrap_or_else(|| self.editor_selection.range());
+        // IME composition must remain transparent to the platform. Normal committed
+        // single-character input in a fenced code block goes through the code behavior
+        // layer so paired delimiters share the document's existing selection and undo path.
+        if self.editor_marked_range.is_none()
+            && let Some(input) = self.code_text_input_behavior(&source, range.clone(), text)
+        {
+            match input {
+                CodeTextInput::Edit(edit) => {
+                    self.apply_code_editor_edit(edit, cx);
+                }
+                CodeTextInput::SkipTrackedCloser { cursor } => {
+                    self.skip_code_auto_pair_closer(cursor, cx);
+                }
+            }
+            return;
+        }
         let previous_revision = self
             .state
             .active_document()
@@ -2642,10 +3107,11 @@ mod tests {
     use std::{hint::black_box, time::Instant};
 
     use super::{
-        EditorSelection, INLINE_STRONG_WEIGHT, LIST_BULLET_DIAMETER, MarkdownBlockKind,
-        char_byte_boundaries, char_to_byte, footnote_preview_line, hidden_bullet_marker_range,
-        inline_code_byte_ranges, source_lines, source_lines_with_mode, task_preview_line,
-        text_run_from_markdown, visual_row_byte_ranges,
+        CodeSyntaxCache, CodeSyntaxEdit, EditorSelection, INLINE_STRONG_WEIGHT,
+        LIST_BULLET_DIAMETER, MarkdownBlockKind, char_byte_boundaries, char_to_byte,
+        code_block_language, footnote_preview_line, hidden_bullet_marker_range,
+        inline_code_byte_ranges, source_lines, source_lines_from_buffer_with_syntax_cache,
+        source_lines_with_mode, task_preview_line, text_run_from_markdown, visual_row_byte_ranges,
     };
 
     fn present_markdown_line(source: &str) -> super::MarkdownLinePresentation {
@@ -2887,14 +3353,17 @@ mod tests {
         let opening = lines[8]
             .presentation
             .code_line
+            .as_ref()
             .expect("opening fence metadata");
         let content = lines[9]
             .presentation
             .code_line
+            .as_ref()
             .expect("code content metadata");
         let closing = lines[10]
             .presentation
             .code_line
+            .as_ref()
             .expect("closing fence metadata");
         assert!(opening.is_fence && opening.is_opening_fence);
         assert!(content.is_first_content && content.is_last_content);
@@ -2906,6 +3375,161 @@ mod tests {
                 .runs
                 .iter()
                 .any(|run| run.syntax_rgba.is_some())
+        );
+    }
+
+    #[test]
+    fn code_blocks_normalize_common_language_aliases_and_highlight_them() {
+        let typescript = source_lines("```ts\nconst answer: number = 42;\n```", 0, false);
+        let type_script_code = typescript[1]
+            .presentation
+            .code_line
+            .as_ref()
+            .expect("TypeScript code metadata");
+        assert_eq!(type_script_code.language, "TypeScript");
+        assert_eq!(type_script_code.content_start_char, 6);
+        assert_eq!(type_script_code.content_end_char, 32);
+        assert!(
+            typescript[1]
+                .presentation
+                .runs
+                .iter()
+                .any(|run| run.syntax_rgba.is_some())
+        );
+        let dark_typescript = source_lines("```ts\nconst answer: number = 42;\n```", 0, true);
+        assert_ne!(
+            typescript[1]
+                .presentation
+                .runs
+                .iter()
+                .filter_map(|run| run.syntax_rgba)
+                .collect::<Vec<_>>(),
+            dark_typescript[1]
+                .presentation
+                .runs
+                .iter()
+                .filter_map(|run| run.syntax_rgba)
+                .collect::<Vec<_>>()
+        );
+
+        let python = source_lines(
+            "```py\ndef greet(name):\n    return f\"Hi {name}\"\n```",
+            0,
+            true,
+        );
+        assert_eq!(
+            python[1]
+                .presentation
+                .code_line
+                .as_ref()
+                .map(|code| code.language.as_str()),
+            Some("Python")
+        );
+        assert!(
+            python[1..=2]
+                .iter()
+                .flat_map(|line| line.presentation.runs.iter())
+                .any(|run| run.syntax_rgba.is_some())
+        );
+
+        for (language, snippet) in [
+            (
+                "csharp",
+                "public class User { public string Name { get; set; } }",
+            ),
+            ("swift", "import Foundation\nlet greeting = \"Hello\""),
+            ("cmake", "cmake_minimum_required(VERSION 3.20)"),
+            ("graphql", "type User { id: ID! name: String! }"),
+            (
+                "proto",
+                "syntax = \"proto3\"; message User { string name = 1; }",
+            ),
+        ] {
+            let lines = source_lines(&format!("```{language}\n{snippet}\n```"), 0, false);
+            assert!(
+                lines[1..lines.len() - 1]
+                    .iter()
+                    .flat_map(|line| line.presentation.runs.iter())
+                    .any(|run| run.syntax_rgba.is_some()),
+                "expected {language} to produce syntax color runs"
+            );
+        }
+
+        assert_eq!(code_block_language("```c++").label, "C++");
+        assert_eq!(code_block_language("```yml").label, "YAML");
+        assert_eq!(code_block_language("```unknown").label, "unknown");
+    }
+
+    #[test]
+    fn code_syntax_cache_reuses_unchanged_blocks_and_updates_typed_code_incrementally() {
+        let initial = "before\n```rust\nfn main() {\n}\n```\nafter";
+        let mut cache = CodeSyntaxCache::default();
+        let mut initial_buffer = initial.parse().expect("Writ buffer");
+        let initial_lines = source_lines_from_buffer_with_syntax_cache(
+            &mut initial_buffer,
+            0,
+            false,
+            &mut cache,
+            None,
+        );
+        assert_eq!(cache.entries.len(), 1);
+        assert!(
+            initial_lines[2]
+                .presentation
+                .runs
+                .iter()
+                .any(|run| run.syntax_rgba.is_some())
+        );
+
+        let insertion_byte =
+            initial.find('\n').expect("first newline") + "\n```rust\nfn main() {\n".len();
+        let insertion_char = initial[..insertion_byte].chars().count();
+        let inserted = "    println!(\"fast\");\n";
+        let updated = format!(
+            "{}{}{}",
+            &initial[..insertion_byte],
+            inserted,
+            &initial[insertion_byte..]
+        );
+        let mut updated_buffer = updated.parse().expect("updated Writ buffer");
+        let updated_lines = source_lines_from_buffer_with_syntax_cache(
+            &mut updated_buffer,
+            insertion_char,
+            false,
+            &mut cache,
+            Some(&CodeSyntaxEdit::new(
+                insertion_char..insertion_char,
+                inserted,
+            )),
+        );
+
+        assert_eq!(cache.entries.len(), 1);
+        assert_eq!(
+            cache.entries[0].source,
+            "fn main() {\n    println!(\"fast\");\n}"
+        );
+        assert!(
+            updated_lines[3]
+                .presentation
+                .runs
+                .iter()
+                .any(|run| run.syntax_rgba.is_some())
+        );
+
+        let after_edit = CodeSyntaxEdit::new(0..0, "x");
+        let unchanged_code = format!("x{updated}");
+        let mut unchanged_buffer = unchanged_code.parse().expect("unchanged code Writ buffer");
+        source_lines_from_buffer_with_syntax_cache(
+            &mut unchanged_buffer,
+            1,
+            false,
+            &mut cache,
+            Some(&after_edit),
+        );
+        assert_eq!(cache.entries.len(), 1);
+        assert_eq!(
+            cache.entries[0].source,
+            "fn main() {\n    println!(\"fast\");\n}"
         );
     }
 
@@ -2926,12 +3550,14 @@ mod tests {
             complete[0]
                 .presentation
                 .code_line
+                .as_ref()
                 .is_some_and(|line| line.is_opening_fence)
         );
         assert!(
             complete[2]
                 .presentation
                 .code_line
+                .as_ref()
                 .is_some_and(|line| line.is_closing_fence)
         );
         assert_eq!(complete[0].presentation.kind, MarkdownBlockKind::Code);

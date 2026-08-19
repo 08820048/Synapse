@@ -51,7 +51,7 @@ use gpui_component::{
     switch::Switch,
 };
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher as _};
-use synapse::{ShellState, trailing_fenced_code_block_paragraph_edit};
+use synapse::{ShellState, smart_enter_edit, trailing_fenced_code_block_paragraph_edit};
 use synapse_core::{VaultEntry, VaultEntryKind};
 
 mod commands;
@@ -62,6 +62,11 @@ mod ui;
 mod workspaces;
 
 use self::editor::blink::CursorBlinkState;
+use self::editor::code_block::{
+    AutoPair, CodeEdit, CodeTextInput, adjust_auto_pairs, code_block_exit_requested,
+    code_indent_edit, code_newline_edit, code_outdent_edit, code_text_input,
+    paired_backspace_range, paired_delete_forward_range,
+};
 #[cfg(test)]
 use self::editor::document_outline;
 use self::editor::document_outline::{
@@ -75,10 +80,13 @@ use self::editor::slash_command::{
     SlashCommand, note_link_markdown, slash_command_edit, slash_trigger,
 };
 use self::editor::surface as editor_surface;
+#[cfg(test)]
+use self::editor::surface::source_lines_from_buffer;
 use self::editor::surface::{
-    EditorLineLayout, EditorSelection, MarkdownBlockKind, MarkdownCalloutKind, MarkdownImage,
-    MarkdownInlineFootnote, MarkdownInlineMath, MarkdownLineElement, MarkdownTableRow, SourceLine,
-    footnote_preview_line, source_lines_from_buffer, source_lines_with_mode, task_preview_line,
+    CodeSyntaxCache, CodeSyntaxEdit, EditorLineLayout, EditorSelection, MarkdownBlockKind,
+    MarkdownCalloutKind, MarkdownImage, MarkdownInlineFootnote, MarkdownInlineMath,
+    MarkdownLineElement, MarkdownTableRow, SourceLine, footnote_preview_line,
+    source_lines_from_buffer_with_syntax_cache, source_lines_with_mode, task_preview_line,
 };
 use self::platform::http_client::SynapseHttpClient;
 use self::platform::updater;
@@ -1285,6 +1293,7 @@ actions!(
         ToggleCodeBlock,
         InsertNewline,
         InsertRawNewline,
+        OutdentCodeBlock,
         AcceptSlashCommand,
         DismissSlashMenu,
         OpenCommandPalette,
@@ -1385,6 +1394,8 @@ struct SynapseApp {
     collapsed_directories: BTreeSet<PathBuf>,
     editor_marked_range: Option<Range<usize>>,
     editor_selection: EditorSelection,
+    code_auto_pair_document: Option<PathBuf>,
+    code_auto_pairs: Vec<AutoPair>,
     selection_menu_mode: SelectionMenuMode,
     slash_menu: Option<SlashMenuState>,
     note_link_picker: Option<NoteLinkPickerState>,
@@ -1410,6 +1421,8 @@ struct EditorRenderCache {
     source_mode: bool,
     writ_revision: u64,
     writ_buffer: writ::buffer::Buffer,
+    code_syntax_cache: CodeSyntaxCache,
+    code_syntax_edit: Option<CodeSyntaxEdit>,
     lines: Rc<Vec<Rc<SourceLine>>>,
     outline: Rc<Vec<DocumentOutlineEntry>>,
     mermaid_previews: Rc<BTreeMap<usize, MermaidPreview>>,
@@ -2841,6 +2854,7 @@ pub(crate) fn run() {
                 KeyBinding::new("enter", InsertNewline, Some("SynapseEditor")),
                 KeyBinding::new("shift-enter", InsertRawNewline, Some("SynapseEditor")),
                 KeyBinding::new("tab", AcceptSlashCommand, Some("SynapseEditor")),
+                KeyBinding::new("shift-tab", OutdentCodeBlock, Some("SynapseEditor")),
                 KeyBinding::new("escape", DismissSlashMenu, Some("SynapseEditor")),
             ]);
 
@@ -3118,6 +3132,8 @@ pub(crate) fn run() {
                             collapsed_directories: BTreeSet::new(),
                             editor_marked_range: None,
                             editor_selection: EditorSelection::collapsed(0),
+                            code_auto_pair_document: None,
+                            code_auto_pairs: Vec::new(),
                             selection_menu_mode: SelectionMenuMode::Formatting,
                             slash_menu: None,
                             note_link_picker: None,
@@ -3971,6 +3987,8 @@ mod tests {
             source_mode: false,
             writ_revision: 7,
             writ_buffer: "".parse().unwrap(),
+            code_syntax_cache: super::CodeSyntaxCache::default(),
+            code_syntax_edit: None,
             lines: Rc::new(Vec::new()),
             outline: Rc::new(Vec::new()),
             mermaid_previews: Rc::new(Default::default()),
@@ -4036,15 +4054,15 @@ mod tests {
         let lines = source_lines("```rust\nfn main() {}\n```", 0, false);
 
         assert_eq!(
-            code_block_edges(lines[0].presentation.code_line),
+            code_block_edges(lines[0].presentation.code_line.as_ref()),
             (false, false)
         );
         assert_eq!(
-            code_block_edges(lines[1].presentation.code_line),
+            code_block_edges(lines[1].presentation.code_line.as_ref()),
             (true, true)
         );
         assert_eq!(
-            code_block_edges(lines[2].presentation.code_line),
+            code_block_edges(lines[2].presentation.code_line.as_ref()),
             (false, false)
         );
     }

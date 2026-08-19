@@ -1,4 +1,5 @@
 pub(super) mod blink;
+pub(super) mod code_block;
 pub(super) mod document_outline;
 pub(super) mod inline_rename;
 pub(super) mod math;
