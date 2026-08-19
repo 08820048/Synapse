@@ -9,7 +9,7 @@ pub(super) struct FencedCodeBlock {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum CodeLanguage {
+pub(in crate::app) enum CodeLanguage {
     Rust,
     JavaScript,
     TypeScript,

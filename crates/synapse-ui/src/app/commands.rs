@@ -1919,6 +1919,7 @@ impl SynapseApp {
         }
         self.editor_marked_range = None;
         self.refresh_slash_menu(cx);
+        self.refresh_code_completion(false, cx);
         self.restart_editor_cursor_blink(cx);
         cx.notify();
         true
@@ -1934,6 +1935,7 @@ impl SynapseApp {
         self.state.set_cursor(cursor);
         self.editor_selection.collapse(cursor);
         self.editor_marked_range = None;
+        self.refresh_code_completion(false, cx);
         self.restart_editor_cursor_blink(cx);
         cx.notify();
     }
@@ -2006,6 +2008,7 @@ impl SynapseApp {
         }
         self.editor_selection.collapse(self.state.cursor());
         self.refresh_slash_menu(cx);
+        self.refresh_code_completion(false, cx);
         self.restart_editor_cursor_blink(cx);
         cx.stop_propagation();
         cx.notify();
@@ -2050,6 +2053,7 @@ impl SynapseApp {
         }
         self.editor_selection.collapse(self.state.cursor());
         self.refresh_slash_menu(cx);
+        self.refresh_code_completion(false, cx);
         self.restart_editor_cursor_blink(cx);
         cx.stop_propagation();
         cx.notify();
@@ -2069,6 +2073,7 @@ impl SynapseApp {
         }
         self.editor_selection.collapse(self.state.cursor());
         self.refresh_slash_menu(cx);
+        self.dismiss_code_completion();
         self.restart_editor_cursor_blink(cx);
         cx.stop_propagation();
         cx.notify();
@@ -2088,12 +2093,17 @@ impl SynapseApp {
         }
         self.editor_selection.collapse(self.state.cursor());
         self.refresh_slash_menu(cx);
+        self.dismiss_code_completion();
         self.restart_editor_cursor_blink(cx);
         cx.stop_propagation();
         cx.notify();
     }
 
     pub(in crate::app) fn move_up(&mut self, _: &MoveUp, _: &mut Window, cx: &mut Context<Self>) {
+        if self.move_code_completion_selection(-1, cx) {
+            cx.stop_propagation();
+            return;
+        }
         if self.move_slash_selection(-1, cx) {
             cx.stop_propagation();
             return;
@@ -2102,6 +2112,7 @@ impl SynapseApp {
         self.state.move_up();
         self.editor_selection.collapse(self.state.cursor());
         self.refresh_slash_menu(cx);
+        self.dismiss_code_completion();
         self.restart_editor_cursor_blink(cx);
         cx.stop_propagation();
         cx.notify();
@@ -2113,6 +2124,10 @@ impl SynapseApp {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.move_code_completion_selection(1, cx) {
+            cx.stop_propagation();
+            return;
+        }
         if self.move_slash_selection(1, cx) {
             cx.stop_propagation();
             return;
@@ -2121,6 +2136,7 @@ impl SynapseApp {
         self.state.move_down();
         self.editor_selection.collapse(self.state.cursor());
         self.refresh_slash_menu(cx);
+        self.dismiss_code_completion();
         self.restart_editor_cursor_blink(cx);
         cx.stop_propagation();
         cx.notify();
@@ -2438,6 +2454,7 @@ impl SynapseApp {
             self.sync_writ_render_buffer(previous_revision, range, "`");
             self.editor_marked_range = None;
             self.editor_selection.collapse(self.state.cursor());
+            self.refresh_code_completion(false, cx);
             self.restart_editor_cursor_blink(cx);
             cx.notify();
         }
@@ -2450,6 +2467,10 @@ impl SynapseApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.execute_selected_code_completion(window, cx) {
+            cx.stop_propagation();
+            return;
+        }
         if self.execute_selected_slash_command(window, cx) {
             cx.stop_propagation();
             return;
@@ -2540,6 +2561,7 @@ impl SynapseApp {
         self.selection_menu_mode = SelectionMenuMode::Formatting;
         self.begin_close_slash_menu(cx);
         self.begin_close_note_link_picker(cx);
+        self.dismiss_code_completion();
         self.restart_editor_cursor_blink(cx);
         cx.stop_propagation();
         cx.notify();
@@ -2557,10 +2579,199 @@ impl SynapseApp {
     pub(in crate::app) fn clear_slash_surfaces_immediately(&mut self) {
         self.slash_menu_generation = self.slash_menu_generation.wrapping_add(1);
         self.note_link_picker_generation = self.note_link_picker_generation.wrapping_add(1);
+        self.dismiss_code_completion();
         self.slash_menu = None;
         self.note_link_picker = None;
         self.slash_menu_visible = false;
         self.note_link_picker_visible = false;
+    }
+
+    pub(in crate::app) fn dismiss_code_completion(&mut self) {
+        self.code_completion_generation = self.code_completion_generation.wrapping_add(1);
+        self.code_completion = None;
+    }
+
+    pub(in crate::app) fn refresh_code_completion(
+        &mut self,
+        include_empty_prefix: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if self.markdown_source_mode
+            || self.workspace_view != WorkspaceView::Note
+            || !self.editor_selection.is_empty()
+            || self.editor_marked_range.is_some()
+        {
+            self.dismiss_code_completion();
+            return;
+        }
+        let Some(document) = self.state.active_document() else {
+            self.dismiss_code_completion();
+            return;
+        };
+        let document_path = document.relative_path().to_path_buf();
+        let document_revision = document.revision();
+        let source = document.text();
+        let cursor = self.state.cursor();
+        let Some(context) = code_completion_context(&source, cursor) else {
+            self.dismiss_code_completion();
+            return;
+        };
+        if context.prefix.is_empty() && !include_empty_prefix {
+            self.dismiss_code_completion();
+            return;
+        }
+        let items = local_code_completions_with_empty_prefix(&context, include_empty_prefix);
+        let replacement_range = context.replacement_range.clone();
+        let anchor = self.code_completion.as_ref().and_then(|menu| {
+            (menu.range == replacement_range)
+                .then_some(menu.anchor)
+                .flatten()
+        });
+        let selected = self.code_completion.as_ref().map_or(0, |menu| {
+            if menu.range == replacement_range {
+                menu.selected.min(items.len().saturating_sub(1))
+            } else {
+                0
+            }
+        });
+        self.code_completion_generation = self.code_completion_generation.wrapping_add(1);
+        let generation = self.code_completion_generation;
+        self.code_completion = Some(CodeCompletionMenuState {
+            range: replacement_range.clone(),
+            items,
+            selected,
+            anchor,
+            document_path: document_path.clone(),
+            document_revision,
+        });
+        self.code_completion_scroll.scroll_to_item(0);
+
+        let workspace_root = self
+            .state
+            .vault_root()
+            .map_or_else(std::env::temp_dir, Path::to_path_buf);
+        let stem = document_path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("note");
+        let virtual_path = workspace_root.join(".synapse-lsp").join(format!(
+            "{stem}-{}.{}",
+            context.code_range.start,
+            language_file_extension(context.language)
+        ));
+        let request = LspCompletionRequest {
+            language: context.language,
+            language_id: language_identifier(context.language),
+            uri: file_uri(virtual_path),
+            workspace_uri: file_uri(workspace_root),
+            document_text: context.code,
+            line: context.line,
+            utf16_column: context.utf16_column,
+        };
+        let Some(response) = self.language_service.request_completions(request) else {
+            if self
+                .code_completion
+                .as_ref()
+                .is_some_and(|menu| menu.items.is_empty())
+            {
+                self.dismiss_code_completion();
+            }
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(remote)) = response.await else {
+                return;
+            };
+            let _ = this.update(cx, |this, cx| {
+                if this.code_completion_generation != generation {
+                    return;
+                }
+                let Some(menu) = this.code_completion.as_mut() else {
+                    return;
+                };
+                if menu.range != replacement_range
+                    || menu.document_path != document_path
+                    || menu.document_revision != document_revision
+                {
+                    return;
+                }
+                menu.items = merge_code_completions(std::mem::take(&mut menu.items), remote);
+                menu.selected = menu.selected.min(menu.items.len().saturating_sub(1));
+                if menu.items.is_empty() {
+                    this.dismiss_code_completion();
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub(in crate::app) fn trigger_code_completion(
+        &mut self,
+        _: &TriggerCodeCompletion,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.refresh_code_completion(true, cx);
+        if self.code_completion.is_some() {
+            cx.stop_propagation();
+            cx.notify();
+        }
+    }
+
+    pub(in crate::app) fn move_code_completion_selection(
+        &mut self,
+        direction: isize,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(menu) = self.code_completion.as_mut() else {
+            return false;
+        };
+        if menu.items.is_empty() {
+            return false;
+        }
+        menu.selected =
+            (menu.selected as isize + direction).rem_euclid(menu.items.len() as isize) as usize;
+        self.code_completion_scroll.scroll_to_item(menu.selected);
+        cx.notify();
+        true
+    }
+
+    pub(in crate::app) fn execute_selected_code_completion(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(menu) = self.code_completion.clone() else {
+            return false;
+        };
+        let Some(item) = menu.items.get(menu.selected).cloned() else {
+            return false;
+        };
+        let previous_revision = self
+            .state
+            .active_document()
+            .map_or(0, |document| document.revision());
+        let range = menu.range;
+        if self
+            .state
+            .replace_active_range(range.clone(), &item.insert_text)
+            .is_err()
+        {
+            self.dismiss_code_completion();
+            return true;
+        }
+        self.sync_writ_render_buffer(previous_revision, range.clone(), &item.insert_text);
+        let cursor = range.start + item.cursor_offset;
+        self.state.set_cursor(cursor);
+        self.editor_selection.collapse(cursor);
+        self.editor_marked_range = None;
+        self.dismiss_code_completion();
+        self.refresh_slash_menu(cx);
+        window.focus(&self.editor_focus);
+        self.restart_editor_cursor_blink(cx);
+        cx.notify();
+        true
     }
 
     pub(in crate::app) fn reveal_slash_menu(&mut self, cx: &mut Context<Self>) {
@@ -2704,11 +2915,15 @@ impl SynapseApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.slash_menu.is_none() && self.note_link_picker.is_none() {
+        if self.slash_menu.is_none()
+            && self.note_link_picker.is_none()
+            && self.code_completion.is_none()
+        {
             return;
         }
         self.begin_close_slash_menu(cx);
         self.begin_close_note_link_picker(cx);
+        self.dismiss_code_completion();
         window.focus(&self.editor_focus);
     }
 
@@ -2914,6 +3129,10 @@ impl SynapseApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.execute_selected_code_completion(window, cx) {
+            cx.stop_propagation();
+            return;
+        }
         if self.execute_selected_slash_command(window, cx) {
             cx.stop_propagation();
             return;
@@ -2929,7 +3148,10 @@ impl SynapseApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.slash_menu.is_some() || self.note_link_picker.is_some() {
+        if self.slash_menu.is_some()
+            || self.note_link_picker.is_some()
+            || self.code_completion.is_some()
+        {
             self.dismiss_slash_surfaces(window, cx);
             cx.stop_propagation();
         }
@@ -3266,6 +3488,7 @@ impl SynapseApp {
         self.selection_menu_mode = SelectionMenuMode::Formatting;
         self.begin_close_slash_menu(cx);
         self.begin_close_note_link_picker(cx);
+        self.dismiss_code_completion();
         self.state.break_history_coalesce();
         self.editor_selection
             .start_drag(cursor, event.modifiers.shift);

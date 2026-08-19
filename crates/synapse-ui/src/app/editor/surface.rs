@@ -2972,6 +2972,7 @@ impl EntityInputHandler for SynapseApp {
             self.editor_marked_range = None;
             self.editor_selection.collapse(self.state.cursor());
             self.refresh_slash_menu(cx);
+            self.refresh_code_completion(false, cx);
             self.restart_editor_cursor_blink(cx);
             cx.notify();
         }

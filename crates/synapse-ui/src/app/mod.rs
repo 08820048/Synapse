@@ -67,6 +67,10 @@ use self::editor::code_block::{
     code_indent_edit, code_newline_edit, code_outdent_edit, code_text_input,
     paired_backspace_range, paired_delete_forward_range,
 };
+use self::editor::completion::{
+    CodeCompletionItem, CompletionKind, code_completion_context, language_file_extension,
+    language_identifier, local_code_completions_with_empty_prefix, merge_code_completions,
+};
 #[cfg(test)]
 use self::editor::document_outline;
 use self::editor::document_outline::{
@@ -75,6 +79,7 @@ use self::editor::document_outline::{
     render_document_outline,
 };
 use self::editor::inline_rename::{InlineRenameEvent, InlineRenameInput};
+use self::editor::language_service::{LanguageService, LspCompletionRequest, file_uri};
 use self::editor::math::{MathPreview, render_math_preview};
 use self::editor::slash_command::{
     SlashCommand, note_link_markdown, slash_command_edit, slash_trigger,
@@ -185,6 +190,7 @@ const SLASH_MENU_WIDTH: f32 = 208.0;
 const SLASH_MENU_MAX_HEIGHT: f32 = 264.0;
 const SLASH_MENU_ROW_HEIGHT: f32 = 32.0;
 const SLASH_MENU_OFFSET: f32 = 6.0;
+const CODE_COMPLETION_MENU_WIDTH: f32 = 328.0;
 const NOTE_LINK_PICKER_WIDTH: f32 = 268.0;
 const SLASH_MENU_REVEAL_DELAY: Duration = Duration::from_millis(16);
 const SLASH_MENU_ENTER_TRANSITION: Duration = Duration::from_millis(120);
@@ -1294,6 +1300,7 @@ actions!(
         InsertNewline,
         InsertRawNewline,
         OutdentCodeBlock,
+        TriggerCodeCompletion,
         AcceptSlashCommand,
         DismissSlashMenu,
         OpenCommandPalette,
@@ -1314,6 +1321,16 @@ struct SlashMenuState {
     range: Range<usize>,
     selected: usize,
     anchor: Option<(Point<Pixels>, bool)>,
+}
+
+#[derive(Clone, Debug)]
+struct CodeCompletionMenuState {
+    range: Range<usize>,
+    items: Vec<CodeCompletionItem>,
+    selected: usize,
+    anchor: Option<(Point<Pixels>, bool)>,
+    document_path: PathBuf,
+    document_revision: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -1396,14 +1413,18 @@ struct SynapseApp {
     editor_selection: EditorSelection,
     code_auto_pair_document: Option<PathBuf>,
     code_auto_pairs: Vec<AutoPair>,
+    language_service: LanguageService,
     selection_menu_mode: SelectionMenuMode,
     slash_menu: Option<SlashMenuState>,
+    code_completion: Option<CodeCompletionMenuState>,
     note_link_picker: Option<NoteLinkPickerState>,
     slash_menu_visible: bool,
     note_link_picker_visible: bool,
     slash_menu_generation: u64,
+    code_completion_generation: u64,
     note_link_picker_generation: u64,
     slash_menu_scroll: ScrollHandle,
+    code_completion_scroll: ScrollHandle,
     editor_line_layouts: Rc<RefCell<Vec<Option<EditorLineLayout>>>>,
     editor_list_state: ListState,
     editor_visible_range: Range<usize>,
@@ -2851,6 +2872,7 @@ pub(crate) fn run() {
                 KeyBinding::new("ctrl-e", ToggleInlineCode, Some("SynapseEditor")),
                 KeyBinding::new("cmd-alt-c", ToggleCodeBlock, Some("SynapseEditor")),
                 KeyBinding::new("ctrl-alt-c", ToggleCodeBlock, Some("SynapseEditor")),
+                KeyBinding::new("ctrl-space", TriggerCodeCompletion, Some("SynapseEditor")),
                 KeyBinding::new("enter", InsertNewline, Some("SynapseEditor")),
                 KeyBinding::new("shift-enter", InsertRawNewline, Some("SynapseEditor")),
                 KeyBinding::new("tab", AcceptSlashCommand, Some("SynapseEditor")),
@@ -3134,14 +3156,18 @@ pub(crate) fn run() {
                             editor_selection: EditorSelection::collapsed(0),
                             code_auto_pair_document: None,
                             code_auto_pairs: Vec::new(),
+                            language_service: LanguageService::default(),
                             selection_menu_mode: SelectionMenuMode::Formatting,
                             slash_menu: None,
+                            code_completion: None,
                             note_link_picker: None,
                             slash_menu_visible: false,
                             note_link_picker_visible: false,
                             slash_menu_generation: 0,
+                            code_completion_generation: 0,
                             note_link_picker_generation: 0,
                             slash_menu_scroll: ScrollHandle::new(),
+                            code_completion_scroll: ScrollHandle::new(),
                             editor_line_layouts: editor_line_layouts.clone(),
                             editor_list_state: editor_list_state.clone(),
                             editor_visible_range: 0..0,

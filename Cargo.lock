@@ -6565,6 +6565,7 @@ dependencies = [
  "ratex-types",
  "ropey 2.0.0-beta.1",
  "rusty-mermaid",
+ "serde_json",
  "synapse-core",
  "tempfile",
  "tokio",

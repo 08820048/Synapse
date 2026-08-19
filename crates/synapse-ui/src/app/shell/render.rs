@@ -348,6 +348,24 @@ impl Render for SynapseApp {
                     None
                 }
             });
+            let code_completion_surface = self.code_completion.clone().and_then(|menu| {
+                if menu.items.is_empty() {
+                    return None;
+                }
+                let height = (menu.items.len() as f32 * SLASH_MENU_ROW_HEIGHT + 8.0)
+                    .min(SLASH_MENU_MAX_HEIGHT);
+                let positioned = self
+                    .slash_surface_anchor(&menu.range, height, viewport_height)
+                    .or(menu.anchor);
+                if let Some(anchor) = positioned {
+                    if let Some(current) = self.code_completion.as_mut() {
+                        current.anchor = Some(anchor);
+                    }
+                    Some((menu, anchor.0, anchor.1))
+                } else {
+                    None
+                }
+            });
             div()
                 .id("editor-content")
                 .relative()
@@ -386,6 +404,7 @@ impl Render for SynapseApp {
                 .on_action(cx.listener(Self::insert_newline))
                 .on_action(cx.listener(Self::insert_raw_newline))
                 .on_action(cx.listener(Self::outdent_code_block))
+                .on_action(cx.listener(Self::trigger_code_completion))
                 .on_action(cx.listener(Self::accept_slash_command))
                 .on_action(cx.listener(Self::dismiss_slash_menu_action))
                 .on_mouse_down(MouseButton::Left, cx.listener(Self::editor_mouse_down))
@@ -520,6 +539,95 @@ impl Render for SynapseApp {
                                     .top(if below { px(-4.0) } else { px(4.0) })
                             },
                         );
+                    editor.child(deferred(
+                        anchored()
+                            .snap_to_window_with_margin(px(12.0))
+                            .anchor(Corner::TopLeft)
+                            .position(anchor)
+                            .child(surface),
+                    ))
+                })
+                .when_some(code_completion_surface, |editor, (menu, anchor, _below)| {
+                    let scroll_handle = self.code_completion_scroll.clone();
+                    let rows = menu.items.into_iter().enumerate().map(|(index, item)| {
+                        let selected = index == menu.selected;
+                        let click_app = app_entity.clone();
+                        let kind = match item.kind {
+                            CompletionKind::Keyword => self.language.text("关键字", "keyword"),
+                            CompletionKind::Snippet => self.language.text("片段", "snippet"),
+                            CompletionKind::Lsp => "LSP",
+                        };
+                        div()
+                            .id(("code-completion-row", index))
+                            .h(px(SLASH_MENU_ROW_HEIGHT))
+                            .w_full()
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.0))
+                            .px_2()
+                            .rounded(px(6.0))
+                            .cursor_pointer()
+                            .text_size(px(13.0))
+                            .when(selected, |row| {
+                                row.bg(theme.secondary).text_color(theme.foreground)
+                            })
+                            .when(!selected, |row| {
+                                row.text_color(theme.muted_foreground).hover(|style| {
+                                    style.bg(theme.secondary).text_color(theme.foreground)
+                                })
+                            })
+                            .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                                if *hovered
+                                    && let Some(menu) = this.code_completion.as_mut()
+                                    && menu.selected != index
+                                {
+                                    menu.selected = index;
+                                    cx.notify();
+                                }
+                            }))
+                            .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                                cx.stop_propagation();
+                                click_app.update(cx, |this, cx| {
+                                    if let Some(menu) = this.code_completion.as_mut() {
+                                        menu.selected = index;
+                                    }
+                                    this.execute_selected_code_completion(window, cx);
+                                });
+                            })
+                            .child(div().min_w(px(0.0)).flex_1().truncate().child(item.label))
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .text_size(px(11.0))
+                                    .text_color(theme.muted_foreground)
+                                    .child(kind),
+                            )
+                            .child(
+                                div()
+                                    .max_w(px(106.0))
+                                    .flex_none()
+                                    .truncate()
+                                    .text_size(px(11.0))
+                                    .text_color(theme.muted_foreground)
+                                    .child(item.detail),
+                            )
+                    });
+                    let surface = div()
+                        .id("editor-code-completion")
+                        .w(px(CODE_COMPLETION_MENU_WIDTH))
+                        .max_h(px(SLASH_MENU_MAX_HEIGHT))
+                        .overflow_y_scroll()
+                        .track_scroll(&scroll_handle)
+                        .p_1()
+                        .rounded(px(8.0))
+                        .border_1()
+                        .border_color(theme.border)
+                        .bg(theme.popover)
+                        .text_color(theme.popover_foreground)
+                        .shadow_lg()
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .children(rows);
                     editor.child(deferred(
                         anchored()
                             .snap_to_window_with_margin(px(12.0))
