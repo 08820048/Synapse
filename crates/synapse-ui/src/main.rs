@@ -38,7 +38,8 @@ use gpui_animation::{
     transition::{Transition, general::EaseInOutCubic, general::EaseOutQuad},
 };
 use gpui_component::{
-    ActiveTheme, Disableable as _, IconName, Root, Sizable as _, Theme, ThemeMode, WindowExt as _,
+    ActiveTheme, Disableable as _, IconName, Root, Sizable as _, Theme, ThemeMode, TitleBar,
+    WindowExt as _,
     alert::Alert,
     button::{Button, ButtonCustomVariant, ButtonRounded, ButtonVariant, ButtonVariants as _},
     dialog::DialogButtonProps,
@@ -574,6 +575,8 @@ fn apply_synapse_theme(preference: ThemePreference, mut window: Option<&mut Wind
     theme.tab_bar = palette.panel;
     theme.tab_bar_segmented = palette.line_soft;
     theme.tab_foreground = palette.muted;
+    theme.title_bar = palette.background;
+    theme.title_bar_border = palette.border;
     theme.table = palette.background;
     theme.table_active = palette.active;
     theme.table_active_border = palette.border;
@@ -5876,16 +5879,44 @@ impl Render for SettingsWindow {
         };
         div()
             .size_full()
-            .child(render_settings_content(
-                self.app.clone(),
-                vault_path,
-                language,
-                preference_errors,
-                cx.theme().danger,
-                cx.theme().background,
-            ))
+            .flex()
+            .flex_col()
+            .bg(cx.theme().background)
+            .when(cfg!(target_os = "macos"), |this| {
+                this.child(render_settings_titlebar(language, cx))
+            })
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .min_h(px(0.0))
+                    .child(render_settings_content(
+                        self.app.clone(),
+                        vault_path,
+                        language,
+                        preference_errors,
+                        cx.theme().danger,
+                        cx.theme().background,
+                    )),
+            )
             .children(component_layers)
     }
+}
+
+fn render_settings_titlebar(language: AppLanguage, cx: &mut App) -> impl IntoElement {
+    TitleBar::new().child(
+        div()
+            .flex()
+            .flex_1()
+            .h_full()
+            .items_center()
+            .justify_center()
+            .pr(px(80.0))
+            .text_size(px(13.0))
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(cx.theme().muted_foreground)
+            .child(language.text("Synapse 设置", "Synapse Settings")),
+    )
 }
 
 fn render_settings_content(
@@ -9534,8 +9565,10 @@ fn synapse_titlebar_options() -> TitlebarOptions {
 fn settings_titlebar_options(language: AppLanguage) -> TitlebarOptions {
     TitlebarOptions {
         title: Some(language.text("Synapse 设置", "Synapse Settings").into()),
-        appears_transparent: false,
-        traffic_light_position: None,
+        // Opaque system titlebars sample the app icon and wash purple/red over Dark Aqua.
+        // macOS uses a transparent titlebar so Settings can paint Synapse theme chrome.
+        appears_transparent: cfg!(target_os = "macos"),
+        traffic_light_position: cfg!(target_os = "macos").then(|| point(px(9.0), px(9.0))),
     }
 }
 
@@ -10571,7 +10604,7 @@ mod tests {
         assert!(options.is_movable);
         assert!(options.is_resizable);
         assert!(options.is_minimizable);
-        assert!(!titlebar.appears_transparent);
+        assert_eq!(titlebar.appears_transparent, cfg!(target_os = "macos"));
         assert_eq!(
             titlebar.title.expect("Settings title").as_ref(),
             "Synapse Settings"
