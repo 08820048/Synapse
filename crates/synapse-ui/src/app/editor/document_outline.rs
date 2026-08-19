@@ -8,10 +8,10 @@ use gpui_animation::{
     transition::{Transition, general::EaseOutQuad},
 };
 
-use super::{SynapseApp, SynapseThemePalette};
+use super::super::{SynapseApp, SynapseThemePalette};
 #[cfg(test)]
-use crate::editor_surface::source_lines;
-use crate::editor_surface::{MarkdownBlockKind, SourceLine};
+use super::surface::source_lines;
+use super::surface::{MarkdownBlockKind, SourceLine};
 
 const MIN_VIEWPORT_WIDTH: f32 = 1280.0;
 const RAIL_WIDTH: f32 = 40.0;
@@ -28,25 +28,25 @@ const EDGE_GAP: f32 = 8.0;
 const MAGNETIC_TRANSITION: Duration = Duration::from_millis(180);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct DocumentOutlineEntry {
-    pub(super) line_index: usize,
-    pub(super) level: u8,
-    pub(super) title: SharedString,
+pub(in crate::app) struct DocumentOutlineEntry {
+    pub(in crate::app) line_index: usize,
+    pub(in crate::app) level: u8,
+    pub(in crate::app) title: SharedString,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub(super) struct DocumentOutlineLayout {
-    pub(super) top: f32,
-    pub(super) height: f32,
-    pub(super) item_height: f32,
-    pub(super) gap: f32,
+pub(in crate::app) struct DocumentOutlineLayout {
+    pub(in crate::app) top: f32,
+    pub(in crate::app) height: f32,
+    pub(in crate::app) item_height: f32,
+    pub(in crate::app) gap: f32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub(super) struct DocumentOutlineHorizontalLayout {
-    pub(super) left: f32,
-    pub(super) tooltip_left: f32,
-    pub(super) tooltip_width: f32,
+pub(in crate::app) struct DocumentOutlineHorizontalLayout {
+    pub(in crate::app) left: f32,
+    pub(in crate::app) tooltip_left: f32,
+    pub(in crate::app) tooltip_width: f32,
 }
 
 #[derive(Clone, Copy)]
@@ -65,7 +65,7 @@ fn cubic_bezier_coordinate(parameter: f32, first: f32, second: f32) -> f32 {
         + parameter * parameter * parameter
 }
 
-pub(super) fn css_cubic_bezier_0201(time: f32) -> f32 {
+pub(in crate::app) fn css_cubic_bezier_0201(time: f32) -> f32 {
     let target = time.clamp(0.0, 1.0);
     if target == 0.0 || target == 1.0 {
         return target;
@@ -86,7 +86,10 @@ pub(super) fn css_cubic_bezier_0201(time: f32) -> f32 {
 }
 
 #[cfg(test)]
-pub(super) fn build_document_outline(text: &str, dark_mode: bool) -> Vec<DocumentOutlineEntry> {
+pub(in crate::app) fn build_document_outline(
+    text: &str,
+    dark_mode: bool,
+) -> Vec<DocumentOutlineEntry> {
     // Keep the synthetic cursor on an appended empty line so every real heading uses its
     // marker-free reading presentation, even when the editor cursor currently sits on a heading.
     let mut inactive_text = String::with_capacity(text.len() + 1);
@@ -105,7 +108,7 @@ pub(super) fn build_document_outline(text: &str, dark_mode: bool) -> Vec<Documen
     )
 }
 
-pub(super) fn build_document_outline_from_lines(
+pub(in crate::app) fn build_document_outline_from_lines(
     lines: &[Rc<SourceLine>],
 ) -> Vec<DocumentOutlineEntry> {
     lines
@@ -132,7 +135,7 @@ pub(super) fn build_document_outline_from_lines(
         .collect()
 }
 
-pub(super) fn active_document_outline_index(
+pub(in crate::app) fn active_document_outline_index(
     outline: &[DocumentOutlineEntry],
     first_visible_line: usize,
 ) -> Option<usize> {
@@ -146,7 +149,7 @@ pub(super) fn active_document_outline_index(
     )
 }
 
-pub(super) fn document_outline_tick_style(
+pub(in crate::app) fn document_outline_tick_style(
     hovered_index: Option<usize>,
     index: usize,
     active_index: Option<usize>,
@@ -172,7 +175,7 @@ pub(super) fn document_outline_tick_style(
     )
 }
 
-pub(super) fn document_outline_layout(
+pub(in crate::app) fn document_outline_layout(
     editor_height: f32,
     entry_count: usize,
 ) -> DocumentOutlineLayout {
@@ -212,7 +215,7 @@ pub(super) fn document_outline_layout(
     }
 }
 
-pub(super) fn document_outline_horizontal_layout(
+pub(in crate::app) fn document_outline_horizontal_layout(
     editor_width: f32,
     page_content_width: f32,
 ) -> Option<DocumentOutlineHorizontalLayout> {
@@ -235,7 +238,7 @@ pub(super) fn document_outline_horizontal_layout(
     })
 }
 
-pub(super) fn document_outline_is_visible(
+pub(in crate::app) fn document_outline_is_visible(
     entry_count: usize,
     horizontal_layout: Option<DocumentOutlineHorizontalLayout>,
 ) -> bool {
@@ -250,7 +253,7 @@ fn outline_kicker(level: u8) -> &'static str {
     }
 }
 
-pub(super) fn render_document_outline(
+pub(in crate::app) fn render_document_outline(
     outline: Rc<Vec<DocumentOutlineEntry>>,
     active_index: Option<usize>,
     hovered_index: Option<usize>,

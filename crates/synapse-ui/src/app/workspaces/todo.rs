@@ -16,17 +16,17 @@ use gpui_component::InteractiveElementExt;
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputState};
 
-use super::{AppLanguage, DangerousAction, Icon, SynapseApp, SynapseThemePalette};
+use super::super::{AppLanguage, DangerousAction, Icon, SynapseApp, SynapseThemePalette};
 
 const CONTENT_MAX_WIDTH: f32 = 900.0;
 const TAG_COLUMN_WIDTH: f32 = 168.0;
 const TAG_ROW_CONTENT_WIDTH: f32 = TAG_COLUMN_WIDTH - 16.0;
-pub(super) const TAG_ROW_HEIGHT: f32 = 40.0;
-pub(super) const TAG_ROW_GAP: f32 = 2.0;
-pub(super) const TAG_PILL_TRANSITION: Duration = Duration::from_millis(180);
-pub(super) const TAG_PILL_SPRING_STIFFNESS: f32 = 360.0;
-pub(super) const TAG_PILL_SPRING_DAMPING: f32 = 32.0;
-pub(super) const TAG_PILL_SPRING_MASS: f32 = 0.6;
+pub(in crate::app) const TAG_ROW_HEIGHT: f32 = 40.0;
+pub(in crate::app) const TAG_ROW_GAP: f32 = 2.0;
+pub(in crate::app) const TAG_PILL_TRANSITION: Duration = Duration::from_millis(180);
+pub(in crate::app) const TAG_PILL_SPRING_STIFFNESS: f32 = 360.0;
+pub(in crate::app) const TAG_PILL_SPRING_DAMPING: f32 = 32.0;
+pub(in crate::app) const TAG_PILL_SPRING_MASS: f32 = 0.6;
 const TAG_NAME_MAX_CHARS: usize = 48;
 const TODO_TEXT_MAX_CHARS: usize = 500;
 
@@ -35,7 +35,7 @@ const TODO_TEXT_MAX_CHARS: usize = 500;
 /// `SPRING_LAYOUT` (stiffness 360, damping 32, mass 0.6) normalized to the
 /// project animation convention's 180ms panel duration.
 #[derive(Clone, Copy, Debug, Default)]
-pub(super) struct TagPillSpring;
+pub(in crate::app) struct TagPillSpring;
 
 impl Transition for TagPillSpring {
     fn calculate(&self, progress: f32) -> f32 {
@@ -64,24 +64,24 @@ fn tag_pill_spring_progress(progress: f32) -> f32 {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct TodoTag {
+pub(in crate::app) struct TodoTag {
     id: u64,
     name: String,
     color_index: usize,
 }
 
 impl TodoTag {
-    pub(super) fn id(&self) -> u64 {
+    pub(in crate::app) fn id(&self) -> u64 {
         self.id
     }
 
-    pub(super) fn name(&self) -> &str {
+    pub(in crate::app) fn name(&self) -> &str {
         &self.name
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct TodoItem {
+pub(in crate::app) struct TodoItem {
     id: u64,
     text: String,
     done: bool,
@@ -89,27 +89,27 @@ pub(super) struct TodoItem {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub(super) struct TodoTagPicker {
-    pub(super) todo_id: u64,
-    pub(super) position: Point<Pixels>,
+pub(in crate::app) struct TodoTagPicker {
+    pub(in crate::app) todo_id: u64,
+    pub(in crate::app) position: Point<Pixels>,
 }
 
-pub(super) struct TodoWorkspaceRenderState<'a> {
-    pub(super) todo_input: &'a Entity<InputState>,
-    pub(super) todo_error: Option<&'a str>,
-    pub(super) tag_error: Option<&'a str>,
-    pub(super) tag_picker: Option<TodoTagPicker>,
-    pub(super) todo_edit_input: &'a Entity<InputState>,
-    pub(super) todo_editing_id: Option<u64>,
-    pub(super) todo_edit_error: Option<&'a str>,
-    pub(super) theme: SynapseThemePalette,
-    pub(super) language: AppLanguage,
-    pub(super) auto_clear_pending: &'a std::collections::BTreeSet<u64>,
-    pub(super) auto_clear_exiting: &'a std::collections::BTreeSet<u64>,
+pub(in crate::app) struct TodoWorkspaceRenderState<'a> {
+    pub(in crate::app) todo_input: &'a Entity<InputState>,
+    pub(in crate::app) todo_error: Option<&'a str>,
+    pub(in crate::app) tag_error: Option<&'a str>,
+    pub(in crate::app) tag_picker: Option<TodoTagPicker>,
+    pub(in crate::app) todo_edit_input: &'a Entity<InputState>,
+    pub(in crate::app) todo_editing_id: Option<u64>,
+    pub(in crate::app) todo_edit_error: Option<&'a str>,
+    pub(in crate::app) theme: SynapseThemePalette,
+    pub(in crate::app) language: AppLanguage,
+    pub(in crate::app) auto_clear_pending: &'a std::collections::BTreeSet<u64>,
+    pub(in crate::app) auto_clear_exiting: &'a std::collections::BTreeSet<u64>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub(super) struct TodoWorkspace {
+pub(in crate::app) struct TodoWorkspace {
     tags: Vec<TodoTag>,
     todos: Vec<TodoItem>,
     selected_tag_id: Option<u64>,
@@ -118,27 +118,27 @@ pub(super) struct TodoWorkspace {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum TodoToggleOutcome {
+pub(in crate::app) enum TodoToggleOutcome {
     Missing,
     Updated,
     Removed,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum AddTodoTagError {
+pub(in crate::app) enum AddTodoTagError {
     Empty,
     Duplicate,
     TooLong,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum TodoTextError {
+pub(in crate::app) enum TodoTextError {
     Empty,
     TooLong,
 }
 
 impl TodoTextError {
-    pub(super) fn message(self, language: AppLanguage) -> &'static str {
+    pub(in crate::app) fn message(self, language: AppLanguage) -> &'static str {
         match self {
             Self::Empty => language.text("待办内容不能为空", "Todo text cannot be empty"),
             Self::TooLong => language.text(
@@ -150,7 +150,7 @@ impl TodoTextError {
 }
 
 impl AddTodoTagError {
-    pub(super) fn message(self, language: AppLanguage) -> &'static str {
+    pub(in crate::app) fn message(self, language: AppLanguage) -> &'static str {
         match self {
             Self::Empty => language.text("标签名称不能为空", "Tag name cannot be empty"),
             Self::Duplicate => {
@@ -165,23 +165,23 @@ impl AddTodoTagError {
 }
 
 impl TodoWorkspace {
-    pub(super) fn tags(&self) -> &[TodoTag] {
+    pub(in crate::app) fn tags(&self) -> &[TodoTag] {
         &self.tags
     }
 
-    pub(super) fn selected_tag_id(&self) -> Option<u64> {
+    pub(in crate::app) fn selected_tag_id(&self) -> Option<u64> {
         self.selected_tag_id
     }
 
-    pub(super) fn total_count(&self) -> usize {
+    pub(in crate::app) fn total_count(&self) -> usize {
         self.todos.len()
     }
 
-    pub(super) fn completed_count(&self) -> usize {
+    pub(in crate::app) fn completed_count(&self) -> usize {
         self.todos.iter().filter(|todo| todo.done).count()
     }
 
-    pub(super) fn visible_todos(&self) -> Vec<TodoItem> {
+    pub(in crate::app) fn visible_todos(&self) -> Vec<TodoItem> {
         let selected_tag = self.selected_tag_name();
         self.todos
             .iter()
@@ -193,11 +193,11 @@ impl TodoWorkspace {
     }
 
     /// 完整待办集合（不过滤标签或完成状态），用于侧边栏快捷列表。
-    pub(super) fn sidebar_todos(&self) -> Vec<TodoItem> {
+    pub(in crate::app) fn sidebar_todos(&self) -> Vec<TodoItem> {
         self.todos.clone()
     }
 
-    pub(super) fn tag_usage_count(&self, tag_id: u64) -> usize {
+    pub(in crate::app) fn tag_usage_count(&self, tag_id: u64) -> usize {
         let Some(tag_name) = self
             .tags
             .iter()
@@ -212,7 +212,7 @@ impl TodoWorkspace {
             .count()
     }
 
-    pub(super) fn add_todo(&mut self, text: &str) -> Result<u64, TodoTextError> {
+    pub(in crate::app) fn add_todo(&mut self, text: &str) -> Result<u64, TodoTextError> {
         let text = text.trim();
         if text.is_empty() {
             return Err(TodoTextError::Empty);
@@ -242,7 +242,7 @@ impl TodoWorkspace {
     /// Replace the text of an existing todo. Text is trimmed and validated with
     /// the same rules as creation; returns `false` when the todo does not exist
     /// or the normalized text is unchanged, so callers can skip persistence.
-    pub(super) fn update_todo_text(
+    pub(in crate::app) fn update_todo_text(
         &mut self,
         todo_id: u64,
         text: &str,
@@ -264,14 +264,14 @@ impl TodoWorkspace {
         Ok(true)
     }
 
-    pub(super) fn todo_text(&self, todo_id: u64) -> Option<String> {
+    pub(in crate::app) fn todo_text(&self, todo_id: u64) -> Option<String> {
         self.todos
             .iter()
             .find(|todo| todo.id == todo_id)
             .map(|todo| todo.text.clone())
     }
 
-    pub(super) fn todo_is_done(&self, todo_id: u64) -> Option<bool> {
+    pub(in crate::app) fn todo_is_done(&self, todo_id: u64) -> Option<bool> {
         self.todos
             .iter()
             .find(|todo| todo.id == todo_id)
@@ -279,11 +279,11 @@ impl TodoWorkspace {
     }
 
     #[cfg(test)]
-    pub(super) fn toggle_todo(&mut self, todo_id: u64) -> bool {
+    pub(in crate::app) fn toggle_todo(&mut self, todo_id: u64) -> bool {
         self.toggle_todo_with_auto_clear(todo_id, false) == TodoToggleOutcome::Updated
     }
 
-    pub(super) fn toggle_todo_with_auto_clear(
+    pub(in crate::app) fn toggle_todo_with_auto_clear(
         &mut self,
         todo_id: u64,
         auto_clear_completed: bool,
@@ -300,7 +300,7 @@ impl TodoWorkspace {
         }
     }
 
-    pub(super) fn toggle_todo_tag(&mut self, todo_id: u64, tag_id: u64) -> bool {
+    pub(in crate::app) fn toggle_todo_tag(&mut self, todo_id: u64, tag_id: u64) -> bool {
         let Some(tag_name) = self
             .tags
             .iter()
@@ -320,7 +320,7 @@ impl TodoWorkspace {
         true
     }
 
-    pub(super) fn remove_todo_tag(&mut self, todo_id: u64, tag_id: u64) -> bool {
+    pub(in crate::app) fn remove_todo_tag(&mut self, todo_id: u64, tag_id: u64) -> bool {
         let Some(tag_name) = self
             .tags
             .iter()
@@ -337,13 +337,13 @@ impl TodoWorkspace {
         todo.tags.len() != previous_len
     }
 
-    pub(super) fn delete_todo(&mut self, todo_id: u64) -> bool {
+    pub(in crate::app) fn delete_todo(&mut self, todo_id: u64) -> bool {
         let previous_len = self.todos.len();
         self.todos.retain(|todo| todo.id != todo_id);
         self.todos.len() != previous_len
     }
 
-    pub(super) fn delete_tag(&mut self, tag_id: u64) -> bool {
+    pub(in crate::app) fn delete_tag(&mut self, tag_id: u64) -> bool {
         let Some(index) = self.tags.iter().position(|tag| tag.id == tag_id) else {
             return false;
         };
@@ -357,22 +357,22 @@ impl TodoWorkspace {
         true
     }
 
-    pub(super) fn clear_completed(&mut self) -> usize {
+    pub(in crate::app) fn clear_completed(&mut self) -> usize {
         let previous_len = self.todos.len();
         self.todos.retain(|todo| !todo.done);
         previous_len - self.todos.len()
     }
 
-    pub(super) fn contains_todo(&self, todo_id: u64) -> bool {
+    pub(in crate::app) fn contains_todo(&self, todo_id: u64) -> bool {
         self.todos.iter().any(|todo| todo.id == todo_id)
     }
 
-    pub(super) fn select_tag(&mut self, tag_id: Option<u64>) {
+    pub(in crate::app) fn select_tag(&mut self, tag_id: Option<u64>) {
         self.selected_tag_id =
             tag_id.filter(|tag_id| self.tags.iter().any(|candidate| candidate.id == *tag_id));
     }
 
-    pub(super) fn add_tag(&mut self, name: &str) -> Result<u64, AddTodoTagError> {
+    pub(in crate::app) fn add_tag(&mut self, name: &str) -> Result<u64, AddTodoTagError> {
         let name = name.trim();
         if name.is_empty() {
             return Err(AddTodoTagError::Empty);
@@ -408,7 +408,7 @@ impl TodoWorkspace {
             .map(|tag| tag.name.as_str())
     }
 
-    pub(super) fn load_default() -> Self {
+    pub(in crate::app) fn load_default() -> Self {
         let mut workspace = todo_tags_path()
             .and_then(|path| Self::load_from(&path).ok())
             .unwrap_or_default();
@@ -418,7 +418,7 @@ impl TodoWorkspace {
         workspace
     }
 
-    pub(super) fn save_default(&self) -> io::Result<()> {
+    pub(in crate::app) fn save_default(&self) -> io::Result<()> {
         let tags_path = todo_tags_path()
             .ok_or_else(|| io::Error::other("unable to locate the user configuration directory"))?;
         let items_path = todo_items_path()
@@ -612,12 +612,12 @@ fn decode_tags(value: &str) -> Option<Vec<String>> {
     Some(tags)
 }
 
-pub(super) fn tag_color(index: usize) -> Hsla {
+pub(in crate::app) fn tag_color(index: usize) -> Hsla {
     const COLORS: [u32; 6] = [0x2f8cff, 0xff9f1a, 0x16a3ff, 0x6c63e8, 0xa0a0a0, 0x35b779];
     rgb(COLORS[index % COLORS.len()]).into()
 }
 
-pub(super) fn render_todo_workspace(
+pub(in crate::app) fn render_todo_workspace(
     workspace: &TodoWorkspace,
     render_state: TodoWorkspaceRenderState<'_>,
     cx: &mut Context<SynapseApp>,
@@ -1052,11 +1052,11 @@ pub(super) fn render_todo_workspace(
                                 )))
                                 .transition_when_else(
                                     auto_clear_exiting,
-                                    super::TODO_AUTO_CLEAR_EXIT,
+                                    super::super::TODO_AUTO_CLEAR_EXIT,
                                     EaseOutQuad,
                                     |style| {
                                         style
-                                            .translate_x(px(super::TODO_AUTO_CLEAR_EXIT_OFFSET))
+                                            .translate_x(px(super::super::TODO_AUTO_CLEAR_EXIT_OFFSET))
                                             .opacity(0.0)
                                     },
                                     |style| style.translate_x(px(0.0)).opacity(1.0),
@@ -1424,7 +1424,7 @@ pub(super) fn render_todo_workspace(
 
 /// 侧边栏待办快捷操作区：在「待办」下方内联展开，展示全部待办，
 /// 完成项继续保留并支持直接切换回未完成。
-pub(super) fn render_todo_quick_picker(
+pub(in crate::app) fn render_todo_quick_picker(
     workspace: &TodoWorkspace,
     expanded: bool,
     theme: SynapseThemePalette,
@@ -1486,11 +1486,11 @@ pub(super) fn render_todo_quick_picker(
                         )))
                         .transition_when_else(
                             auto_clear_exiting,
-                            super::TODO_AUTO_CLEAR_EXIT,
+                            super::super::TODO_AUTO_CLEAR_EXIT,
                             EaseOutQuad,
                             |style| {
                                 style
-                                    .translate_x(px(super::TODO_AUTO_CLEAR_EXIT_OFFSET))
+                                    .translate_x(px(super::super::TODO_AUTO_CLEAR_EXIT_OFFSET))
                                     .opacity(0.0)
                             },
                             |style| style.translate_x(px(0.0)).opacity(1.0),

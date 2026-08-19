@@ -142,6 +142,8 @@ impl Settings {
     ) -> impl IntoElement {
         let selected_index = state.read(cx).selected_index;
         let search_input = state.read(cx).search_input.clone();
+        // Sidebar adds 12px horizontal padding and its header adds another 8px on each side.
+        let search_input_width = self.sidebar_width - px(40.0);
 
         Sidebar::left()
             .w(relative(1.))
@@ -150,8 +152,14 @@ impl Settings {
             .collapsed(false)
             .header(
                 div()
-                    .w_full()
-                    .child(Input::new(&search_input).prefix(IconName::Search)),
+                    .w(search_input_width)
+                    .flex_none()
+                    .child(
+                        Input::new(&search_input)
+                            .w(search_input_width)
+                            .flex_none()
+                            .prefix(IconName::Search),
+                    ),
             )
             .child(
                 SidebarMenu::new().children(pages.iter().enumerate().map(|(page_ix, page)| {

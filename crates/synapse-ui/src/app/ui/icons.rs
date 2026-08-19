@@ -155,101 +155,129 @@ pub struct SynapseAssets;
 impl AssetSource for SynapseAssets {
     fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
         let bytes: Option<&'static [u8]> = match path {
-            "lucide/search.svg" => Some(include_bytes!("../../../assets/icons/lucide/search.svg")),
-            "lucide/list-todo.svg" => {
-                Some(include_bytes!("../../../assets/icons/lucide/list-todo.svg"))
-            }
-            "lucide/bookmark.svg" => {
-                Some(include_bytes!("../../../assets/icons/lucide/bookmark.svg"))
-            }
-            "lucide/plus.svg" => Some(include_bytes!("../../../assets/icons/lucide/plus.svg")),
-            "lucide/minus.svg" => Some(include_bytes!("../../../assets/icons/lucide/minus.svg")),
-            "lucide/file-plus.svg" => {
-                Some(include_bytes!("../../../assets/icons/lucide/file-plus.svg"))
-            }
+            "lucide/search.svg" => Some(include_bytes!(
+                "../../../../../assets/icons/lucide/search.svg"
+            )),
+            "lucide/list-todo.svg" => Some(include_bytes!(
+                "../../../../../assets/icons/lucide/list-todo.svg"
+            )),
+            "lucide/bookmark.svg" => Some(include_bytes!(
+                "../../../../../assets/icons/lucide/bookmark.svg"
+            )),
+            "lucide/plus.svg" => Some(include_bytes!(
+                "../../../../../assets/icons/lucide/plus.svg"
+            )),
+            "lucide/minus.svg" => Some(include_bytes!(
+                "../../../../../assets/icons/lucide/minus.svg"
+            )),
+            "lucide/file-plus.svg" => Some(include_bytes!(
+                "../../../../../assets/icons/lucide/file-plus.svg"
+            )),
             "lucide/folder-plus.svg" => Some(include_bytes!(
-                "../../../assets/icons/lucide/folder-plus.svg"
+                "../../../../../assets/icons/lucide/folder-plus.svg"
             )),
-            "lucide/folder.svg" => Some(include_bytes!("../../../assets/icons/lucide/folder.svg")),
+            "lucide/folder.svg" => Some(include_bytes!(
+                "../../../../../assets/icons/lucide/folder.svg"
+            )),
             "lucide/folder-open.svg" => Some(include_bytes!(
-                "../../../assets/icons/lucide/folder-open.svg"
+                "../../../../../assets/icons/lucide/folder-open.svg"
             )),
-            "lucide/file-text.svg" => {
-                Some(include_bytes!("../../../assets/icons/lucide/file-text.svg"))
-            }
-            "lucide/settings.svg" => {
-                Some(include_bytes!("../../../assets/icons/lucide/settings.svg"))
-            }
-            "lucide/x.svg" => Some(include_bytes!("../../../assets/icons/lucide/x.svg")),
+            "lucide/file-text.svg" => Some(include_bytes!(
+                "../../../../../assets/icons/lucide/file-text.svg"
+            )),
+            "lucide/settings.svg" => Some(include_bytes!(
+                "../../../../../assets/icons/lucide/settings.svg"
+            )),
+            "lucide/x.svg" => Some(include_bytes!("../../../../../assets/icons/lucide/x.svg")),
             "lucide/panel-left.svg" => Some(include_bytes!(
-                "../../../assets/icons/lucide/panel-left.svg"
+                "../../../../../assets/icons/lucide/panel-left.svg"
             )),
             "lucide/panel-right.svg" => Some(include_bytes!(
-                "../../../assets/icons/lucide/panel-right.svg"
+                "../../../../../assets/icons/lucide/panel-right.svg"
             )),
-            "lucide/pencil.svg" => Some(include_bytes!("../../../assets/icons/lucide/pencil.svg")),
+            "lucide/pencil.svg" => Some(include_bytes!(
+                "../../../../../assets/icons/lucide/pencil.svg"
+            )),
             "lucide/folder-search.svg" => Some(include_bytes!(
-                "../../../assets/icons/lucide/folder-search.svg"
+                "../../../../../assets/icons/lucide/folder-search.svg"
             )),
-            "lucide/trash-2.svg" => {
-                Some(include_bytes!("../../../assets/icons/lucide/trash-2.svg"))
-            }
+            "lucide/trash-2.svg" => Some(include_bytes!(
+                "../../../../../assets/icons/lucide/trash-2.svg"
+            )),
             "lucide/chevron-right.svg" => Some(include_bytes!(
-                "../../../assets/icons/lucide/chevron-right.svg"
+                "../../../../../assets/icons/lucide/chevron-right.svg"
             )),
-            "lucide/code-2.svg" => Some(include_bytes!("../../../assets/icons/lucide/code-2.svg")),
-            "lucide/pilcrow.svg" => {
-                Some(include_bytes!("../../../assets/icons/lucide/pilcrow.svg"))
-            }
+            "lucide/code-2.svg" => Some(include_bytes!(
+                "../../../../../assets/icons/lucide/code-2.svg"
+            )),
+            "lucide/pilcrow.svg" => Some(include_bytes!(
+                "../../../../../assets/icons/lucide/pilcrow.svg"
+            )),
             "lucide/ellipsis-vertical.svg" => Some(include_bytes!(
-                "../../../assets/icons/lucide/ellipsis-vertical.svg"
+                "../../../../../assets/icons/lucide/ellipsis-vertical.svg"
             )),
-            "lucide/download.svg" => {
-                Some(include_bytes!("../../../assets/icons/lucide/download.svg"))
-            }
-            "lucide/copy.svg" => Some(include_bytes!("../../../assets/icons/lucide/copy.svg")),
-            "lucide/circle-x.svg" => {
-                Some(include_bytes!("../../../assets/icons/lucide/circle-x.svg"))
-            }
-            "lucide/check.svg" => Some(include_bytes!("../../../assets/icons/lucide/check.svg")),
-            "lucide/tag.svg" => Some(include_bytes!("../../../assets/icons/lucide/tag.svg")),
-            "lucide/globe.svg" => Some(include_bytes!("../../../assets/icons/lucide/globe.svg")),
-            "lucide/sparkles.svg" => {
-                Some(include_bytes!("../../../assets/icons/lucide/sparkles.svg"))
-            }
-            "lucide/bold.svg" => Some(include_bytes!("../../../assets/icons/lucide/bold.svg")),
-            "lucide/italic.svg" => Some(include_bytes!("../../../assets/icons/lucide/italic.svg")),
-            "lucide/underline.svg" => {
-                Some(include_bytes!("../../../assets/icons/lucide/underline.svg"))
-            }
+            "lucide/download.svg" => Some(include_bytes!(
+                "../../../../../assets/icons/lucide/download.svg"
+            )),
+            "lucide/copy.svg" => Some(include_bytes!(
+                "../../../../../assets/icons/lucide/copy.svg"
+            )),
+            "lucide/circle-x.svg" => Some(include_bytes!(
+                "../../../../../assets/icons/lucide/circle-x.svg"
+            )),
+            "lucide/check.svg" => Some(include_bytes!(
+                "../../../../../assets/icons/lucide/check.svg"
+            )),
+            "lucide/tag.svg" => Some(include_bytes!("../../../../../assets/icons/lucide/tag.svg")),
+            "lucide/globe.svg" => Some(include_bytes!(
+                "../../../../../assets/icons/lucide/globe.svg"
+            )),
+            "lucide/sparkles.svg" => Some(include_bytes!(
+                "../../../../../assets/icons/lucide/sparkles.svg"
+            )),
+            "lucide/bold.svg" => Some(include_bytes!(
+                "../../../../../assets/icons/lucide/bold.svg"
+            )),
+            "lucide/italic.svg" => Some(include_bytes!(
+                "../../../../../assets/icons/lucide/italic.svg"
+            )),
+            "lucide/underline.svg" => Some(include_bytes!(
+                "../../../../../assets/icons/lucide/underline.svg"
+            )),
             "lucide/strikethrough.svg" => Some(include_bytes!(
-                "../../../assets/icons/lucide/strikethrough.svg"
+                "../../../../../assets/icons/lucide/strikethrough.svg"
             )),
-            "lucide/link.svg" => Some(include_bytes!("../../../assets/icons/lucide/link.svg")),
-            "lucide/arrow-up.svg" => {
-                Some(include_bytes!("../../../assets/icons/lucide/arrow-up.svg"))
-            }
-            "lucide/heading-1.svg" => {
-                Some(include_bytes!("../../../assets/icons/lucide/heading-1.svg"))
-            }
-            "lucide/heading-2.svg" => {
-                Some(include_bytes!("../../../assets/icons/lucide/heading-2.svg"))
-            }
-            "lucide/heading-3.svg" => {
-                Some(include_bytes!("../../../assets/icons/lucide/heading-3.svg"))
-            }
-            "lucide/list.svg" => Some(include_bytes!("../../../assets/icons/lucide/list.svg")),
+            "lucide/link.svg" => Some(include_bytes!(
+                "../../../../../assets/icons/lucide/link.svg"
+            )),
+            "lucide/arrow-up.svg" => Some(include_bytes!(
+                "../../../../../assets/icons/lucide/arrow-up.svg"
+            )),
+            "lucide/heading-1.svg" => Some(include_bytes!(
+                "../../../../../assets/icons/lucide/heading-1.svg"
+            )),
+            "lucide/heading-2.svg" => Some(include_bytes!(
+                "../../../../../assets/icons/lucide/heading-2.svg"
+            )),
+            "lucide/heading-3.svg" => Some(include_bytes!(
+                "../../../../../assets/icons/lucide/heading-3.svg"
+            )),
+            "lucide/list.svg" => Some(include_bytes!(
+                "../../../../../assets/icons/lucide/list.svg"
+            )),
             "lucide/list-ordered.svg" => Some(include_bytes!(
-                "../../../assets/icons/lucide/list-ordered.svg"
+                "../../../../../assets/icons/lucide/list-ordered.svg"
             )),
             "lucide/text-quote.svg" => Some(include_bytes!(
-                "../../../assets/icons/lucide/text-quote.svg"
+                "../../../../../assets/icons/lucide/text-quote.svg"
             )),
-            "lucide/table.svg" => Some(include_bytes!("../../../assets/icons/lucide/table.svg")),
-            "lucide/pin.svg" => Some(include_bytes!("../../../assets/icons/lucide/pin.svg")),
-            "lucide/pin-off.svg" => {
-                Some(include_bytes!("../../../assets/icons/lucide/pin-off.svg"))
-            }
+            "lucide/table.svg" => Some(include_bytes!(
+                "../../../../../assets/icons/lucide/table.svg"
+            )),
+            "lucide/pin.svg" => Some(include_bytes!("../../../../../assets/icons/lucide/pin.svg")),
+            "lucide/pin-off.svg" => Some(include_bytes!(
+                "../../../../../assets/icons/lucide/pin-off.svg"
+            )),
             _ => None,
         };
 

@@ -15,7 +15,7 @@ use writ::{
     segment_map::{SegmentMap, Special},
 };
 
-use super::SynapseApp;
+use super::super::SynapseApp;
 
 const LIST_BULLET_DIAMETER: f32 = 5.0;
 const LIST_BULLET_OPTICAL_Y_OFFSET: f32 = -0.5;
@@ -3308,7 +3308,7 @@ mod tests {
 
     #[test]
     fn p2_markdown_fixture_keeps_render_runs_and_unicode_maps_consistent() {
-        let fixture = include_str!("../../../docs/Markdown语法完整性测试.md");
+        let fixture = include_str!("../../../../../docs/Markdown语法完整性测试.md");
         let lines = source_lines(fixture, 0, true);
 
         assert!(lines.len() > 300);

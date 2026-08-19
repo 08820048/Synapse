@@ -17,10 +17,8 @@ use gpui_component::{
     input::{Input, InputState},
 };
 
-use super::todo_workspace::{
-    TAG_PILL_TRANSITION, TAG_ROW_GAP, TAG_ROW_HEIGHT, TagPillSpring, tag_color,
-};
-use super::{AppLanguage, DangerousAction, Icon, SynapseApp, SynapseThemePalette};
+use super::super::{AppLanguage, DangerousAction, Icon, SynapseApp, SynapseThemePalette};
+use super::todo::{TAG_PILL_TRANSITION, TAG_ROW_GAP, TAG_ROW_HEIGHT, TagPillSpring, tag_color};
 
 const CONTENT_MAX_WIDTH: f32 = 940.0;
 const TAG_COLUMN_WIDTH: f32 = 168.0;
@@ -31,14 +29,14 @@ const BOOKMARK_PREVIEW_HEIGHT: f32 = 40.0;
 const BOOKMARK_TAG_MAX_CHARS: usize = 48;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct BookmarkTag {
+pub(in crate::app) struct BookmarkTag {
     id: u64,
     name: String,
     color_index: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct BookmarkItem {
+pub(in crate::app) struct BookmarkItem {
     id: u64,
     url: String,
     title: String,
@@ -50,44 +48,44 @@ pub(super) struct BookmarkItem {
 }
 
 impl BookmarkItem {
-    pub(super) fn id(&self) -> u64 {
+    pub(in crate::app) fn id(&self) -> u64 {
         self.id
     }
 
-    pub(super) fn url(&self) -> &str {
+    pub(in crate::app) fn url(&self) -> &str {
         &self.url
     }
 
-    pub(super) fn title(&self) -> &str {
+    pub(in crate::app) fn title(&self) -> &str {
         &self.title
     }
 
-    pub(super) fn meta_fetched(&self) -> bool {
+    pub(in crate::app) fn meta_fetched(&self) -> bool {
         self.meta_fetched
     }
 }
 
 #[derive(Clone, Copy, Debug)]
-pub(super) struct BookmarkTagPicker {
-    pub(super) bookmark_id: u64,
-    pub(super) position: Point<Pixels>,
+pub(in crate::app) struct BookmarkTagPicker {
+    pub(in crate::app) bookmark_id: u64,
+    pub(in crate::app) position: Point<Pixels>,
 }
 
-pub(super) struct BookmarkWorkspaceRenderState<'a> {
-    pub(super) query_input: &'a Entity<InputState>,
-    pub(super) query_error: Option<&'a str>,
-    pub(super) tag_error: Option<&'a str>,
-    pub(super) tag_picker: Option<BookmarkTagPicker>,
-    pub(super) edit_input: &'a Entity<InputState>,
-    pub(super) editing_id: Option<u64>,
-    pub(super) edit_error: Option<&'a str>,
-    pub(super) fetching_ids: &'a std::collections::BTreeSet<u64>,
-    pub(super) theme: SynapseThemePalette,
-    pub(super) language: AppLanguage,
+pub(in crate::app) struct BookmarkWorkspaceRenderState<'a> {
+    pub(in crate::app) query_input: &'a Entity<InputState>,
+    pub(in crate::app) query_error: Option<&'a str>,
+    pub(in crate::app) tag_error: Option<&'a str>,
+    pub(in crate::app) tag_picker: Option<BookmarkTagPicker>,
+    pub(in crate::app) edit_input: &'a Entity<InputState>,
+    pub(in crate::app) editing_id: Option<u64>,
+    pub(in crate::app) edit_error: Option<&'a str>,
+    pub(in crate::app) fetching_ids: &'a std::collections::BTreeSet<u64>,
+    pub(in crate::app) theme: SynapseThemePalette,
+    pub(in crate::app) language: AppLanguage,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum BookmarkInputError {
+pub(in crate::app) enum BookmarkInputError {
     Empty,
     InvalidUrl,
     Duplicate,
@@ -98,7 +96,7 @@ pub(super) enum BookmarkInputError {
 }
 
 impl BookmarkInputError {
-    pub(super) fn message(self, language: AppLanguage) -> &'static str {
+    pub(in crate::app) fn message(self, language: AppLanguage) -> &'static str {
         match self {
             Self::Empty => language.text("链接不能为空", "Link cannot be empty"),
             Self::InvalidUrl => language.text(
@@ -122,7 +120,7 @@ impl BookmarkInputError {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub(super) struct BookmarkWorkspace {
+pub(in crate::app) struct BookmarkWorkspace {
     tags: Vec<BookmarkTag>,
     bookmarks: Vec<BookmarkItem>,
     selected_tag_id: Option<u64>,
@@ -131,23 +129,23 @@ pub(super) struct BookmarkWorkspace {
 }
 
 impl BookmarkWorkspace {
-    pub(super) fn tags(&self) -> &[BookmarkTag] {
+    pub(in crate::app) fn tags(&self) -> &[BookmarkTag] {
         &self.tags
     }
 
-    pub(super) fn bookmarks(&self) -> &[BookmarkItem] {
+    pub(in crate::app) fn bookmarks(&self) -> &[BookmarkItem] {
         &self.bookmarks
     }
 
-    pub(super) fn selected_tag_id(&self) -> Option<u64> {
+    pub(in crate::app) fn selected_tag_id(&self) -> Option<u64> {
         self.selected_tag_id
     }
 
-    pub(super) fn total_count(&self) -> usize {
+    pub(in crate::app) fn total_count(&self) -> usize {
         self.bookmarks.len()
     }
 
-    pub(super) fn selected_tag_name(&self) -> Option<&str> {
+    pub(in crate::app) fn selected_tag_name(&self) -> Option<&str> {
         self.selected_tag_id.and_then(|tag_id| {
             self.tags
                 .iter()
@@ -156,12 +154,12 @@ impl BookmarkWorkspace {
         })
     }
 
-    pub(super) fn select_tag(&mut self, tag_id: Option<u64>) {
+    pub(in crate::app) fn select_tag(&mut self, tag_id: Option<u64>) {
         self.selected_tag_id =
             tag_id.filter(|id| self.tags.iter().any(|candidate| candidate.id == *id));
     }
 
-    pub(super) fn tag_usage_count(&self, tag_id: u64) -> usize {
+    pub(in crate::app) fn tag_usage_count(&self, tag_id: u64) -> usize {
         let Some(name) = self
             .tags
             .iter()
@@ -176,7 +174,7 @@ impl BookmarkWorkspace {
             .count()
     }
 
-    pub(super) fn add_tag(&mut self, name: &str) -> Result<u64, BookmarkInputError> {
+    pub(in crate::app) fn add_tag(&mut self, name: &str) -> Result<u64, BookmarkInputError> {
         let name = name.trim();
         if name.is_empty() {
             return Err(BookmarkInputError::EmptyTag);
@@ -202,7 +200,7 @@ impl BookmarkWorkspace {
         Ok(id)
     }
 
-    pub(super) fn add_bookmark(&mut self, input: &str) -> Result<u64, BookmarkInputError> {
+    pub(in crate::app) fn add_bookmark(&mut self, input: &str) -> Result<u64, BookmarkInputError> {
         let url = normalize_bookmark_url(input)?;
         if self.bookmarks.iter().any(|bookmark| bookmark.url == url) {
             return Err(BookmarkInputError::Duplicate);
@@ -229,11 +227,11 @@ impl BookmarkWorkspace {
         Ok(id)
     }
 
-    pub(super) fn bookmark(&self, id: u64) -> Option<&BookmarkItem> {
+    pub(in crate::app) fn bookmark(&self, id: u64) -> Option<&BookmarkItem> {
         self.bookmarks.iter().find(|bookmark| bookmark.id == id)
     }
 
-    pub(super) fn update_title(
+    pub(in crate::app) fn update_title(
         &mut self,
         id: u64,
         title: &str,
@@ -252,7 +250,7 @@ impl BookmarkWorkspace {
         Ok(true)
     }
 
-    pub(super) fn apply_metadata(&mut self, id: u64, metadata: LinkMetadata) -> bool {
+    pub(in crate::app) fn apply_metadata(&mut self, id: u64, metadata: LinkMetadata) -> bool {
         let Some(bookmark) = self.bookmarks.iter_mut().find(|bookmark| bookmark.id == id) else {
             return false;
         };
@@ -267,7 +265,7 @@ impl BookmarkWorkspace {
         true
     }
 
-    pub(super) fn mark_metadata_fetched(&mut self, id: u64) -> bool {
+    pub(in crate::app) fn mark_metadata_fetched(&mut self, id: u64) -> bool {
         let Some(bookmark) = self.bookmarks.iter_mut().find(|bookmark| bookmark.id == id) else {
             return false;
         };
@@ -275,7 +273,7 @@ impl BookmarkWorkspace {
         true
     }
 
-    pub(super) fn toggle_tag(&mut self, bookmark_id: u64, tag_id: u64) -> bool {
+    pub(in crate::app) fn toggle_tag(&mut self, bookmark_id: u64, tag_id: u64) -> bool {
         let Some(tag_name) = self
             .tags
             .iter()
@@ -299,7 +297,7 @@ impl BookmarkWorkspace {
         true
     }
 
-    pub(super) fn remove_tag(&mut self, bookmark_id: u64, tag_id: u64) -> bool {
+    pub(in crate::app) fn remove_tag(&mut self, bookmark_id: u64, tag_id: u64) -> bool {
         let Some(tag_name) = self
             .tags
             .iter()
@@ -320,13 +318,13 @@ impl BookmarkWorkspace {
         bookmark.tags.len() != previous
     }
 
-    pub(super) fn delete_bookmark(&mut self, id: u64) -> bool {
+    pub(in crate::app) fn delete_bookmark(&mut self, id: u64) -> bool {
         let previous = self.bookmarks.len();
         self.bookmarks.retain(|bookmark| bookmark.id != id);
         self.bookmarks.len() != previous
     }
 
-    pub(super) fn delete_tag(&mut self, id: u64) -> bool {
+    pub(in crate::app) fn delete_tag(&mut self, id: u64) -> bool {
         let Some(index) = self.tags.iter().position(|tag| tag.id == id) else {
             return false;
         };
@@ -340,7 +338,7 @@ impl BookmarkWorkspace {
         true
     }
 
-    pub(super) fn filtered_bookmarks(&self, query: &str) -> Vec<BookmarkItem> {
+    pub(in crate::app) fn filtered_bookmarks(&self, query: &str) -> Vec<BookmarkItem> {
         let query = query.trim();
         let candidate_is_url = is_bookmark_url_candidate(query);
         let lower_query = query.to_lowercase();
@@ -365,7 +363,7 @@ impl BookmarkWorkspace {
             .collect()
     }
 
-    pub(super) fn to_markdown(&self) -> String {
+    pub(in crate::app) fn to_markdown(&self) -> String {
         let mut output = String::from("# Bookmarks\n\n");
         for bookmark in &self.bookmarks {
             output.push_str(&format!("- [{}]({})", bookmark.title, bookmark.url));
@@ -385,13 +383,13 @@ impl BookmarkWorkspace {
         output
     }
 
-    pub(super) fn load_default() -> Self {
+    pub(in crate::app) fn load_default() -> Self {
         bookmarks_path()
             .and_then(|path| Self::load_from(&path).ok())
             .unwrap_or_default()
     }
 
-    pub(super) fn save_default(&self) -> io::Result<()> {
+    pub(in crate::app) fn save_default(&self) -> io::Result<()> {
         let path = bookmarks_path()
             .ok_or_else(|| io::Error::other("unable to locate the user configuration directory"))?;
         self.save_to(&path)
@@ -518,13 +516,13 @@ impl BookmarkWorkspace {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub(super) struct LinkMetadata {
-    pub(super) title: Option<String>,
-    pub(super) image: Option<String>,
-    pub(super) favicon: Option<String>,
+pub(in crate::app) struct LinkMetadata {
+    pub(in crate::app) title: Option<String>,
+    pub(in crate::app) image: Option<String>,
+    pub(in crate::app) favicon: Option<String>,
 }
 
-pub(super) async fn fetch_link_metadata(
+pub(in crate::app) async fn fetch_link_metadata(
     client: Arc<dyn gpui::http_client::HttpClient>,
     url: String,
 ) -> Result<LinkMetadata, String> {
@@ -545,7 +543,7 @@ pub(super) async fn fetch_link_metadata(
     Ok(parse_link_metadata(&body, &url))
 }
 
-pub(super) fn normalize_bookmark_url(input: &str) -> Result<String, BookmarkInputError> {
+pub(in crate::app) fn normalize_bookmark_url(input: &str) -> Result<String, BookmarkInputError> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
         return Err(BookmarkInputError::Empty);
@@ -573,7 +571,7 @@ pub(super) fn normalize_bookmark_url(input: &str) -> Result<String, BookmarkInpu
     Ok(value)
 }
 
-pub(super) fn is_bookmark_url_candidate(input: &str) -> bool {
+pub(in crate::app) fn is_bookmark_url_candidate(input: &str) -> bool {
     normalize_bookmark_url(input).is_ok()
 }
 
@@ -861,7 +859,7 @@ fn split_encoded_fields(line: &str, expected: usize) -> Vec<String> {
     line.splitn(expected, '\t').map(str::to_owned).collect()
 }
 
-pub(super) fn render_bookmark_workspace(
+pub(in crate::app) fn render_bookmark_workspace(
     workspace: &BookmarkWorkspace,
     render_state: BookmarkWorkspaceRenderState<'_>,
     cx: &mut Context<SynapseApp>,
@@ -1593,7 +1591,7 @@ fn bookmark_preview(
         .into_any_element()
 }
 
-pub(super) fn render_bookmark_quick_picker(
+pub(in crate::app) fn render_bookmark_quick_picker(
     workspace: &BookmarkWorkspace,
     expanded: bool,
     theme: SynapseThemePalette,

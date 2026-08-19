@@ -8,7 +8,7 @@ use gpui::{
     rgb, rgba, size,
 };
 
-use super::TreeTarget;
+use super::super::TreeTarget;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum InlineRenameEvent {
