@@ -3758,7 +3758,100 @@ fn markdown_list_item_text(line: &str) -> Option<String> {
         }
         _ => return None,
     };
-    (!content.trim().is_empty()).then(|| content.trim().to_owned())
+    if content.trim().is_empty() {
+        return None;
+    }
+    let plain_text = strip_markdown_inline_formatting(content.trim());
+    (!plain_text.trim().is_empty()).then_some(plain_text)
+}
+
+/// Converts inline Markdown in a list item to the plain text stored by the todo workspace.
+///
+/// Todo titles are rendered as text, rather than parsed as Markdown. Keep the human-readable
+/// content while removing common inline delimiters (and preserving literal punctuation when it
+/// is not acting as a delimiter).
+fn strip_markdown_inline_formatting(text: &str) -> String {
+    let chars = text.chars().collect::<Vec<_>>();
+    let mut output = String::with_capacity(text.len());
+    let mut index = 0;
+
+    while index < chars.len() {
+        if chars[index] == '\\' {
+            if let Some(next) = chars.get(index + 1).copied()
+                && matches!(next, '\\' | '*' | '_' | '~' | '`' | '[' | ']' | '(' | ')')
+            {
+                output.push(next);
+                index += 2;
+                continue;
+            }
+        }
+
+        // Markdown links and images contribute their label/alt text, not the destination.
+        let label_start = if chars[index] == '!' && chars.get(index + 1) == Some(&'[') {
+            Some(index + 1)
+        } else if chars[index] == '[' {
+            Some(index)
+        } else {
+            None
+        };
+        if let Some(label_start) = label_start
+            && let Some(label_end) = chars[label_start + 1..].iter().position(|c| *c == ']')
+        {
+            let label_end = label_start + 1 + label_end;
+            if chars.get(label_end + 1) == Some(&'(')
+                && chars[label_end + 2..].iter().any(|c| *c == ')')
+            {
+                let label = chars[label_start + 1..label_end].iter().collect::<String>();
+                output.push_str(&strip_markdown_inline_formatting(&label));
+                index = chars[label_end + 2..]
+                    .iter()
+                    .position(|c| *c == ')')
+                    .map_or(chars.len(), |end| label_end + 3 + end);
+                continue;
+            }
+        }
+
+        let delimiter_len = if index + 1 < chars.len()
+            && matches!((chars[index], chars[index + 1]), ( '*', '*' ) | ( '_', '_' ) | ( '~', '~' ))
+        {
+            2
+        } else if matches!(chars[index], '*' | '_' | '~' | '`') {
+            1
+        } else {
+            0
+        };
+        if delimiter_len > 0 {
+            let delimiter = chars[index];
+            let is_code = delimiter == '`';
+            let closing = chars[index + delimiter_len..]
+                .windows(delimiter_len)
+                .position(|window| window.iter().all(|c| *c == delimiter));
+            let is_closing_delimiter = chars
+                .get(index.wrapping_sub(1))
+                .is_some_and(|c| !c.is_whitespace())
+                && chars
+                    .get(index + delimiter_len)
+                    .is_none_or(|c| !c.is_alphanumeric());
+            let valid_single_emphasis = delimiter_len == 1
+                && delimiter != '~'
+                && !is_code
+                && ((chars.get(index.wrapping_sub(1)).is_none_or(|c| !c.is_alphanumeric())
+                    && chars.get(index + 1).is_some_and(|c| !c.is_whitespace()))
+                    || (chars.get(index.wrapping_sub(1)).is_some_and(|c| !c.is_whitespace())
+                        && chars.get(index + 1).is_none_or(|c| !c.is_alphanumeric())));
+            if (closing.is_some() || is_closing_delimiter)
+                && (delimiter_len == 2 || is_code || valid_single_emphasis)
+            {
+                index += delimiter_len;
+                continue;
+            }
+        }
+
+        output.push(chars[index]);
+        index += 1;
+    }
+
+    output
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -4474,6 +4567,7 @@ mod tests {
         materialize_large_document_rich_lines, scan_markdown_fence_ranges,
         scan_markdown_structure,
         MarkdownFenceContext,
+        strip_markdown_inline_formatting,
         normalize_clipboard_text, normalize_markdown_link_destination, note_breadcrumb_parts,
         note_link_candidates, parse_boolean_preference, path_is_inside_macos_app_bundle,
         persist_clipboard_image, prune_collapsed_directories, resolve_markdown_image,
@@ -4600,7 +4694,7 @@ mod tests {
 
     #[test]
     fn selected_markdown_lists_expand_into_clean_todo_titles() {
-        let source = "前言\n  - 写文档\n  * 修复问题\n  + 发布版本\n后记";
+        let source = "前言\n  - **写文档**\n  * _修复问题_\n  + 发布版本\n后记";
         let selection_start = source.find('-').unwrap();
         let selection_start = source[..selection_start].chars().count() + 1;
         let selection_end = source.find("\n后记").unwrap();
@@ -4618,6 +4712,20 @@ mod tests {
 
         let mixed = "- 可转换\n这不是列表";
         assert!(markdown_list_items_in_selection(mixed, 0..mixed.chars().count()).is_empty());
+    }
+
+    #[test]
+    fn todo_titles_strip_inline_markdown_without_losing_content() {
+        assert_eq!(
+            strip_markdown_inline_formatting(
+                "**加粗**、*斜体*、~~删除~~、`代码`、[链接](https://example.com)"
+            ),
+            "加粗、斜体、删除、代码、链接"
+        );
+        assert_eq!(
+            strip_markdown_inline_formatting("保留 foo_bar 和 \\*星号\\*"),
+            "保留 foo_bar 和 *星号*"
+        );
     }
 
     #[test]
