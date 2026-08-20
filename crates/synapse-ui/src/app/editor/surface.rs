@@ -3642,9 +3642,9 @@ mod tests {
         Buffer, CodeSyntaxCache, CodeSyntaxEdit, EditorSelection, INLINE_STRONG_WEIGHT,
         LIST_BULLET_DIAMETER, MarkdownBlockKind, char_byte_boundaries, char_to_byte,
         code_block_language, footnote_preview_line, hidden_bullet_marker_range,
-        inline_code_byte_ranges, source_lines, source_lines_from_buffer_with_syntax_cache,
-        source_lines_with_mode, shift_source_lines, table_cell_editor_line, task_preview_line,
-        text_run_from_markdown, visual_row_byte_ranges,
+        inline_code_byte_ranges, shift_source_lines, source_lines,
+        source_lines_from_buffer_with_syntax_cache, source_lines_with_mode, table_cell_editor_line,
+        task_preview_line, text_run_from_markdown, visual_row_byte_ranges,
     };
 
     fn present_markdown_line(source: &str) -> super::MarkdownLinePresentation {

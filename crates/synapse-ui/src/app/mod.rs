@@ -737,10 +737,7 @@ fn load_session_preference(root: &Path) -> Option<SessionPreference> {
     parse_session_preference(&contents, root)
 }
 
-fn parse_session_preference(
-    contents: &str,
-    root: &Path,
-) -> Option<SessionPreference> {
+fn parse_session_preference(contents: &str, root: &Path) -> Option<SessionPreference> {
     let mut lines = contents.lines();
     let saved_root = PathBuf::from(lines.next()?.strip_prefix("vault=")?);
     if saved_root != root {
@@ -1239,9 +1236,9 @@ impl DangerousAction {
                     AppLanguage::SimplifiedChinese => {
                         format!("关闭这些页签并放弃其中 {count} 个未保存页签的更改？")
                     }
-                    AppLanguage::English => format!(
-                        "Close these tabs and discard changes in {count} unsaved tab(s)?"
-                    ),
+                    AppLanguage::English => {
+                        format!("Close these tabs and discard changes in {count} unsaved tab(s)?")
+                    }
                 },
                 language.text("页签已关闭", "Tabs closed").to_owned(),
             ),
@@ -1760,14 +1757,10 @@ impl SynapseApp {
         revision: u64,
         cx: &mut Context<Self>,
     ) {
-        if self
-            .large_document_structure
-            .as_ref()
-            .is_some_and(|cache| {
-                cache.matches(&vault_root, &relative_path, revision)
-                    && (cache.pending || cache.fences.is_some())
-            })
-        {
+        if self.large_document_structure.as_ref().is_some_and(|cache| {
+            cache.matches(&vault_root, &relative_path, revision)
+                && (cache.pending || cache.fences.is_some())
+        }) {
             return;
         }
 
@@ -1909,17 +1902,17 @@ impl SynapseApp {
             .vault_root()
             .map_or_else(PathBuf::new, Path::to_path_buf);
         let structure = self.large_document_structure.as_ref().filter(|structure| {
-            structure.matches(
-                &vault_root,
-                document.relative_path(),
-                document.revision(),
-            )
+            structure.matches(&vault_root, document.relative_path(), document.revision())
         })?;
         structure.fences.as_ref()?;
         let line_index = document.char_to_line(cursor);
-        Some(structure.fence_at_or_before(line_index).is_some_and(|fence| {
-            fence.opening_line < line_index && line_index < fence.content_end_line
-        }))
+        Some(
+            structure
+                .fence_at_or_before(line_index)
+                .is_some_and(|fence| {
+                    fence.opening_line < line_index && line_index < fence.content_end_line
+                }),
+        )
     }
 
     fn schedule_large_document_rich_render(
@@ -1942,13 +1935,8 @@ impl SynapseApp {
                 let Some(cache) = this.large_document_render_cache.as_mut() else {
                     return;
                 };
-                if !cache.matches(
-                    &vault_root,
-                    &relative_path,
-                    revision,
-                    dark_mode,
-                    false,
-                ) || cache.cached_range != line_range
+                if !cache.matches(&vault_root, &relative_path, revision, dark_mode, false)
+                    || cache.cached_range != line_range
                     || cache.structure_generation != structure_generation
                 {
                     return;
@@ -2109,8 +2097,7 @@ impl SynapseApp {
             lines.push(line.clone());
         }
 
-        let local_visible_range = visible_range.start.clamp(cache_start, cache_end)
-            - cache_start
+        let local_visible_range = visible_range.start.clamp(cache_start, cache_end) - cache_start
             ..visible_range.end.clamp(cache_start, cache_end) - cache_start;
         let preview_range = editor_preview_range(local_visible_range, lines.len());
         let local_mermaid_previews = Rc::new(
@@ -2272,11 +2259,9 @@ impl LargeDocumentStructureCache {
     }
 
     fn can_reuse_after_single_line_edit(&self, line_index: usize, updated_line: &str) -> bool {
-        let touches_fence = self
-            .fence_at_or_before(line_index)
-            .is_some_and(|fence| {
-                fence.opening_line == line_index || fence.closing_line == Some(line_index)
-            });
+        let touches_fence = self.fence_at_or_before(line_index).is_some_and(|fence| {
+            fence.opening_line == line_index || fence.closing_line == Some(line_index)
+        });
         if touches_fence || markdown_fence_opener(updated_line).is_some() {
             return false;
         }
@@ -2286,7 +2271,9 @@ impl LargeDocumentStructureCache {
         }
         let table = self.table_at_line(line_index);
         match table {
-            Some(table) if table.header_line == line_index || table.delimiter_line == line_index => {
+            Some(table)
+                if table.header_line == line_index || table.delimiter_line == line_index =>
+            {
                 false
             }
             Some(_) => markdown_table_row_candidate(updated_line),
@@ -2296,9 +2283,7 @@ impl LargeDocumentStructureCache {
 
     fn fence_context_for_source_line(&self, line_index: usize) -> Option<MarkdownFenceContext> {
         self.fence_at_or_before(line_index)
-            .filter(|fence| {
-                fence.opening_line < line_index && line_index < fence.content_end_line
-            })
+            .filter(|fence| fence.opening_line < line_index && line_index < fence.content_end_line)
             .map(|fence| MarkdownFenceContext {
                 opening_source: fence.opening_source.clone(),
                 content_end_line: fence.content_end_line,
@@ -2816,7 +2801,10 @@ fn markdown_fence_closes(line: &str, marker: char, marker_len: usize) -> bool {
 }
 
 fn markdown_fence_run(line: &str) -> Option<(char, usize, &str)> {
-    let indentation = line.chars().take_while(|character| *character == ' ').count();
+    let indentation = line
+        .chars()
+        .take_while(|character| *character == ' ')
+        .count();
     if indentation > 3 {
         return None;
     }
@@ -2833,8 +2821,7 @@ fn markdown_fence_run(line: &str) -> Option<(char, usize, &str)> {
 }
 
 fn markdown_fence_is_mermaid(source: &str) -> bool {
-    let Some((_, _, suffix)) = markdown_fence_run(source.lines().next().unwrap_or(""))
-    else {
+    let Some((_, _, suffix)) = markdown_fence_run(source.lines().next().unwrap_or("")) else {
         return false;
     };
     suffix
@@ -4082,9 +4069,7 @@ fn strip_markdown_inline_formatting(text: &str) -> String {
             && let Some(label_end) = chars[label_start + 1..].iter().position(|c| *c == ']')
         {
             let label_end = label_start + 1 + label_end;
-            if chars.get(label_end + 1) == Some(&'(')
-                && chars[label_end + 2..].contains(&')')
-            {
+            if chars.get(label_end + 1) == Some(&'(') && chars[label_end + 2..].contains(&')') {
                 let label = chars[label_start + 1..label_end].iter().collect::<String>();
                 output.push_str(&strip_markdown_inline_formatting(&label));
                 index = chars[label_end + 2..]
@@ -4096,8 +4081,10 @@ fn strip_markdown_inline_formatting(text: &str) -> String {
         }
 
         let delimiter_len = if index + 1 < chars.len()
-            && matches!((chars[index], chars[index + 1]), ( '*', '*' ) | ( '_', '_' ) | ( '~', '~' ))
-        {
+            && matches!(
+                (chars[index], chars[index + 1]),
+                ('*', '*') | ('_', '_') | ('~', '~')
+            ) {
             2
         } else if matches!(chars[index], '*' | '_' | '~' | '`') {
             1
@@ -4119,9 +4106,13 @@ fn strip_markdown_inline_formatting(text: &str) -> String {
             let valid_single_emphasis = delimiter_len == 1
                 && delimiter != '~'
                 && !is_code
-                && ((chars.get(index.wrapping_sub(1)).is_none_or(|c| !c.is_alphanumeric())
+                && ((chars
+                    .get(index.wrapping_sub(1))
+                    .is_none_or(|c| !c.is_alphanumeric())
                     && chars.get(index + 1).is_some_and(|c| !c.is_whitespace()))
-                    || (chars.get(index.wrapping_sub(1)).is_some_and(|c| !c.is_whitespace())
+                    || (chars
+                        .get(index.wrapping_sub(1))
+                        .is_some_and(|c| !c.is_whitespace())
                         && chars.get(index + 1).is_none_or(|c| !c.is_alphanumeric())));
             if (closing.is_some() || is_closing_delimiter)
                 && (delimiter_len == 2 || is_code || valid_single_emphasis)
@@ -4932,43 +4923,39 @@ mod tests {
         AppLanguage, DangerousAction, EDITOR_BODY_FONT_SIZE, EDITOR_BODY_LINE_HEIGHT,
         EDITOR_COMPACT_GUTTER, EDITOR_PAGE_MAX_WIDTH, EDITOR_REGULAR_GUTTER,
         EDITOR_RULE_BLOCK_HEIGHT, EDITOR_RULE_THICKNESS, EDITOR_TOP_PADDING, EDITOR_WIDE_GUTTER,
-        FileTreeRow, InlineFormat, InlineFormatEdit, MARKD_PANEL_SPRING_DAMPING,
-        MARKD_PANEL_SPRING_MASS, MARKD_PANEL_SPRING_STIFFNESS, MENU_ITEM_ICON_SIZE,
-        MENU_ITEM_ICON_SLOT_SIZE, MarkdownImagePreview, PANEL_TRANSITION,
-        SETTINGS_WINDOW_MIN_HEIGHT, SETTINGS_WINDOW_MIN_WIDTH, SIDEBAR_FOOTER_HEIGHT,
-        SIDEBAR_SEARCH_CONTENT_WIDTH, SIDEBAR_SEARCH_INNER_PADDING, SIDEBAR_SEARCH_OUTER_MARGIN,
-        SIDEBAR_SHORTCUT_ACTION_WIDTH, SIDEBAR_TREE_FONT_FAMILY, SIDEBAR_TREE_FONT_SIZE,
-        SIDEBAR_TREE_ROW_HEIGHT, SLASH_MENU_ENTER_TRANSITION, SLASH_MENU_EXIT_TRANSITION,
-        SLASH_MENU_REVEAL_DELAY, SYNAPSE_APP_ICON_PNG, ShellState, SlashCommand,
-        TABLE_CELL_HORIZONTAL_PADDING, TABLE_CELL_VERTICAL_PADDING, TABLE_FONT_SIZE,
-        TABLE_ROW_MIN_HEIGHT, TITLEBAR_HEIGHT, TODO_AUTO_CLEAR_COMPLETED_HOLD,
-        TODO_AUTO_CLEAR_EXIT, TODO_AUTO_CLEAR_EXIT_OFFSET, ThemePreference, TreeTarget,
-        active_document_outline_index, build_document_outline, build_file_tree_rows,
-        build_image_previews, build_math_previews, build_mermaid_previews, changed_line_span,
-        clipboard_image_extension, code_block_edges, command_palette_key_bindings,
-        default_window_size, document_outline_horizontal_layout, document_outline_is_visible,
-        document_outline_layout, editor_backtick_key_bindings, editor_horizontal_gutter,
-        editor_page_content_width, editor_preview_range, embedded_app_icon_png_metadata,
-        fenced_code_block_edit, file_manager_reveal_command, filtered_slash_commands,
-        inline_format_edit, inline_format_is_active, is_tab_context_trigger,
-        large_document_cache_range, large_document_line_range,
-        large_document_rich_render_request, LargeDocumentRichRenderContext,
-        LargeDocumentRichRenderRequest, linked_vault_note, markd_panel_spring_progress,
-        markdown_link_context, markdown_list_items_in_selection, materialize_large_document_lines,
-        materialize_large_document_rich_lines, scan_markdown_fence_ranges,
-        scan_markdown_structure,
-        MarkdownFenceContext,
-        command_palette_scroll_item_index, next_command_palette_selection,
-        strip_markdown_inline_formatting,
-        normalize_clipboard_text, normalize_markdown_link_destination, note_breadcrumb_parts,
-        note_link_candidates, parse_boolean_preference, path_is_inside_macos_app_bundle,
-        parse_recovery_preference, parse_session_preference,
-        persist_clipboard_image, prune_collapsed_directories, resolve_markdown_image,
-        search_vault_entries,
-        select_startup_vault_path, settings_language_indicator_left, settings_spring_progress,
-        settings_theme_indicator_left, settings_titlebar_options, settings_window_options,
-        source_lines_from_buffer, synapse_mermaid_theme, synapse_theme_palette,
-        synapse_titlebar_options, titlebar_left_inset,
+        FileTreeRow, InlineFormat, InlineFormatEdit, LargeDocumentRichRenderContext,
+        LargeDocumentRichRenderRequest, MARKD_PANEL_SPRING_DAMPING, MARKD_PANEL_SPRING_MASS,
+        MARKD_PANEL_SPRING_STIFFNESS, MENU_ITEM_ICON_SIZE, MENU_ITEM_ICON_SLOT_SIZE,
+        MarkdownFenceContext, MarkdownImagePreview, PANEL_TRANSITION, SETTINGS_WINDOW_MIN_HEIGHT,
+        SETTINGS_WINDOW_MIN_WIDTH, SIDEBAR_FOOTER_HEIGHT, SIDEBAR_SEARCH_CONTENT_WIDTH,
+        SIDEBAR_SEARCH_INNER_PADDING, SIDEBAR_SEARCH_OUTER_MARGIN, SIDEBAR_SHORTCUT_ACTION_WIDTH,
+        SIDEBAR_TREE_FONT_FAMILY, SIDEBAR_TREE_FONT_SIZE, SIDEBAR_TREE_ROW_HEIGHT,
+        SLASH_MENU_ENTER_TRANSITION, SLASH_MENU_EXIT_TRANSITION, SLASH_MENU_REVEAL_DELAY,
+        SYNAPSE_APP_ICON_PNG, ShellState, SlashCommand, TABLE_CELL_HORIZONTAL_PADDING,
+        TABLE_CELL_VERTICAL_PADDING, TABLE_FONT_SIZE, TABLE_ROW_MIN_HEIGHT, TITLEBAR_HEIGHT,
+        TODO_AUTO_CLEAR_COMPLETED_HOLD, TODO_AUTO_CLEAR_EXIT, TODO_AUTO_CLEAR_EXIT_OFFSET,
+        ThemePreference, TreeTarget, active_document_outline_index, build_document_outline,
+        build_file_tree_rows, build_image_previews, build_math_previews, build_mermaid_previews,
+        changed_line_span, clipboard_image_extension, code_block_edges,
+        command_palette_key_bindings, command_palette_scroll_item_index, default_window_size,
+        document_outline_horizontal_layout, document_outline_is_visible, document_outline_layout,
+        editor_backtick_key_bindings, editor_horizontal_gutter, editor_page_content_width,
+        editor_preview_range, embedded_app_icon_png_metadata, fenced_code_block_edit,
+        file_manager_reveal_command, filtered_slash_commands, inline_format_edit,
+        inline_format_is_active, is_tab_context_trigger, large_document_cache_range,
+        large_document_line_range, large_document_rich_render_request, linked_vault_note,
+        markd_panel_spring_progress, markdown_link_context, markdown_list_items_in_selection,
+        materialize_large_document_lines, materialize_large_document_rich_lines,
+        next_command_palette_selection, normalize_clipboard_text,
+        normalize_markdown_link_destination, note_breadcrumb_parts, note_link_candidates,
+        parse_boolean_preference, parse_recovery_preference, parse_session_preference,
+        path_is_inside_macos_app_bundle, persist_clipboard_image, prune_collapsed_directories,
+        resolve_markdown_image, scan_markdown_fence_ranges, scan_markdown_structure,
+        search_vault_entries, select_startup_vault_path, settings_language_indicator_left,
+        settings_spring_progress, settings_theme_indicator_left, settings_titlebar_options,
+        settings_window_options, source_lines_from_buffer, strip_markdown_inline_formatting,
+        synapse_mermaid_theme, synapse_theme_palette, synapse_titlebar_options,
+        titlebar_left_inset,
     };
     fn sfnt_table<'a>(font: &'a [u8], tag: &[u8; 4]) -> Option<&'a [u8]> {
         let table_count = usize::from(u16::from_be_bytes(font.get(4..6)?.try_into().ok()?));
@@ -5458,7 +5445,7 @@ mod tests {
         assert!(
             projected
                 .get(&103)
-            .is_some_and(|line| line.presentation.code_line.is_some())
+                .is_some_and(|line| line.presentation.code_line.is_some())
         );
     }
 
@@ -5591,16 +5578,20 @@ mod tests {
             .unwrap();
         assert!(!table_row.is_header);
         assert!(!table_row.is_first);
-        assert!(table_row.cell_presentations[0]
-            .presentation
-            .runs
-            .iter()
-            .any(|run| run.bold));
-        assert!(table_row.cell_presentations[1]
-            .presentation
-            .runs
-            .iter()
-            .any(|run| run.mono));
+        assert!(
+            table_row.cell_presentations[0]
+                .presentation
+                .runs
+                .iter()
+                .any(|run| run.bold)
+        );
+        assert!(
+            table_row.cell_presentations[1]
+                .presentation
+                .runs
+                .iter()
+                .any(|run| run.mono)
+        );
     }
 
     #[test]
@@ -6539,7 +6530,10 @@ mod tests {
                 Some(1),
             ))
         );
-        assert_eq!(parse_session_preference(contents, Path::new("/other")), None);
+        assert_eq!(
+            parse_session_preference(contents, Path::new("/other")),
+            None
+        );
     }
 
     #[test]
@@ -6554,6 +6548,9 @@ mod tests {
                 "# Draft\n\nunfinished".to_owned(),
             ))
         );
-        assert_eq!(parse_recovery_preference(contents, Path::new("/other")), None);
+        assert_eq!(
+            parse_recovery_preference(contents, Path::new("/other")),
+            None
+        );
     }
 }

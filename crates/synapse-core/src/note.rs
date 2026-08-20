@@ -314,10 +314,7 @@ mod tests {
 
     #[test]
     fn rope_line_access_does_not_require_the_whole_document_text() {
-        let document = NoteDocument::from_text(
-            PathBuf::from("note.md"),
-            "第一行\n🙂第二行\n",
-        );
+        let document = NoteDocument::from_text(PathBuf::from("note.md"), "第一行\n🙂第二行\n");
 
         assert_eq!(document.line_count(), 3);
         assert_eq!(document.line_start_char(0), 0);

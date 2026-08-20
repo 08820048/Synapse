@@ -93,11 +93,16 @@ impl InlineRenameInput {
         self.error = None;
     }
 
+    fn submit(&mut self, cx: &mut Context<Self>) {
+        self.marked_range = None;
+        cx.emit(InlineRenameEvent::Submit(self.value.trim().to_owned()));
+    }
+
     fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         match event.keystroke.key.as_str() {
             "enter" if self.marked_range.is_none() => {
                 cx.stop_propagation();
-                cx.emit(InlineRenameEvent::Submit(self.value.trim().to_owned()));
+                self.submit(cx);
             }
             "escape" => {
                 cx.stop_propagation();
@@ -481,6 +486,7 @@ impl Render for InlineRenameInput {
             .track_focus(&self.focus_handle)
             .key_context("InlineRename")
             .on_key_down(cx.listener(Self::on_key_down))
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.submit(cx)))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, window, cx| {

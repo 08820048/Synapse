@@ -87,13 +87,7 @@ impl Render for SynapseApp {
                 .map_or_else(PathBuf::new, Path::to_path_buf);
             let dark_mode = theme.is_dark();
             let source_mode = self.markdown_source_mode;
-            let (
-                relative_path,
-                revision,
-                document_len,
-                large_document,
-                structure_snapshot,
-            ) = {
+            let (relative_path, revision, document_len, large_document, structure_snapshot) = {
                 let document = self
                     .state
                     .active_document()
@@ -223,116 +217,119 @@ impl Render for SynapseApp {
                             !source_mode && !cache.rich && !cache.rich_render_pending,
                         )
                     });
-                let (lines, rich_request) =
-                    if let Some((lines, cache_range, should_render_rich)) = cached_window {
-                        let rich_request = should_render_rich
-                            .then(|| {
-                                let source_line_start = cache_range
-                                    .start
-                                    .saturating_sub(LARGE_DOCUMENT_PARSE_CONTEXT_LINES);
-                                let fence_context = self.large_document_fence_context(
-                                    &vault_root,
-                                    &relative_path,
-                                    revision,
-                                    source_line_start,
-                                );
-                                let table_prefix = fence_context.is_none().then(|| {
-                                    self.large_document_table_prefix(
-                                        &vault_root,
-                                        &relative_path,
-                                        revision,
-                                        source_line_start,
-                                    )
-                                })
-                                .flatten();
-                                large_document_rich_render_request(
-                                    document,
-                                    LargeDocumentRichRenderContext {
-                                        vault_root: vault_root.clone(),
-                                        relative_path: relative_path.clone(),
-                                        revision,
-                                        dark_mode,
-                                        cursor,
-                                        line_range: cache_range,
-                                        fence_context,
-                                        table_prefix,
-                                        structure_generation: self
-                                            .large_document_structure_generation(
-                                                &vault_root,
-                                                &relative_path,
-                                                revision,
-                                            ),
-                                    },
-                                )
-                            })
-                            .flatten();
-                        if rich_request.is_some()
-                            && let Some(cache) = self.large_document_render_cache.as_mut()
-                        {
-                            cache.rich_render_pending = true;
-                        }
-                        (lines, rich_request)
-                    } else {
-                        let cache_range = large_document_cache_range(
-                            self.editor_visible_range.clone(),
-                            line_count,
-                            document.char_to_line(cursor),
-                        );
-                        let lines = materialize_large_document_lines(document, cache_range.clone());
-                        let rich_request = (!source_mode)
-                            .then(|| {
-                                let source_line_start = cache_range
-                                    .start
-                                    .saturating_sub(LARGE_DOCUMENT_PARSE_CONTEXT_LINES);
-                                let fence_context = self.large_document_fence_context(
-                                    &vault_root,
-                                    &relative_path,
-                                    revision,
-                                    source_line_start,
-                                );
-                                let table_prefix = fence_context.is_none().then(|| {
-                                    self.large_document_table_prefix(
-                                        &vault_root,
-                                        &relative_path,
-                                        revision,
-                                        source_line_start,
-                                    )
-                                })
-                                .flatten();
-                                large_document_rich_render_request(
-                                    document,
-                                    LargeDocumentRichRenderContext {
-                                        vault_root: vault_root.clone(),
-                                        relative_path: relative_path.clone(),
-                                        revision,
-                                        dark_mode,
-                                        cursor,
-                                        line_range: cache_range.clone(),
-                                        fence_context,
-                                        table_prefix,
-                                        structure_generation: self
-                                            .large_document_structure_generation(
-                                                &vault_root,
-                                                &relative_path,
-                                                revision,
-                                            ),
-                                    },
-                                )
-                            })
-                            .flatten();
-                        self.large_document_render_cache = Some(LargeDocumentRenderCache {
-                            vault_root: vault_root.clone(),
-                            relative_path: relative_path.clone(),
-                            revision,
-                            dark_mode,
-                            source_mode,
-                            line_count,
-                            cached_range: cache_range,
-                            structure_generation: self.large_document_structure_generation(
+                let (lines, rich_request) = if let Some((lines, cache_range, should_render_rich)) =
+                    cached_window
+                {
+                    let rich_request = should_render_rich
+                        .then(|| {
+                            let source_line_start = cache_range
+                                .start
+                                .saturating_sub(LARGE_DOCUMENT_PARSE_CONTEXT_LINES);
+                            let fence_context = self.large_document_fence_context(
                                 &vault_root,
                                 &relative_path,
                                 revision,
-                            ),
+                                source_line_start,
+                            );
+                            let table_prefix = fence_context
+                                .is_none()
+                                .then(|| {
+                                    self.large_document_table_prefix(
+                                        &vault_root,
+                                        &relative_path,
+                                        revision,
+                                        source_line_start,
+                                    )
+                                })
+                                .flatten();
+                            large_document_rich_render_request(
+                                document,
+                                LargeDocumentRichRenderContext {
+                                    vault_root: vault_root.clone(),
+                                    relative_path: relative_path.clone(),
+                                    revision,
+                                    dark_mode,
+                                    cursor,
+                                    line_range: cache_range,
+                                    fence_context,
+                                    table_prefix,
+                                    structure_generation: self.large_document_structure_generation(
+                                        &vault_root,
+                                        &relative_path,
+                                        revision,
+                                    ),
+                                },
+                            )
+                        })
+                        .flatten();
+                    if rich_request.is_some()
+                        && let Some(cache) = self.large_document_render_cache.as_mut()
+                    {
+                        cache.rich_render_pending = true;
+                    }
+                    (lines, rich_request)
+                } else {
+                    let cache_range = large_document_cache_range(
+                        self.editor_visible_range.clone(),
+                        line_count,
+                        document.char_to_line(cursor),
+                    );
+                    let lines = materialize_large_document_lines(document, cache_range.clone());
+                    let rich_request = (!source_mode)
+                        .then(|| {
+                            let source_line_start = cache_range
+                                .start
+                                .saturating_sub(LARGE_DOCUMENT_PARSE_CONTEXT_LINES);
+                            let fence_context = self.large_document_fence_context(
+                                &vault_root,
+                                &relative_path,
+                                revision,
+                                source_line_start,
+                            );
+                            let table_prefix = fence_context
+                                .is_none()
+                                .then(|| {
+                                    self.large_document_table_prefix(
+                                        &vault_root,
+                                        &relative_path,
+                                        revision,
+                                        source_line_start,
+                                    )
+                                })
+                                .flatten();
+                            large_document_rich_render_request(
+                                document,
+                                LargeDocumentRichRenderContext {
+                                    vault_root: vault_root.clone(),
+                                    relative_path: relative_path.clone(),
+                                    revision,
+                                    dark_mode,
+                                    cursor,
+                                    line_range: cache_range.clone(),
+                                    fence_context,
+                                    table_prefix,
+                                    structure_generation: self.large_document_structure_generation(
+                                        &vault_root,
+                                        &relative_path,
+                                        revision,
+                                    ),
+                                },
+                            )
+                        })
+                        .flatten();
+                    self.large_document_render_cache = Some(LargeDocumentRenderCache {
+                        vault_root: vault_root.clone(),
+                        relative_path: relative_path.clone(),
+                        revision,
+                        dark_mode,
+                        source_mode,
+                        line_count,
+                        cached_range: cache_range,
+                        structure_generation: self.large_document_structure_generation(
+                            &vault_root,
+                            &relative_path,
+                            revision,
+                        ),
                         lines: lines.clone(),
                         rich: false,
                         rich_render_pending: rich_request.is_some(),
@@ -340,13 +337,13 @@ impl Render for SynapseApp {
                         math_previews: Rc::new(BTreeMap::new()),
                         image_previews: Rc::new(BTreeMap::new()),
                     });
-                        (lines, rich_request)
-                    };
+                    (lines, rich_request)
+                };
                 if let Some(request) = rich_request {
                     self.schedule_large_document_rich_render(request, cx);
                 }
-                let (mermaid_previews, math_previews, image_previews) =
-                    self.large_document_preview_maps(
+                let (mermaid_previews, math_previews, image_previews) = self
+                    .large_document_preview_maps(
                         self.editor_visible_range.clone(),
                         &vault_root,
                         &relative_path,
@@ -783,9 +780,7 @@ impl Render for SynapseApp {
                                     .p_0()
                                     .tooltip(self.language.text("关闭", "Close"))
                                     .child(
-                                        Icon::Close
-                                            .render(14.0)
-                                            .text_color(theme.muted_foreground),
+                                        Icon::Close.render(14.0).text_color(theme.muted_foreground),
                                     )
                                     .on_click(move |_, window, cx| {
                                         cx.stop_propagation();
@@ -2920,12 +2915,7 @@ impl Render for SynapseApp {
                         ))
                         .on_click(move |_, window, cx| {
                             cx.stop_propagation();
-                            SynapseApp::request_close_tab(
-                                index,
-                                close_app.clone(),
-                                window,
-                                cx,
-                            );
+                            SynapseApp::request_close_tab(index, close_app.clone(), window, cx);
                         }),
                 )
                 .child(
@@ -2941,9 +2931,8 @@ impl Render for SynapseApp {
                         .on_click(move |_, window, cx| {
                             cx.stop_propagation();
                             let tabs = close_left_app.read(cx).state.tabs();
-                            let indices = (0..index)
-                                .filter(|&index| !tabs[index].is_pinned)
-                                .collect();
+                            let indices =
+                                (0..index).filter(|&index| !tabs[index].is_pinned).collect();
                             SynapseApp::request_close_tabs(
                                 indices,
                                 Some(index),
@@ -3044,6 +3033,7 @@ impl Render for SynapseApp {
                 .bg(theme.popover)
                 .text_sm()
                 .text_color(theme.popover_foreground)
+                .occlude()
                 .opacity(0.0)
                 .with_transition(SharedString::from(format!(
                     "tree-context-menu-transition-{surface_theme_key}"
@@ -3519,8 +3509,7 @@ impl Render for SynapseApp {
                 .justify_center()
                 .pt(px(72.0))
                 .bg(hsla(0.0, 0.0, 0.0, 0.58))
-                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
+                .occlude()
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.dismiss_command_palette(cx);
                 }))
@@ -3580,10 +3569,10 @@ impl Render for SynapseApp {
                                             .py_3()
                                             .text_size(px(12.0))
                                             .text_color(theme.muted_foreground)
-                                            .child(self.language.text(
-                                                "没有匹配的笔记",
-                                                "No matching notes",
-                                            )),
+                                            .child(
+                                                self.language
+                                                    .text("没有匹配的笔记", "No matching notes"),
+                                            ),
                                     )
                                 })
                         })

@@ -8,7 +8,9 @@ fn editor_word_range(text: &str, cursor: usize) -> Option<Range<usize>> {
     if chars.is_empty() {
         return None;
     }
-    let index = cursor.min(chars.len()).saturating_sub(usize::from(cursor >= chars.len()));
+    let index = cursor
+        .min(chars.len())
+        .saturating_sub(usize::from(cursor >= chars.len()));
     let kind = |character: char| {
         if character.is_alphanumeric() || character == '_' {
             0
@@ -143,18 +145,15 @@ impl EditorSourceWindow {
         }
         let start = range.start.checked_sub(self.source_start_char)?;
         let end = range.end.checked_sub(self.source_start_char)?;
-        (start <= end).then_some(
-            start + self.synthetic_prefix_chars..end + self.synthetic_prefix_chars,
-        )
+        (start <= end)
+            .then_some(start + self.synthetic_prefix_chars..end + self.synthetic_prefix_chars)
     }
 
     fn local_pairs(&self, pairs: &[AutoPair]) -> Vec<AutoPair> {
         pairs
             .iter()
             .copied()
-            .filter(|pair| {
-                pair.open >= self.source_start_char && pair.close < self.source_end_char
-            })
+            .filter(|pair| pair.open >= self.source_start_char && pair.close < self.source_end_char)
             .map(|mut pair| {
                 pair.open = pair.open - self.source_start_char + self.synthetic_prefix_chars;
                 pair.close = pair.close - self.source_start_char + self.synthetic_prefix_chars;
@@ -208,32 +207,34 @@ impl SynapseApp {
 
     pub(in crate::app) fn start_autosave(&mut self, cx: &mut Context<Self>) {
         let executor = cx.background_executor().clone();
-        cx.spawn(async move |this, cx| loop {
-            executor.timer(AUTOSAVE_INTERVAL).await;
-            let active = this
-                .update(cx, |this, cx| {
-                    if !this.state.active_is_dirty() {
-                        return true;
-                    }
-                    if let Err(error) = save_recovery_preference(&this.state) {
-                        this.state.set_error_message(format!(
-                            "{}: {error}",
-                            this.language
-                                .text("恢复副本无法保存", "Recovery copy could not be saved")
-                        ));
+        cx.spawn(async move |this, cx| {
+            loop {
+                executor.timer(AUTOSAVE_INTERVAL).await;
+                let active = this
+                    .update(cx, |this, cx| {
+                        if !this.state.active_is_dirty() {
+                            return true;
+                        }
+                        if let Err(error) = save_recovery_preference(&this.state) {
+                            this.state.set_error_message(format!(
+                                "{}: {error}",
+                                this.language
+                                    .text("恢复副本无法保存", "Recovery copy could not be saved")
+                            ));
+                            cx.notify();
+                            return true;
+                        }
+                        if this.state.save_active().is_ok() {
+                            let _ = clear_recovery_preference();
+                            this.persist_session();
+                        }
                         cx.notify();
-                        return true;
-                    }
-                    if this.state.save_active().is_ok() {
-                        let _ = clear_recovery_preference();
-                        this.persist_session();
-                    }
-                    cx.notify();
-                    true
-                })
-                .unwrap_or(false);
-            if !active {
-                break;
+                        true
+                    })
+                    .unwrap_or(false);
+                if !active {
+                    break;
+                }
             }
         })
         .detach();
@@ -241,12 +242,10 @@ impl SynapseApp {
 
     pub(in crate::app) fn refresh_command_search(&mut self, cx: &mut Context<Self>) {
         let query = self.command_search.read(cx).value();
-        let active_document = self.state.active_document().map(|document| {
-            (
-                document.relative_path().to_path_buf(),
-                document.text(),
-            )
-        });
+        let active_document = self
+            .state
+            .active_document()
+            .map(|document| (document.relative_path().to_path_buf(), document.text()));
         self.command_search_results = search_vault_entries(
             &self.state.entries,
             self.state.vault_root(),
@@ -277,11 +276,7 @@ impl SynapseApp {
         cx.notify();
     }
 
-    pub(in crate::app) fn open_find(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub(in crate::app) fn open_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.state.active_document().is_none() {
             return;
         }
@@ -301,11 +296,7 @@ impl SynapseApp {
         self.open_find(window, cx);
     }
 
-    pub(in crate::app) fn dismiss_find(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub(in crate::app) fn dismiss_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.find_bar_open = false;
         window.focus(&self.editor_focus);
         cx.notify();
@@ -334,11 +325,7 @@ impl SynapseApp {
         self.state.set_cursor(range.end);
     }
 
-    pub(in crate::app) fn find_next(
-        &mut self,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub(in crate::app) fn find_next(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         let matches = self.active_find_matches(cx);
         if matches.is_empty() {
             cx.notify();
@@ -354,11 +341,7 @@ impl SynapseApp {
         cx.notify();
     }
 
-    pub(in crate::app) fn find_previous(
-        &mut self,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub(in crate::app) fn find_previous(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         let matches = self.active_find_matches(cx);
         if matches.is_empty() {
             cx.notify();
@@ -375,14 +358,14 @@ impl SynapseApp {
         cx.notify();
     }
 
-    pub(in crate::app) fn replace_next(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub(in crate::app) fn replace_next(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let matches = self.active_find_matches(cx);
         let current = self.editor_selection.range();
-        let Some(range) = matches.iter().find(|candidate| **candidate == current).cloned() else {
+        let Some(range) = matches
+            .iter()
+            .find(|candidate| **candidate == current)
+            .cloned()
+        else {
             self.find_next(window, cx);
             return;
         };
@@ -404,11 +387,7 @@ impl SynapseApp {
         cx.notify();
     }
 
-    pub(in crate::app) fn replace_all(
-        &mut self,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub(in crate::app) fn replace_all(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         let matches = self.active_find_matches(cx);
         if matches.is_empty() {
             return;
@@ -2068,7 +2047,8 @@ impl SynapseApp {
         self.command_palette_open = true;
         self.refresh_command_search(cx);
         self.command_palette_selected = 0;
-        self.command_palette_scroll.set_offset(point(px(0.0), px(0.0)));
+        self.command_palette_scroll
+            .set_offset(point(px(0.0), px(0.0)));
         self.clear_slash_surfaces_immediately();
         self.command_palette_closing = false;
         self.command_palette_generation = self.command_palette_generation.wrapping_add(1);
@@ -2090,11 +2070,8 @@ impl SynapseApp {
 
     fn move_command_palette_selection(&mut self, direction: i32, cx: &mut Context<Self>) {
         let count = self.command_palette_item_count(cx);
-        self.command_palette_selected = next_command_palette_selection(
-            self.command_palette_selected,
-            count,
-            direction,
-        );
+        self.command_palette_selected =
+            next_command_palette_selection(self.command_palette_selected, count, direction);
         let query_nonempty = !self.command_search.read(cx).value().trim().is_empty();
         let search_count = if query_nonempty {
             self.command_search_results.len()
@@ -2568,8 +2545,7 @@ impl SynapseApp {
         inserted: &str,
     ) -> Option<CodeTextInput> {
         if !code_text_input_candidate(inserted)
-            || (range.is_empty()
-                && self.large_document_cursor_is_known_not_code(range.start))
+            || (range.is_empty() && self.large_document_cursor_is_known_not_code(range.start))
         {
             return None;
         }
@@ -3404,7 +3380,9 @@ impl SynapseApp {
             self.dismiss_code_completion();
             return;
         };
-        let Some(local_cursor) = source_window.local_range(cursor..cursor).map(|range| range.start)
+        let Some(local_cursor) = source_window
+            .local_range(cursor..cursor)
+            .map(|range| range.start)
         else {
             self.dismiss_code_completion();
             return;
@@ -3686,8 +3664,7 @@ impl SynapseApp {
             return;
         };
         let local_cursor = line_prefix.chars().count();
-        let Some(mut trigger) = slash_trigger(&line_prefix, local_cursor)
-        else {
+        let Some(mut trigger) = slash_trigger(&line_prefix, local_cursor) else {
             self.begin_close_slash_menu(cx);
             return;
         };
@@ -4580,10 +4557,7 @@ mod tests {
 
     #[test]
     fn find_matches_use_character_ranges_and_ascii_case_insensitivity() {
-        assert_eq!(
-            find_char_matches("One 中文 one", "one"),
-            vec![0..3, 7..10]
-        );
+        assert_eq!(find_char_matches("One 中文 one", "one"), vec![0..3, 7..10]);
         assert_eq!(find_char_matches("中文内容", "内容"), vec![2..4]);
         assert_eq!(find_char_matches("aaaa", "aa"), vec![0..2, 2..4]);
         assert!(find_char_matches("abc", "").is_empty());

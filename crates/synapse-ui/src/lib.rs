@@ -1074,7 +1074,6 @@ impl ShellState {
         indices: Vec<usize>,
         closed_active: Option<usize>,
     ) -> usize {
-
         let count = indices.len();
         if count == 0 {
             return 0;
@@ -2327,9 +2326,8 @@ mod tests {
         fs::write(directory.path().join("two.md"), "two").unwrap();
         fs::write(directory.path().join("three.md"), "three").unwrap();
 
-        let mut state = ShellState::from_vault_argument(Some(OsString::from(
-            directory.path().as_os_str(),
-        )));
+        let mut state =
+            ShellState::from_vault_argument(Some(OsString::from(directory.path().as_os_str())));
         state
             .restore_session(
                 &[
@@ -2355,9 +2353,8 @@ mod tests {
         );
         assert_eq!(active, Some(0));
 
-        let mut restored = ShellState::from_vault_argument(Some(OsString::from(
-            directory.path().as_os_str(),
-        )));
+        let mut restored =
+            ShellState::from_vault_argument(Some(OsString::from(directory.path().as_os_str())));
         restored
             .restore_session(
                 &[
@@ -2376,9 +2373,8 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("note.md");
         fs::write(&path, "original").unwrap();
-        let mut state = ShellState::from_vault_argument(Some(OsString::from(
-            directory.path().as_os_str(),
-        )));
+        let mut state =
+            ShellState::from_vault_argument(Some(OsString::from(directory.path().as_os_str())));
         state.select_note(Path::new("note.md")).unwrap();
 
         fs::write(&path, "external").unwrap();
@@ -2399,13 +2395,15 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("note.md");
         fs::write(&path, "saved").unwrap();
-        let mut state = ShellState::from_vault_argument(Some(OsString::from(
-            directory.path().as_os_str(),
-        )));
+        let mut state =
+            ShellState::from_vault_argument(Some(OsString::from(directory.path().as_os_str())));
         state.select_note(Path::new("note.md")).unwrap();
         state.insert_text("local ").unwrap();
 
-        assert!(matches!(state.close_tab(0), Err(super::SessionError::UnsavedChanges)));
+        assert!(matches!(
+            state.close_tab(0),
+            Err(super::SessionError::UnsavedChanges)
+        ));
         assert!(state.discard_tab(0).unwrap());
         assert!(state.tabs().is_empty());
         assert_eq!(fs::read_to_string(path).unwrap(), "saved");
