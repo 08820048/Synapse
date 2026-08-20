@@ -1591,6 +1591,9 @@ impl SynapseApp {
     }
 
     pub(in crate::app) fn toggle_markdown_source_mode(&mut self, cx: &mut Context<Self>) {
+        if self.large_document_active() {
+            return;
+        }
         self.markdown_source_mode = !self.markdown_source_mode;
         self.selection_menu_mode = SelectionMenuMode::Formatting;
         self.clear_slash_surfaces_immediately();
@@ -1980,7 +1983,9 @@ impl SynapseApp {
         cx: &mut Context<Self>,
     ) {
         self.editor_marked_range = None;
-        let source = self.state.active_document().map(|document| document.text());
+        let source = (!self.large_document_active())
+            .then(|| self.state.active_document().map(|document| document.text()))
+            .flatten();
         let previous_revision = self
             .state
             .active_document()
@@ -2021,7 +2026,9 @@ impl SynapseApp {
         cx: &mut Context<Self>,
     ) {
         self.editor_marked_range = None;
-        let source = self.state.active_document().map(|document| document.text());
+        let source = (!self.large_document_active())
+            .then(|| self.state.active_document().map(|document| document.text()))
+            .flatten();
         let previous_revision = self
             .state
             .active_document()
@@ -2265,17 +2272,12 @@ impl SynapseApp {
     }
 
     pub(in crate::app) fn copy_code_block(&mut self, range: Range<usize>, cx: &mut Context<Self>) {
-        let Some(text) = self.state.active_document().map(|document| document.text()) else {
+        let Some(document) = self.state.active_document() else {
             return;
         };
-        if range.start > range.end || range.end > text.chars().count() {
+        let Ok(code) = document.slice(range) else {
             return;
-        }
-        let code = text
-            .chars()
-            .skip(range.start)
-            .take(range.len())
-            .collect::<String>();
+        };
         cx.write_to_clipboard(ClipboardItem::new_string(code));
     }
 
@@ -2430,6 +2432,22 @@ impl SynapseApp {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.large_document_active() {
+            let range = self.editor_selection.range();
+            let previous_revision = self
+                .state
+                .active_document()
+                .map_or(0, |document| document.revision());
+            if self.state.replace_active_range(range.clone(), "`").is_ok() {
+                self.sync_writ_render_buffer(previous_revision, range, "`");
+                self.editor_marked_range = None;
+                self.editor_selection.collapse(self.state.cursor());
+                self.restart_editor_cursor_blink(cx);
+                cx.notify();
+            }
+            cx.stop_propagation();
+            return;
+        }
         let Some(source) = self.state.active_document().map(|document| document.text()) else {
             return;
         };
@@ -2476,6 +2494,22 @@ impl SynapseApp {
             return;
         }
         self.editor_marked_range = None;
+        if self.large_document_active() {
+            let range = self.editor_selection.range();
+            self.apply_code_editor_edit(
+                CodeEdit {
+                    cursor: range.start + 1,
+                    range,
+                    replacement: "\n".to_owned(),
+                    selection: None,
+                    new_pair: None,
+                },
+                cx,
+            );
+            self.begin_close_slash_menu(cx);
+            cx.stop_propagation();
+            return;
+        }
         let Some(source) = self.state.active_document().map(|document| document.text()) else {
             return;
         };
@@ -2572,8 +2606,7 @@ impl SynapseApp {
         if range.is_empty() {
             return None;
         }
-        let text = self.state.active_document()?.text();
-        Some(text.chars().skip(range.start).take(range.len()).collect())
+        self.state.active_document()?.slice(range).ok()
     }
 
     pub(in crate::app) fn clear_slash_surfaces_immediately(&mut self) {
@@ -2596,7 +2629,8 @@ impl SynapseApp {
         include_empty_prefix: bool,
         cx: &mut Context<Self>,
     ) {
-        if self.markdown_source_mode
+        if self.large_document_active()
+            || self.markdown_source_mode
             || self.workspace_view != WorkspaceView::Note
             || !self.editor_selection.is_empty()
             || self.editor_marked_range.is_some()
@@ -2867,7 +2901,8 @@ impl SynapseApp {
     }
 
     pub(in crate::app) fn refresh_slash_menu(&mut self, cx: &mut Context<Self>) {
-        if self.markdown_source_mode
+        if self.large_document_active()
+            || self.markdown_source_mode
             || self.workspace_view != WorkspaceView::Note
             || !self.editor_selection.is_empty()
             || self.note_link_picker.is_some()
@@ -2935,8 +2970,7 @@ impl SynapseApp {
     ) -> Option<(Point<Pixels>, bool)> {
         let layouts = self.editor_line_layouts.borrow();
         let layout = layouts
-            .iter()
-            .flatten()
+            .values()
             .find(|layout| layout.contains_source_char(range.end))?;
         let caret = layout.point_for_source_char(range.end);
         let below =
@@ -3158,19 +3192,20 @@ impl SynapseApp {
     }
 
     pub(in crate::app) fn selection_menu_anchor(&self) -> Option<Point<Pixels>> {
+        if self.large_document_active() {
+            return None;
+        }
         let range = self.editor_selection.range();
         if range.is_empty() || self.editor_selection.is_dragging() {
             return None;
         }
         let layouts = self.editor_line_layouts.borrow();
         let start_layout = layouts
-            .iter()
-            .flatten()
+            .values()
             .find(|layout| layout.contains_source_char(range.start))?;
         let end_index = range.end.saturating_sub(1).max(range.start);
         let end_layout = layouts
-            .iter()
-            .flatten()
+            .values()
             .find(|layout| layout.contains_source_char(end_index))?;
         let start = start_layout.point_for_source_char(range.start);
         let end = end_layout.point_for_source_char(range.end);
@@ -3419,7 +3454,7 @@ impl SynapseApp {
         position: Point<Pixels>,
     ) -> Option<usize> {
         let line_layouts = self.editor_line_layouts.borrow();
-        let mut layouts = line_layouts.iter().flatten();
+        let mut layouts = line_layouts.values();
         let first = layouts.next()?;
         if position.y < first.bounds.top() {
             return Some(first.source_line.start_char);
@@ -3446,8 +3481,7 @@ impl SynapseApp {
         let last_layout_bottom = self
             .editor_line_layouts
             .borrow()
-            .iter()
-            .flatten()
+            .values()
             .last()
             .map(|layout| layout.bounds.bottom());
         let clicked_below_document =
@@ -3455,7 +3489,8 @@ impl SynapseApp {
         let Some(mut cursor) = self.editor_char_for_position(event.position) else {
             return;
         };
-        if clicked_below_document
+        if !self.large_document_active()
+            && clicked_below_document
             && let Some(source) = self.state.active_document().map(|document| document.text())
             && let Some(edit) = trailing_fenced_code_block_paragraph_edit(&source)
         {
@@ -3474,11 +3509,14 @@ impl SynapseApp {
                 cursor = edit.cursor;
             }
         }
-        let linked_note = self
-            .state
-            .active_document()
-            .and_then(|document| markdown_link_context(&document.text(), cursor..cursor))
-            .and_then(|link| linked_vault_note(&link.destination, &self.state.entries));
+        let linked_note = (!self.large_document_active())
+            .then(|| {
+                self.state
+                    .active_document()
+                    .and_then(|document| markdown_link_context(&document.text(), cursor..cursor))
+                    .and_then(|link| linked_vault_note(&link.destination, &self.state.entries))
+            })
+            .flatten();
         if let Some(relative_path) = linked_note {
             self.select_note(relative_path, window, cx);
             cx.stop_propagation();

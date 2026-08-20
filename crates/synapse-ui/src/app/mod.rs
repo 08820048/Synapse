@@ -52,7 +52,7 @@ use gpui_component::{
 };
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher as _};
 use synapse::{ShellState, smart_enter_edit, trailing_fenced_code_block_paragraph_edit};
-use synapse_core::{VaultEntry, VaultEntryKind};
+use synapse_core::{NoteDocument, VaultEntry, VaultEntryKind};
 
 mod commands;
 mod editor;
@@ -91,7 +91,8 @@ use self::editor::surface::{
     CodeSyntaxCache, CodeSyntaxEdit, EditorLineLayout, EditorSelection, MarkdownBlockKind,
     MarkdownCalloutKind, MarkdownImage, MarkdownInlineFootnote, MarkdownInlineMath,
     MarkdownLineElement, MarkdownTableRow, SourceLine, footnote_preview_line,
-    source_lines_from_buffer_with_syntax_cache, source_lines_with_mode, task_preview_line,
+    plain_source_line, source_lines_from_buffer_with_syntax_cache, source_lines_with_mode,
+    task_preview_line,
 };
 use self::platform::http_client::SynapseHttpClient;
 use self::platform::updater;
@@ -162,6 +163,11 @@ const EDITOR_WIDE_GUTTER: f32 = 32.0;
 const EDITOR_TOP_PADDING: f32 = 24.0;
 const EDITOR_BODY_FONT_SIZE: f32 = 16.0;
 const EDITOR_BODY_LINE_HEIGHT: f32 = 26.4;
+/// Rich Markdown carries per-character mappings and block metadata. Past this size, build only
+/// a plain source window around the viewport instead of allocating that model for the full note.
+const LARGE_DOCUMENT_THRESHOLD_BYTES: usize = 1024 * 1024;
+const LARGE_DOCUMENT_CACHE_BEHIND_LINES: usize = 64;
+const LARGE_DOCUMENT_CACHE_AHEAD_LINES: usize = 256;
 // Render diagrams and formulas only for the viewport and its immediate surroundings. Their SVG
 // generation is substantially more expensive than ordinary Markdown layout, so doing it for an
 // entire note before its first frame makes opening long notes needlessly slow.
@@ -1430,13 +1436,22 @@ struct SynapseApp {
     note_link_picker_generation: u64,
     slash_menu_scroll: ScrollHandle,
     code_completion_scroll: ScrollHandle,
-    editor_line_layouts: Rc<RefCell<Vec<Option<EditorLineLayout>>>>,
+    editor_line_layouts: Rc<RefCell<BTreeMap<usize, EditorLineLayout>>>,
     editor_list_state: ListState,
     editor_visible_range: Range<usize>,
     editor_outline_hovered_index: Option<usize>,
     editor_render_cache: Option<EditorRenderCache>,
+    large_document_render_cache: Option<LargeDocumentRenderCache>,
     editor_blink: CursorBlinkState,
     markdown_source_mode: bool,
+}
+
+impl SynapseApp {
+    pub(in crate::app) fn large_document_active(&self) -> bool {
+        self.state
+            .active_document()
+            .is_some_and(|document| document.len_bytes() >= LARGE_DOCUMENT_THRESHOLD_BYTES)
+    }
 }
 
 struct EditorRenderCache {
@@ -1454,6 +1469,57 @@ struct EditorRenderCache {
     mermaid_previews: Rc<BTreeMap<usize, MermaidPreview>>,
     math_previews: Rc<BTreeMap<usize, MathPreview>>,
     image_previews: Rc<BTreeMap<usize, MarkdownImagePreview>>,
+}
+
+#[derive(Clone)]
+enum EditorRows {
+    Rich(Rc<Vec<Rc<SourceLine>>>),
+    Large {
+        line_count: usize,
+        lines: Rc<BTreeMap<usize, Rc<SourceLine>>>,
+    },
+}
+
+impl EditorRows {
+    fn line_count(&self) -> usize {
+        match self {
+            Self::Rich(lines) => lines.len(),
+            Self::Large { line_count, .. } => *line_count,
+        }
+    }
+
+    fn line_at(&self, index: usize) -> Rc<SourceLine> {
+        match self {
+            Self::Rich(lines) => lines[index].clone(),
+            Self::Large { lines, .. } => lines
+                .get(&index)
+                .cloned()
+                // The virtual list can ask for an item just outside its last reported
+                // viewport. It will be materialized on the immediately following render.
+                .unwrap_or_else(|| Rc::new(plain_source_line(0, ""))),
+        }
+    }
+}
+
+struct LargeDocumentRenderCache {
+    vault_root: PathBuf,
+    relative_path: PathBuf,
+    revision: u64,
+    line_count: usize,
+    cached_range: Range<usize>,
+    lines: Rc<BTreeMap<usize, Rc<SourceLine>>>,
+}
+
+impl LargeDocumentRenderCache {
+    fn matches(&self, vault_root: &Path, relative_path: &Path, revision: u64) -> bool {
+        self.vault_root == vault_root
+            && self.relative_path == relative_path
+            && self.revision == revision
+    }
+
+    fn covers(&self, line_range: &Range<usize>) -> bool {
+        self.cached_range.start <= line_range.start && self.cached_range.end >= line_range.end
+    }
 }
 
 #[derive(Clone)]
@@ -1565,6 +1631,63 @@ fn changed_line_span(
         prefix..old_lines.len().saturating_sub(suffix),
         new_lines.len().saturating_sub(prefix + suffix),
     ))
+}
+
+fn splice_editor_line_layouts(
+    layouts: &mut BTreeMap<usize, EditorLineLayout>,
+    old_range: Range<usize>,
+    new_count: usize,
+) {
+    let old_count = old_range.end.saturating_sub(old_range.start);
+    let shift = new_count as isize - old_count as isize;
+    let previous = std::mem::take(layouts);
+    for (index, layout) in previous {
+        if index < old_range.start {
+            layouts.insert(index, layout);
+        } else if index >= old_range.end {
+            let shifted = (index as isize + shift).max(0) as usize;
+            layouts.insert(shifted, layout);
+        }
+    }
+}
+
+fn large_document_line_range(
+    visible_range: Range<usize>,
+    line_count: usize,
+    cursor_line: usize,
+) -> Range<usize> {
+    if line_count == 0 {
+        return 0..0;
+    }
+    let visible_range = if visible_range.is_empty() {
+        cursor_line.min(line_count.saturating_sub(1))
+            ..cursor_line.min(line_count.saturating_sub(1)).saturating_add(1)
+    } else {
+        visible_range.start.min(line_count)..visible_range.end.min(line_count)
+    };
+    let start = visible_range
+        .start
+        .saturating_sub(LARGE_DOCUMENT_CACHE_BEHIND_LINES);
+    let end = visible_range
+        .end
+        .saturating_add(LARGE_DOCUMENT_CACHE_AHEAD_LINES)
+        .min(line_count);
+    start.min(end)..end
+}
+
+fn materialize_large_document_lines(
+    document: &NoteDocument,
+    line_range: Range<usize>,
+) -> Rc<BTreeMap<usize, Rc<SourceLine>>> {
+    let start = line_range.start.min(document.line_count());
+    let end = line_range.end.min(document.line_count()).max(start);
+    let mut lines = BTreeMap::new();
+    for line_index in start..end {
+        let source = document.line_text(line_index);
+        let line = plain_source_line(document.line_start_char(line_index), &source);
+        lines.insert(line_index, Rc::new(line));
+    }
+    Rc::new(lines)
 }
 
 fn editor_line_layout_matches(old: &SourceLine, new: &SourceLine) -> bool {
@@ -3103,7 +3226,7 @@ pub(crate) fn run() {
                         InputState::new(window, cx)
                             .placeholder(language.text("链接到笔记…", "Link to note…"))
                     });
-                    let editor_line_layouts = Rc::new(RefCell::new(Vec::new()));
+                    let editor_line_layouts = Rc::new(RefCell::new(BTreeMap::new()));
                     let editor_list_state = ListState::new(0, ListAlignment::Top, px(320.0));
                     let app = cx.new(|cx| {
                         let input_subscriptions = vec![
@@ -3331,6 +3454,7 @@ pub(crate) fn run() {
                             editor_visible_range: 0..0,
                             editor_outline_hovered_index: None,
                             editor_render_cache: None,
+                            large_document_render_cache: None,
                             editor_blink: CursorBlinkState::default(),
                             markdown_source_mode: false,
                         }
@@ -3339,13 +3463,9 @@ pub(crate) fn run() {
                         let editor_line_layouts = editor_line_layouts.clone();
                         let app = app.downgrade();
                         move |event, _, cx| {
-                            for (index, layout) in
-                                editor_line_layouts.borrow_mut().iter_mut().enumerate()
-                            {
-                                if !event.visible_range.contains(&index) {
-                                    *layout = None;
-                                }
-                            }
+                            editor_line_layouts
+                                .borrow_mut()
+                                .retain(|index, _| event.visible_range.contains(index));
                             let visible_range = event.visible_range.clone();
                             let _ = app.update(cx, |this, cx| {
                                 if this.editor_visible_range != visible_range {
@@ -3382,10 +3502,13 @@ mod tests {
         fs,
         path::{Path, PathBuf},
         rc::Rc,
-        time::Duration,
+        time::{Duration, Instant},
     };
 
-    use gpui::{Bounds, Image, ImageFormat, MouseButton, WindowKind, px, rgb, size};
+    use gpui::{
+        Bounds, Image, ImageFormat, ListAlignment, ListState, MouseButton, WindowKind, px, rgb,
+        size,
+    };
     use synapse_core::{VaultEntry, VaultEntryKind};
     use tempfile::tempdir;
 
@@ -3406,7 +3529,8 @@ mod tests {
         SLASH_MENU_REVEAL_DELAY, SYNAPSE_APP_ICON_PNG, SlashCommand, TABLE_CELL_HORIZONTAL_PADDING,
         TABLE_CELL_VERTICAL_PADDING, TABLE_FONT_SIZE, TABLE_ROW_MIN_HEIGHT, TITLEBAR_HEIGHT,
         TODO_AUTO_CLEAR_COMPLETED_HOLD, TODO_AUTO_CLEAR_EXIT, TODO_AUTO_CLEAR_EXIT_OFFSET,
-        ThemePreference, TreeTarget, active_document_outline_index, build_document_outline,
+        ThemePreference, TreeTarget, ShellState, active_document_outline_index,
+        build_document_outline,
         build_file_tree_rows, build_image_previews, build_math_previews, build_mermaid_previews,
         changed_line_span, clipboard_image_extension, code_block_edges,
         command_palette_key_bindings, default_window_size, document_outline_horizontal_layout,
@@ -3415,7 +3539,8 @@ mod tests {
         embedded_app_icon_png_metadata, fenced_code_block_edit, file_manager_reveal_command,
         filtered_slash_commands, inline_format_edit, inline_format_is_active,
         is_tab_context_trigger, linked_vault_note, markd_panel_spring_progress,
-        markdown_link_context, markdown_list_items_in_selection, normalize_clipboard_text,
+        large_document_line_range, materialize_large_document_lines, markdown_link_context,
+        markdown_list_items_in_selection, normalize_clipboard_text,
         normalize_markdown_link_destination, note_breadcrumb_parts, note_link_candidates,
         parse_boolean_preference, path_is_inside_macos_app_bundle, persist_clipboard_image,
         prune_collapsed_directories, resolve_markdown_image, select_startup_vault_path,
@@ -3809,6 +3934,54 @@ mod tests {
             .map(Rc::new)
             .collect::<Vec<_>>();
         assert_eq!(changed_line_span(&old, &inserted), Some((1..1, 1)));
+    }
+
+    #[test]
+    fn large_document_cache_window_follows_the_viewport_without_growing_with_the_note() {
+        assert_eq!(large_document_line_range(0..0, 10_000, 500), 436..757);
+        assert_eq!(large_document_line_range(1_000..1_012, 10_000, 500), 936..1_268);
+        assert_eq!(large_document_line_range(9_980..10_000, 10_000, 0), 9_916..10_000);
+        assert_eq!(large_document_line_range(0..0, 0, 0), 0..0);
+    }
+
+    #[test]
+    #[ignore = "manual large-document performance probe"]
+    fn large_document_viewport_materialization_avoids_full_markdown_model_build() {
+        const TARGET_BYTES: usize = 3 * 1024 * 1024;
+        const ROW: &str = "## Section\nA normal paragraph with enough content to represent a realistic Markdown document.\n\n";
+
+        let mut source = ROW.repeat(TARGET_BYTES / ROW.len() + 1);
+        source.truncate(TARGET_BYTES);
+        let vault = tempdir().unwrap();
+        fs::write(vault.path().join("large.md"), &source).unwrap();
+
+        let mut state = ShellState::from_vault_argument(Some(vault.path().into()));
+        let opened_at = Instant::now();
+        state.select_note(Path::new("large.md")).unwrap();
+        let open_elapsed = opened_at.elapsed();
+        let document = state.active_document().unwrap();
+        assert!(document.len_bytes() >= TARGET_BYTES);
+
+        let list_at = Instant::now();
+        let list_state = ListState::new(document.line_count(), ListAlignment::Top, px(100.0));
+        let list_elapsed = list_at.elapsed();
+
+        let viewport_at = Instant::now();
+        let viewport_lines = materialize_large_document_lines(document, 0..256);
+        let viewport_elapsed = viewport_at.elapsed();
+
+        let rich_at = Instant::now();
+        let rich_lines = source_lines(&source, 0, false);
+        let rich_elapsed = rich_at.elapsed();
+
+        eprintln!(
+            "3 MiB markdown: open={open_elapsed:?}, list={} rows in {list_elapsed:?}, viewport={} rows in {viewport_elapsed:?}, full rich={} rows in {rich_elapsed:?}",
+            list_state.item_count(),
+            viewport_lines.len(),
+            rich_lines.len(),
+        );
+        assert_eq!(viewport_lines.len(), 256);
+        assert!(rich_lines.len() > viewport_lines.len());
     }
 
     #[test]

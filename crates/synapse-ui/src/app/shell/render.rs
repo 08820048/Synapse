@@ -91,6 +91,7 @@ impl Render for SynapseApp {
             let document_len = document.len_chars();
             let dark_mode = theme.is_dark();
             let source_mode = self.markdown_source_mode;
+            let large_document = document.len_bytes() >= LARGE_DOCUMENT_THRESHOLD_BYTES;
             let previous_revision = self.editor_render_cache.as_ref().and_then(|cache| {
                 (cache.vault_root == vault_root && cache.relative_path == relative_path)
                     .then_some(cache.revision)
@@ -104,7 +105,100 @@ impl Render for SynapseApp {
                     source_mode,
                 )
             });
-            let (lines, outline, mut mermaid_previews, mut math_previews, mut image_previews) = if cache_hit {
+            let (
+                editor_rows,
+                rich_lines,
+                outline,
+                mut mermaid_previews,
+                mut math_previews,
+                mut image_previews,
+            ) = if large_document {
+                self.editor_render_cache = None;
+                let line_count = document.line_count();
+                let same_document = self
+                    .large_document_render_cache
+                    .as_ref()
+                    .is_some_and(|cache| {
+                        cache.vault_root == vault_root && cache.relative_path == relative_path
+                    });
+                let previous_line_count = self
+                    .large_document_render_cache
+                    .as_ref()
+                    .filter(|cache| {
+                        cache.vault_root == vault_root && cache.relative_path == relative_path
+                    })
+                    .map(|cache| cache.line_count);
+                let previous_revision = self
+                    .large_document_render_cache
+                    .as_ref()
+                    .filter(|cache| {
+                        cache.vault_root == vault_root && cache.relative_path == relative_path
+                    })
+                    .map(|cache| cache.revision);
+                if !same_document {
+                    self.editor_list_state.reset(line_count);
+                    self.editor_line_layouts.borrow_mut().clear();
+                    self.editor_visible_range = 0..0;
+                    self.editor_outline_hovered_index = None;
+                } else if let Some(previous_line_count) = previous_line_count
+                    && previous_line_count != line_count
+                {
+                    let anchor = document.char_to_line(cursor).min(line_count);
+                    if line_count > previous_line_count {
+                        self.editor_list_state.splice(
+                            anchor..anchor,
+                            line_count - previous_line_count,
+                        );
+                    } else {
+                        self.editor_list_state.splice(
+                            anchor..anchor + (previous_line_count - line_count),
+                            0,
+                        );
+                    }
+                    self.editor_line_layouts.borrow_mut().clear();
+                }
+                if previous_revision.is_some_and(|previous| previous != revision) {
+                    self.editor_line_layouts.borrow_mut().clear();
+                }
+                let visible_line_range = large_document_line_range(
+                    self.editor_visible_range.clone(),
+                    line_count,
+                    document.char_to_line(cursor),
+                );
+                let lines = self
+                    .large_document_render_cache
+                    .as_ref()
+                    .filter(|cache| {
+                        cache.matches(&vault_root, &relative_path, revision)
+                            && cache.covers(&visible_line_range)
+                    })
+                    .map(|cache| cache.lines.clone())
+                    .unwrap_or_else(|| {
+                        let lines = materialize_large_document_lines(
+                            document,
+                            visible_line_range.clone(),
+                        );
+                        self.large_document_render_cache = Some(LargeDocumentRenderCache {
+                            vault_root: vault_root.clone(),
+                            relative_path: relative_path.clone(),
+                            revision,
+                            line_count,
+                            cached_range: visible_line_range,
+                            lines: lines.clone(),
+                        });
+                        lines
+                    });
+                (
+                    EditorRows::Large { line_count, lines },
+                    None,
+                    Rc::new(Vec::new()),
+                    Rc::new(BTreeMap::new()),
+                    Rc::new(BTreeMap::new()),
+                    Rc::new(BTreeMap::new()),
+                )
+            } else {
+                self.large_document_render_cache = None;
+                let (lines, outline, mermaid_previews, math_previews, image_previews) = if cache_hit {
                 let cache = self
                     .editor_render_cache
                     .as_ref()
@@ -215,14 +309,15 @@ impl Render for SynapseApp {
                         changed_line_span(&previous_lines, &parsed)
                     {
                         self.editor_list_state.splice(old_range.clone(), new_count);
-                        self.editor_line_layouts
-                            .borrow_mut()
-                            .splice(old_range, (0..new_count).map(|_| None));
+                        splice_editor_line_layouts(
+                            &mut self.editor_line_layouts.borrow_mut(),
+                            old_range,
+                            new_count,
+                        );
                     }
                 } else {
                     self.editor_list_state.reset(parsed.len());
-                    *self.editor_line_layouts.borrow_mut() =
-                        (0..parsed.len()).map(|_| None).collect();
+                    self.editor_line_layouts.borrow_mut().clear();
                     self.editor_visible_range = 0..0;
                     self.editor_outline_hovered_index = None;
                 }
@@ -290,13 +385,22 @@ impl Render for SynapseApp {
                     math_previews,
                     image_previews,
                 )
+                };
+                (
+                    EditorRows::Rich(lines.clone()),
+                    Some(lines),
+                    outline,
+                    mermaid_previews,
+                    math_previews,
+                    image_previews,
+                )
             };
-            if !source_mode {
+            if let Some(lines) = rich_lines.as_ref().filter(|_| !source_mode) {
                 let preview_range =
                     editor_preview_range(self.editor_visible_range.clone(), lines.len());
                 if let Some(expanded_previews) = extend_mermaid_previews(
                     &mermaid_previews,
-                    &lines,
+                    lines,
                     dark_mode,
                     preview_range.clone(),
                 ) {
@@ -306,7 +410,7 @@ impl Render for SynapseApp {
                     }
                 }
                 if let Some(expanded_previews) =
-                    extend_math_previews(&math_previews, &lines, dark_mode, preview_range.clone())
+                    extend_math_previews(&math_previews, lines, dark_mode, preview_range.clone())
                 {
                     math_previews = expanded_previews;
                     if let Some(cache) = self.editor_render_cache.as_mut() {
@@ -315,7 +419,7 @@ impl Render for SynapseApp {
                 }
                 if let Some(expanded_previews) = extend_image_previews(
                     &image_previews,
-                    &lines,
+                    lines,
                     &vault_root,
                     &relative_path,
                     preview_range,
@@ -328,11 +432,6 @@ impl Render for SynapseApp {
             }
             self.editor_selection.clamp(document_len);
             let selection = self.editor_selection.range();
-            if self.editor_line_layouts.borrow().len() != lines.len() {
-                self.editor_line_layouts
-                    .borrow_mut()
-                    .resize_with(lines.len(), || None);
-            }
             let app = cx.entity();
             let line_layouts = self.editor_line_layouts.clone();
             let outline_horizontal_layout = document_outline_horizontal_layout(
@@ -467,9 +566,9 @@ impl Render for SynapseApp {
                 .on_mouse_up_out(MouseButton::Left, cx.listener(Self::editor_mouse_up))
                 .child(
                     list(self.editor_list_state.clone(), {
-                        let lines = lines.clone();
+                        let editor_rows = editor_rows.clone();
                         let row_context = EditorRowContext {
-                            line_count: lines.len(),
+                            line_count: editor_rows.line_count(),
                             app,
                             line_layouts,
                             cursor,
@@ -483,7 +582,7 @@ impl Render for SynapseApp {
                             language: self.language,
                         };
                         move |index, _, cx| {
-                            render_editor_row(index, lines[index].clone(), &row_context, cx)
+                            render_editor_row(index, editor_rows.line_at(index), &row_context, cx)
                         }
                     })
                     .size_full(),
@@ -1649,6 +1748,7 @@ impl Render for SynapseApp {
                 let parts = note_breadcrumb_parts(&path);
                 let last_index = parts.len().saturating_sub(1);
                 let source_mode = self.markdown_source_mode;
+                let large_document = self.large_document_active();
                 let source_app = app_entity.clone();
                 let menu_app = app_entity.clone();
                 div()
@@ -1700,24 +1800,43 @@ impl Render for SynapseApp {
                                     )
                             })),
                     )
+                    .when(large_document, |toolbar| {
+                        toolbar.child(
+                            div()
+                                .mr_2()
+                                .flex_none()
+                                .text_size(px(11.0))
+                                .text_color(theme.muted_foreground)
+                                .child(self.language.text(
+                                    "大文件性能模式",
+                                    "Large-file performance mode",
+                                )),
+                        )
+                    })
                     .child(
                         Button::new("toggle-markdown-source")
                             .text()
                             .rounded(ButtonRounded::None)
                             .size(px(40.0))
-                            .tooltip(if source_mode {
-                                "Show rich editor"
+                            .disabled(large_document)
+                            .tooltip(if large_document {
+                                self.language.text(
+                                    "大文件使用轻量源码编辑，已关闭富文本渲染",
+                                    "Large files use lightweight source editing; rich rendering is off",
+                                )
+                            } else if source_mode {
+                                self.language.text("显示富文本编辑器", "Show rich editor")
                             } else {
-                                "Show Markdown source"
+                                self.language.text("显示 Markdown 源码", "Show Markdown source")
                             })
                             .child(
-                                if source_mode {
+                                if source_mode || large_document {
                                     Icon::RichText
                                 } else {
                                     Icon::Code
                                 }
                                 .render(15.0)
-                                .text_color(if source_mode {
+                                .text_color(if source_mode || large_document {
                                     theme.foreground
                                 } else {
                                     theme.muted_foreground
@@ -2755,10 +2874,14 @@ impl Render for SynapseApp {
             let paste_app = app_entity.clone();
             let add_todos_app = app_entity.clone();
             let has_selection = !self.editor_selection.is_empty();
-            let has_list_items = self.state.active_document().is_some_and(|document| {
-                !markdown_list_items_in_selection(&document.text(), self.editor_selection.range())
+            let has_list_items = !self.large_document_active()
+                && self.state.active_document().is_some_and(|document| {
+                    !markdown_list_items_in_selection(
+                        &document.text(),
+                        self.editor_selection.range(),
+                    )
                     .is_empty()
-            });
+                });
             let panel = div()
                 .id(SharedString::from(format!(
                     "editor-context-menu-{context_menu_theme_key}"

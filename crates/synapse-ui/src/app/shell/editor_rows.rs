@@ -4,7 +4,7 @@ use super::super::*;
 pub(super) struct EditorRowContext {
     pub(super) line_count: usize,
     pub(super) app: Entity<SynapseApp>,
-    pub(super) line_layouts: Rc<RefCell<Vec<Option<EditorLineLayout>>>>,
+    pub(super) line_layouts: Rc<RefCell<BTreeMap<usize, EditorLineLayout>>>,
     pub(super) cursor: usize,
     pub(super) selection: Range<usize>,
     pub(super) cursor_visible: bool,
@@ -73,15 +73,16 @@ fn editor_block_layout_canvas(
                 let focus = app.read(cx).editor_focus.clone();
                 window.handle_input(&focus, ElementInputHandler::new(bounds, app.clone()), cx);
             }
-            if let Some(slot) = line_layouts.borrow_mut().get_mut(index) {
-                *slot = Some(EditorLineLayout {
+            line_layouts.borrow_mut().insert(
+                index,
+                EditorLineLayout {
                     bounds,
                     wrapped_line: None,
                     line_height: bounds.size.height,
                     source_line: line,
                     table_cells: None,
-                });
-            }
+                },
+            );
         },
     )
     .absolute()
@@ -245,15 +246,16 @@ fn editor_table_layout_canvas(
                 let focus = app.read(cx).editor_focus.clone();
                 window.handle_input(&focus, ElementInputHandler::new(bounds, app.clone()), cx);
             }
-            if let Some(slot) = line_layouts.borrow_mut().get_mut(index) {
-                *slot = Some(EditorLineLayout {
+            line_layouts.borrow_mut().insert(
+                index,
+                EditorLineLayout {
                     bounds,
                     wrapped_line: None,
                     line_height: bounds.size.height,
                     source_line: line,
                     table_cells: Some(table_cells),
-                });
-            }
+                },
+            );
         },
     )
     .absolute()

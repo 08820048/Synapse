@@ -1,4 +1,4 @@
-use std::{cell::RefCell, ops::Range, rc::Rc};
+use std::{cell::RefCell, collections::BTreeMap, ops::Range, rc::Rc};
 
 use gpui::{
     App, Bounds, Context, Element, ElementId, ElementInputHandler, Entity, EntityInputHandler,
@@ -19,7 +19,7 @@ use writ::{
     segment_map::{SegmentMap, Special},
 };
 
-use super::{super::SynapseApp, code_block::CodeTextInput};
+use super::{super::{LARGE_DOCUMENT_THRESHOLD_BYTES, SynapseApp}, code_block::CodeTextInput};
 
 const LIST_BULLET_DIAMETER: f32 = 5.0;
 const LIST_BULLET_OPTICAL_Y_OFFSET: f32 = -0.5;
@@ -774,6 +774,18 @@ fn raw_source_presentation(source: &str) -> MarkdownLinePresentation {
         inline_images: Vec::new(),
         source_to_display: (0..=len).collect(),
         display_to_source: (0..=len).collect(),
+    }
+}
+
+/// Builds a lightweight source row without parsing the surrounding document.
+///
+/// Large documents use this for the currently visible viewport so their editor can
+/// become interactive without allocating Markdown presentation maps for every line.
+pub fn plain_source_line(start_char: usize, source: &str) -> SourceLine {
+    SourceLine {
+        start_char,
+        source_len_chars: source.chars().count(),
+        presentation: raw_source_presentation(source),
     }
 }
 
@@ -2883,7 +2895,7 @@ fn distance_to_bounds(position: gpui::Point<Pixels>, bounds: Bounds<Pixels>) -> 
 
 pub struct MarkdownLineElement {
     pub app: Entity<SynapseApp>,
-    pub line_layouts: Rc<RefCell<Vec<Option<EditorLineLayout>>>>,
+    pub line_layouts: Rc<RefCell<BTreeMap<usize, EditorLineLayout>>>,
     pub line_index: usize,
     /// When this element renders a table cell, report its shaped layout to
     /// the containing row instead of replacing that row's line layout.
@@ -3166,8 +3178,8 @@ impl Element for MarkdownLineElement {
                 line_height: prepaint.line_height,
                 source_line: self.source_line.clone(),
             });
-        } else if let Some(slot) = self.line_layouts.borrow_mut().get_mut(self.line_index) {
-            *slot = Some(layout);
+        } else {
+            self.line_layouts.borrow_mut().insert(self.line_index, layout);
         }
     }
 }
@@ -3357,10 +3369,10 @@ impl EntityInputHandler for SynapseApp {
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<String> {
-        let text = self.state.active_document()?.text();
-        let range = utf16_range_to_char(&text, &range_utf16);
-        actual_range.replace(char_range_to_utf16(&text, &range));
-        Some(text.chars().skip(range.start).take(range.len()).collect())
+        let document = self.state.active_document()?;
+        let range = document.utf16_range_to_char(&range_utf16);
+        actual_range.replace(document.char_range_to_utf16(&range));
+        document.slice(range).ok()
     }
 
     fn selected_text_range(
@@ -3369,19 +3381,19 @@ impl EntityInputHandler for SynapseApp {
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<UTF16Selection> {
-        let text = self.state.active_document()?.text();
+        let document = self.state.active_document()?;
         let selection = self.editor_selection.range();
         Some(UTF16Selection {
-            range: char_range_to_utf16(&text, &selection),
+            range: document.char_range_to_utf16(&selection),
             reversed: self.editor_selection.is_reversed(),
         })
     }
 
     fn marked_text_range(&self, _: &mut Window, _: &mut Context<Self>) -> Option<Range<usize>> {
-        let text = self.state.active_document()?.text();
+        let document = self.state.active_document()?;
         self.editor_marked_range
             .as_ref()
-            .map(|range| char_range_to_utf16(&text, range))
+            .map(|range| document.char_range_to_utf16(range))
     }
 
     fn unmark_text(&mut self, _: &mut Window, _: &mut Context<Self>) {
@@ -3399,19 +3411,25 @@ impl EntityInputHandler for SynapseApp {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(source) = self.state.active_document().map(|document| document.text()) else {
+        let Some((range, source)) = self.state.active_document().map(|document| {
+            let range = range_utf16
+                .as_ref()
+                .map(|range| document.utf16_range_to_char(range))
+                .or_else(|| self.editor_marked_range.clone())
+                .unwrap_or_else(|| self.editor_selection.range());
+            let source = (document.len_bytes() < LARGE_DOCUMENT_THRESHOLD_BYTES)
+                .then(|| document.text());
+            (range, source)
+        }) else {
             return;
         };
-        let range = range_utf16
-            .as_ref()
-            .map(|range| utf16_range_to_char(&source, range))
-            .or_else(|| self.editor_marked_range.clone())
-            .unwrap_or_else(|| self.editor_selection.range());
         // IME composition must remain transparent to the platform. Normal committed
         // single-character input in a fenced code block goes through the code behavior
         // layer so paired delimiters share the document's existing selection and undo path.
         if self.editor_marked_range.is_none()
-            && let Some(input) = self.code_text_input_behavior(&source, range.clone(), text)
+            && let Some(input) = source
+                .as_deref()
+                .and_then(|source| self.code_text_input_behavior(source, range.clone(), text))
         {
             match input {
                 CodeTextInput::Edit(edit) => {
@@ -3447,14 +3465,15 @@ impl EntityInputHandler for SynapseApp {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(source) = self.state.active_document().map(|document| document.text()) else {
+        let Some(range) = self.state.active_document().map(|document| {
+            range_utf16
+                .as_ref()
+                .map(|range| document.utf16_range_to_char(range))
+                .or_else(|| self.editor_marked_range.clone())
+                .unwrap_or_else(|| self.editor_selection.range())
+        }) else {
             return;
         };
-        let range = range_utf16
-            .as_ref()
-            .map(|range| utf16_range_to_char(&source, range))
-            .or_else(|| self.editor_marked_range.clone())
-            .unwrap_or_else(|| self.editor_selection.range());
         let start = range.start;
         let previous_revision = self
             .state
@@ -3488,12 +3507,11 @@ impl EntityInputHandler for SynapseApp {
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
-        let text = self.state.active_document()?.text();
-        let range = utf16_range_to_char(&text, &range_utf16);
+        let document = self.state.active_document()?;
+        let range = document.utf16_range_to_char(&range_utf16);
         let line_layouts = self.editor_line_layouts.borrow();
         let layout = line_layouts
-            .iter()
-            .flatten()
+            .values()
             .find(|layout| layout.contains_source_char(range.start))?;
         let right_char = range
             .end
@@ -3512,15 +3530,12 @@ impl EntityInputHandler for SynapseApp {
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<usize> {
-        let text = self.state.active_document()?.text();
+        let document = self.state.active_document()?;
         let line_layouts = self.editor_line_layouts.borrow();
-        let layout = line_layouts.iter().flatten().find(|layout| {
+        let layout = line_layouts.values().find(|layout| {
             position.y >= layout.bounds.top() && position.y <= layout.bounds.bottom()
         })?;
-        Some(char_offset_to_utf16(
-            &text,
-            layout.source_char_for_position(position),
-        ))
+        Some(document.char_to_utf16(layout.source_char_for_position(position)))
     }
 }
 
@@ -3550,18 +3565,6 @@ fn utf16_offset_to_char(text: &str, offset: usize) -> usize {
         utf16_count += character.len_utf16();
     }
     text.chars().count()
-}
-
-fn char_offset_to_utf16(text: &str, offset: usize) -> usize {
-    text.chars().take(offset).map(char::len_utf16).sum()
-}
-
-fn utf16_range_to_char(text: &str, range: &Range<usize>) -> Range<usize> {
-    utf16_offset_to_char(text, range.start)..utf16_offset_to_char(text, range.end)
-}
-
-fn char_range_to_utf16(text: &str, range: &Range<usize>) -> Range<usize> {
-    char_offset_to_utf16(text, range.start)..char_offset_to_utf16(text, range.end)
 }
 
 #[cfg(test)]
