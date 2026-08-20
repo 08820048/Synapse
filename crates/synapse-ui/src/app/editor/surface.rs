@@ -19,7 +19,7 @@ use writ::{
     segment_map::{SegmentMap, Special},
 };
 
-use super::{super::{LARGE_DOCUMENT_THRESHOLD_BYTES, SynapseApp}, code_block::CodeTextInput};
+use super::{super::SynapseApp, code_block::CodeTextInput};
 
 const LIST_BULLET_DIAMETER: f32 = 5.0;
 const LIST_BULLET_OPTICAL_Y_OFFSET: f32 = -0.5;
@@ -361,6 +361,76 @@ pub struct SourceLine {
 pub fn source_lines(text: &str, cursor: usize, dark_mode: bool) -> Vec<SourceLine> {
     let mut buffer: Buffer = text.parse().expect("writ buffer parsing is infallible");
     source_lines_from_buffer(&mut buffer, cursor, dark_mode)
+}
+
+/// Moves parsed source coordinates from a window-local document into the original document.
+///
+/// Markdown presentation carries a few interaction ranges in addition to each line's own
+/// `start_char` (for example a task checkbox and a code block's content range).  Rendering a
+/// large document in windows must translate all of them together, otherwise its visual state
+/// looks correct while clicks and carets target the wrong part of the note.
+pub fn offset_source_lines(lines: &mut [SourceLine], source_offset: usize) {
+    shift_source_lines(lines, source_offset as isize);
+}
+
+/// Translates parsed source coordinates by a signed character delta.
+///
+/// This is used when a local edit shifts already-rendered rows after the edit
+/// point. It preserves their rich presentation while a fresh projection for
+/// the changed rows is prepared in the background.
+pub fn shift_source_lines(lines: &mut [SourceLine], character_delta: isize) {
+    if character_delta == 0 {
+        return;
+    }
+
+    for line in lines {
+        shift_source_position(&mut line.start_char, character_delta);
+        let presentation = &mut line.presentation;
+        if let Some(code) = presentation.code_line.as_mut() {
+            shift_source_position(&mut code.content_start_char, character_delta);
+            shift_source_position(&mut code.content_end_char, character_delta);
+        }
+        if let Some(block) = presentation.mermaid_block.as_mut() {
+            shift_source_position(&mut block.source_start_char, character_delta);
+            shift_source_position(&mut block.source_end_char, character_delta);
+        }
+        if let Some(block) = presentation.math_block.as_mut() {
+            shift_source_position(&mut block.source_start_char, character_delta);
+            shift_source_position(&mut block.source_end_char, character_delta);
+        }
+        for inline in &mut presentation.inline_math {
+            shift_source_position(&mut inline.source_start_char, character_delta);
+            shift_source_position(&mut inline.source_end_char, character_delta);
+        }
+        if let Some(task) = presentation.task_item.as_mut() {
+            shift_source_position(&mut task.checkbox_start_char, character_delta);
+            shift_source_position(&mut task.checkbox_end_char, character_delta);
+            shift_source_position(&mut task.content_start_char, character_delta);
+        }
+        if let Some(footnote) = presentation.footnote_definition.as_mut() {
+            shift_source_position(&mut footnote.content_start_char, character_delta);
+        }
+        for footnote in &mut presentation.inline_footnotes {
+            shift_source_position(&mut footnote.source_start_char, character_delta);
+            shift_source_position(&mut footnote.source_end_char, character_delta);
+        }
+        if let Some(image) = presentation.image_block.as_mut() {
+            shift_source_position(&mut image.source_start_char, character_delta);
+            shift_source_position(&mut image.source_end_char, character_delta);
+        }
+        for image in &mut presentation.inline_images {
+            shift_source_position(&mut image.source_start_char, character_delta);
+            shift_source_position(&mut image.source_end_char, character_delta);
+        }
+    }
+}
+
+fn shift_source_position(position: &mut usize, character_delta: isize) {
+    if character_delta.is_negative() {
+        *position = position.saturating_sub(character_delta.unsigned_abs());
+    } else {
+        *position = position.saturating_add(character_delta as usize);
+    }
 }
 
 pub fn source_lines_with_mode(
@@ -779,8 +849,8 @@ fn raw_source_presentation(source: &str) -> MarkdownLinePresentation {
 
 /// Builds a lightweight source row without parsing the surrounding document.
 ///
-/// Large documents use this for the currently visible viewport so their editor can
-/// become interactive without allocating Markdown presentation maps for every line.
+/// Large documents use this as the immediate viewport fallback while their bounded rich
+/// Markdown projection is prepared off the main thread.
 pub fn plain_source_line(start_char: usize, source: &str) -> SourceLine {
     SourceLine {
         start_char,
@@ -3179,7 +3249,9 @@ impl Element for MarkdownLineElement {
                 source_line: self.source_line.clone(),
             });
         } else {
-            self.line_layouts.borrow_mut().insert(self.line_index, layout);
+            self.line_layouts
+                .borrow_mut()
+                .insert(self.line_index, layout);
         }
     }
 }
@@ -3411,15 +3483,12 @@ impl EntityInputHandler for SynapseApp {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some((range, source)) = self.state.active_document().map(|document| {
-            let range = range_utf16
+        let Some(range) = self.state.active_document().map(|document| {
+            range_utf16
                 .as_ref()
                 .map(|range| document.utf16_range_to_char(range))
                 .or_else(|| self.editor_marked_range.clone())
-                .unwrap_or_else(|| self.editor_selection.range());
-            let source = (document.len_bytes() < LARGE_DOCUMENT_THRESHOLD_BYTES)
-                .then(|| document.text());
-            (range, source)
+                .unwrap_or_else(|| self.editor_selection.range())
         }) else {
             return;
         };
@@ -3427,9 +3496,7 @@ impl EntityInputHandler for SynapseApp {
         // single-character input in a fenced code block goes through the code behavior
         // layer so paired delimiters share the document's existing selection and undo path.
         if self.editor_marked_range.is_none()
-            && let Some(input) = source
-                .as_deref()
-                .and_then(|source| self.code_text_input_behavior(source, range.clone(), text))
+            && let Some(input) = self.code_text_input_behavior(range.clone(), text)
         {
             match input {
                 CodeTextInput::Edit(edit) => {
@@ -3576,8 +3643,8 @@ mod tests {
         LIST_BULLET_DIAMETER, MarkdownBlockKind, char_byte_boundaries, char_to_byte,
         code_block_language, footnote_preview_line, hidden_bullet_marker_range,
         inline_code_byte_ranges, source_lines, source_lines_from_buffer_with_syntax_cache,
-        source_lines_with_mode, table_cell_editor_line, task_preview_line, text_run_from_markdown,
-        visual_row_byte_ranges,
+        source_lines_with_mode, shift_source_lines, table_cell_editor_line, task_preview_line,
+        text_run_from_markdown, visual_row_byte_ranges,
     };
 
     fn present_markdown_line(source: &str) -> super::MarkdownLinePresentation {
@@ -3596,6 +3663,25 @@ mod tests {
         assert_eq!(line.display_char_for_source(3), 0);
         assert_eq!(line.source_char_for_display(0), 0);
         assert!(line.runs.iter().all(|run| !run.bold));
+    }
+
+    #[test]
+    fn shifting_windowed_lines_keeps_code_and_task_interaction_ranges_global() {
+        let mut lines = source_lines("```rust\nlet x = 1;\n```\n- [ ] task", 0, false);
+        shift_source_lines(&mut lines, 100);
+
+        let code = lines[1].presentation.code_line.as_ref().unwrap();
+        assert_eq!(lines[1].start_char, 108);
+        assert_eq!(code.content_start_char..code.content_end_char, 108..118);
+        let task = lines[3].presentation.task_item.as_ref().unwrap();
+        assert_eq!(task.checkbox_start_char..task.checkbox_end_char, 125..128);
+
+        shift_source_lines(&mut lines, -40);
+        let code = lines[1].presentation.code_line.as_ref().unwrap();
+        assert_eq!(lines[1].start_char, 68);
+        assert_eq!(code.content_start_char..code.content_end_char, 68..78);
+        let task = lines[3].presentation.task_item.as_ref().unwrap();
+        assert_eq!(task.checkbox_start_char..task.checkbox_end_char, 85..88);
     }
 
     #[test]

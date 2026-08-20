@@ -52,7 +52,7 @@ use gpui_component::{
 };
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher as _};
 use synapse::{ShellState, smart_enter_edit, trailing_fenced_code_block_paragraph_edit};
-use synapse_core::{NoteDocument, VaultEntry, VaultEntryKind};
+use synapse_core::{NoteDocument, NoteTextSnapshot, VaultEntry, VaultEntryKind};
 
 mod commands;
 mod editor;
@@ -90,9 +90,9 @@ use self::editor::surface::source_lines_from_buffer;
 use self::editor::surface::{
     CodeSyntaxCache, CodeSyntaxEdit, EditorLineLayout, EditorSelection, MarkdownBlockKind,
     MarkdownCalloutKind, MarkdownImage, MarkdownInlineFootnote, MarkdownInlineMath,
-    MarkdownLineElement, MarkdownTableRow, SourceLine, footnote_preview_line,
-    plain_source_line, source_lines_from_buffer_with_syntax_cache, source_lines_with_mode,
-    task_preview_line,
+    MarkdownLineElement, MarkdownTableRow, SourceLine, footnote_preview_line, offset_source_lines,
+    plain_source_line, shift_source_lines, source_lines,
+    source_lines_from_buffer_with_syntax_cache, source_lines_with_mode, task_preview_line,
 };
 use self::platform::http_client::SynapseHttpClient;
 use self::platform::updater;
@@ -163,11 +163,19 @@ const EDITOR_WIDE_GUTTER: f32 = 32.0;
 const EDITOR_TOP_PADDING: f32 = 24.0;
 const EDITOR_BODY_FONT_SIZE: f32 = 16.0;
 const EDITOR_BODY_LINE_HEIGHT: f32 = 26.4;
-/// Rich Markdown carries per-character mappings and block metadata. Past this size, build only
-/// a plain source window around the viewport instead of allocating that model for the full note.
+/// Rich Markdown carries per-character mappings and block metadata. Past this size, keep that
+/// work bounded to a progressive window around the viewport instead of allocating it for the
+/// full note.
 const LARGE_DOCUMENT_THRESHOLD_BYTES: usize = 1024 * 1024;
+/// The viewport only needs a small working set, but the cache is intentionally larger so a
+/// normal scroll does not schedule a new Markdown projection for every crossed line.
 const LARGE_DOCUMENT_CACHE_BEHIND_LINES: usize = 64;
 const LARGE_DOCUMENT_CACHE_AHEAD_LINES: usize = 256;
+const LARGE_DOCUMENT_CACHE_PREFETCH_BEHIND_LINES: usize = 256;
+const LARGE_DOCUMENT_CACHE_PREFETCH_AHEAD_LINES: usize = 768;
+/// Parse a little before the cached display range so list, quote, table, and fenced-code
+/// state that begins immediately above the viewport is preserved in the rich projection.
+const LARGE_DOCUMENT_PARSE_CONTEXT_LINES: usize = 256;
 // Render diagrams and formulas only for the viewport and its immediate surroundings. Their SVG
 // generation is substantially more expensive than ordinary Markdown layout, so doing it for an
 // entire note before its first frame makes opening long notes needlessly slow.
@@ -1442,6 +1450,8 @@ struct SynapseApp {
     editor_outline_hovered_index: Option<usize>,
     editor_render_cache: Option<EditorRenderCache>,
     large_document_render_cache: Option<LargeDocumentRenderCache>,
+    large_document_structure: Option<LargeDocumentStructureCache>,
+    large_document_structure_scan_token: Arc<AtomicU64>,
     editor_blink: CursorBlinkState,
     markdown_source_mode: bool,
 }
@@ -1451,6 +1461,420 @@ impl SynapseApp {
         self.state
             .active_document()
             .is_some_and(|document| document.len_bytes() >= LARGE_DOCUMENT_THRESHOLD_BYTES)
+    }
+
+    /// Builds a cheap block index off the UI thread. The viewport renderer normally carries a
+    /// small source context, but a fenced block can legitimately span many thousands of lines.
+    /// Remembering its opening delimiter lets a later window preserve code highlighting without
+    /// parsing the whole block again.
+    fn ensure_large_document_structure(
+        &mut self,
+        text_snapshot: NoteTextSnapshot,
+        vault_root: PathBuf,
+        relative_path: PathBuf,
+        revision: u64,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .large_document_structure
+            .as_ref()
+            .is_some_and(|cache| {
+                cache.matches(&vault_root, &relative_path, revision)
+                    && (cache.pending || cache.fences.is_some())
+            })
+        {
+            return;
+        }
+
+        self.large_document_structure = Some(LargeDocumentStructureCache {
+            vault_root: vault_root.clone(),
+            relative_path: relative_path.clone(),
+            revision,
+            fences: None,
+            tables: None,
+            pending: true,
+            generation: 0,
+        });
+        // Structural changes can happen rapidly while the user is typing a fence or table.
+        // Coalesce those scans before touching the complete document snapshot; otherwise a
+        // sequence of keystrokes can queue several full-document background scans.
+        let scan_token = self.large_document_structure_scan_token.clone();
+        let scan_generation = scan_token.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
+        let timer = cx.background_executor().timer(Duration::from_millis(75));
+        let task = cx.background_executor().spawn(async move {
+            timer.await;
+            (scan_token.load(Ordering::Acquire) == scan_generation)
+                .then(|| scan_markdown_structure(&text_snapshot.text()))
+        });
+        cx.spawn(async move |this, cx| {
+            let Some(structure_scan) = task.await else {
+                return;
+            };
+            let _ = this.update(cx, |this, cx| {
+                let structure_generation = {
+                    let Some(structure) = this.large_document_structure.as_mut() else {
+                        return;
+                    };
+                    if !structure.matches(&vault_root, &relative_path, revision) {
+                        return;
+                    }
+                    structure.fences = Some(Rc::new(structure_scan.fences));
+                    structure.tables = Some(Rc::new(structure_scan.tables));
+                    structure.pending = false;
+                    structure.generation = structure.generation.wrapping_add(1);
+                    structure.generation
+                };
+
+                if let Some(cache) = this.large_document_render_cache.as_mut()
+                    && cache.vault_root == vault_root
+                    && cache.relative_path == relative_path
+                    && cache.revision == revision
+                    && !cache.source_mode
+                {
+                    cache.rich = false;
+                    cache.rich_render_pending = false;
+                    cache.structure_generation = structure_generation;
+                    cache.mermaid_previews = Rc::new(BTreeMap::new());
+                    cache.math_previews = Rc::new(BTreeMap::new());
+                    cache.image_previews = Rc::new(BTreeMap::new());
+                    this.editor_line_layouts.borrow_mut().clear();
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn refresh_large_document_structure_after_edit(
+        &mut self,
+        relative_path: &Path,
+        revision: u64,
+        previous_revision: u64,
+        line_index: usize,
+        single_line_edit: bool,
+        updated_line: &str,
+    ) {
+        let Some(structure) = self.large_document_structure.as_ref() else {
+            return;
+        };
+        if structure.relative_path != relative_path || structure.revision != previous_revision {
+            return;
+        }
+
+        let can_reuse = single_line_edit
+            && !structure.pending
+            && structure.can_reuse_after_single_line_edit(line_index, updated_line);
+        if can_reuse {
+            self.large_document_structure
+                .as_mut()
+                .expect("validated large document structure is still present")
+                .revision = revision;
+        } else {
+            self.large_document_structure = None;
+            self.large_document_structure_scan_token
+                .fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    fn large_document_fence_context(
+        &self,
+        vault_root: &Path,
+        relative_path: &Path,
+        revision: u64,
+        source_line_start: usize,
+    ) -> Option<MarkdownFenceContext> {
+        self.large_document_structure
+            .as_ref()
+            .filter(|cache| cache.matches(vault_root, relative_path, revision))
+            .and_then(|cache| cache.fence_context_for_source_line(source_line_start))
+    }
+
+    fn large_document_table_prefix(
+        &self,
+        vault_root: &Path,
+        relative_path: &Path,
+        revision: u64,
+        source_line_start: usize,
+    ) -> Option<String> {
+        self.large_document_structure
+            .as_ref()
+            .filter(|cache| cache.matches(vault_root, relative_path, revision))
+            .and_then(|cache| cache.table_prefix_for_source_line(source_line_start))
+    }
+
+    fn large_document_structure_generation(
+        &self,
+        vault_root: &Path,
+        relative_path: &Path,
+        revision: u64,
+    ) -> u64 {
+        self.large_document_structure
+            .as_ref()
+            .filter(|cache| cache.matches(vault_root, relative_path, revision))
+            .map_or(0, |cache| cache.generation)
+    }
+
+    fn large_document_code_context_known(
+        &self,
+        document: &NoteDocument,
+        cursor: usize,
+    ) -> Option<bool> {
+        let vault_root = self
+            .state
+            .vault_root()
+            .map_or_else(PathBuf::new, Path::to_path_buf);
+        let structure = self.large_document_structure.as_ref().filter(|structure| {
+            structure.matches(
+                &vault_root,
+                document.relative_path(),
+                document.revision(),
+            )
+        })?;
+        structure.fences.as_ref()?;
+        let line_index = document.char_to_line(cursor);
+        Some(structure.fence_at_or_before(line_index).is_some_and(|fence| {
+            fence.opening_line < line_index && line_index < fence.content_end_line
+        }))
+    }
+
+    fn schedule_large_document_rich_render(
+        &mut self,
+        request: LargeDocumentRichRenderRequest,
+        cx: &mut Context<Self>,
+    ) {
+        let vault_root = request.vault_root.clone();
+        let relative_path = request.relative_path.clone();
+        let revision = request.revision;
+        let dark_mode = request.dark_mode;
+        let line_range = request.line_range.clone();
+        let structure_generation = request.structure_generation;
+        let task = cx
+            .background_executor()
+            .spawn(async move { materialize_large_document_rich_lines(&request) });
+        cx.spawn(async move |this, cx| {
+            let lines = task.await;
+            let _ = this.update(cx, |this, cx| {
+                let Some(cache) = this.large_document_render_cache.as_mut() else {
+                    return;
+                };
+                if !cache.matches(
+                    &vault_root,
+                    &relative_path,
+                    revision,
+                    dark_mode,
+                    false,
+                ) || cache.cached_range != line_range
+                    || cache.structure_generation != structure_generation
+                {
+                    return;
+                }
+                cache.lines = Rc::new(
+                    lines
+                        .into_iter()
+                        .map(|(index, line)| (index, Rc::new(line)))
+                        .collect(),
+                );
+                cache.rich = true;
+                cache.rich_render_pending = false;
+                cache.mermaid_previews = Rc::new(BTreeMap::new());
+                cache.math_previews = Rc::new(BTreeMap::new());
+                cache.image_previews = Rc::new(BTreeMap::new());
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Keeps a large-document viewport cache usable through ordinary single-line edits.
+    ///
+    /// Rebuilding the entire cache after every keystroke would turn rich Markdown back into a
+    /// flickering raw view. Instead, update the changed row synchronously, translate unchanged
+    /// rows after the edit, and let the background projection refine the local window.
+    fn refresh_large_document_render_cache_after_edit(
+        &mut self,
+        previous_revision: u64,
+        range: Range<usize>,
+        replacement: &str,
+    ) {
+        let Some(document) = self.state.active_document() else {
+            return;
+        };
+        let relative_path = document.relative_path().to_path_buf();
+        let revision = document.revision();
+        let line_count = document.line_count();
+        let document_len = document.len_chars();
+        let line_index = document.char_to_line(range.start.min(document_len));
+        let edit_end_line = document.char_to_line(range.end.min(document_len));
+        let line_start_char = document.line_start_char(line_index);
+        let line_text = document.line_text(line_index);
+        let single_line_edit = line_count
+            == self
+                .large_document_render_cache
+                .as_ref()
+                .map_or(line_count, |cache| cache.line_count)
+            && !replacement.contains('\n')
+            && line_index == edit_end_line;
+
+        self.refresh_large_document_structure_after_edit(
+            &relative_path,
+            revision,
+            previous_revision,
+            line_index,
+            single_line_edit,
+            &line_text,
+        );
+
+        let Some(cache) = self.large_document_render_cache.as_ref() else {
+            return;
+        };
+        if cache.relative_path != relative_path || cache.revision != previous_revision {
+            return;
+        }
+        if !single_line_edit {
+            self.large_document_render_cache = None;
+            self.editor_line_layouts.borrow_mut().clear();
+            return;
+        }
+
+        let character_delta = replacement.chars().count() as isize - range.len() as isize;
+        let cache_range = cache.cached_range.clone();
+        let changed_row = Rc::new(plain_source_line(line_start_char, &line_text));
+        let mut lines = cache.lines.as_ref().clone();
+        let reparsing_required = line_index < cache_range.end;
+
+        if line_index < cache_range.start {
+            let mut shifted = Vec::with_capacity(lines.len());
+            for (index, line) in lines {
+                let mut line = (*line).clone();
+                shift_source_lines(std::slice::from_mut(&mut line), character_delta);
+                shifted.push((index, Rc::new(line)));
+            }
+            lines = shifted.into_iter().collect();
+        } else if cache_range.contains(&line_index) {
+            lines.insert(line_index, changed_row);
+            for (index, line) in &mut lines {
+                if *index <= line_index {
+                    continue;
+                }
+                let mut source_line = (**line).clone();
+                shift_source_lines(std::slice::from_mut(&mut source_line), character_delta);
+                *line = Rc::new(source_line);
+            }
+        }
+
+        let structure_generation = self
+            .large_document_structure
+            .as_ref()
+            .filter(|structure| {
+                structure.relative_path == relative_path && structure.revision == revision
+            })
+            .map_or(0, |structure| structure.generation);
+
+        let cache = self
+            .large_document_render_cache
+            .as_mut()
+            .expect("validated large document cache is still present");
+        cache.revision = revision;
+        cache.line_count = line_count;
+        cache.structure_generation = structure_generation;
+        cache.lines = Rc::new(lines);
+        cache.rich &= !reparsing_required;
+        cache.rich_render_pending = false;
+        if reparsing_required {
+            cache.mermaid_previews = Rc::new(BTreeMap::new());
+            cache.math_previews = Rc::new(BTreeMap::new());
+            cache.image_previews = Rc::new(BTreeMap::new());
+        }
+        self.editor_line_layouts.borrow_mut().clear();
+    }
+
+    fn large_document_preview_maps(
+        &mut self,
+        visible_range: Range<usize>,
+        vault_root: &Path,
+        relative_path: &Path,
+        dark_mode: bool,
+    ) -> LargeDocumentPreviewMaps {
+        let Some(cache) = self.large_document_render_cache.as_mut() else {
+            return (
+                Rc::new(BTreeMap::new()),
+                Rc::new(BTreeMap::new()),
+                Rc::new(BTreeMap::new()),
+            );
+        };
+        if !cache.rich || cache.source_mode || cache.cached_range.is_empty() {
+            return (
+                Rc::new(BTreeMap::new()),
+                Rc::new(BTreeMap::new()),
+                Rc::new(BTreeMap::new()),
+            );
+        }
+
+        let cache_start = cache.cached_range.start;
+        let cache_end = cache.cached_range.end;
+        let mut lines = Vec::with_capacity(cache.cached_range.len());
+        for index in cache.cached_range.clone() {
+            let Some(line) = cache.lines.get(&index) else {
+                return (
+                    Rc::new(BTreeMap::new()),
+                    Rc::new(BTreeMap::new()),
+                    Rc::new(BTreeMap::new()),
+                );
+            };
+            lines.push(line.clone());
+        }
+
+        let local_visible_range = visible_range.start.clamp(cache_start, cache_end)
+            - cache_start
+            ..visible_range.end.clamp(cache_start, cache_end) - cache_start;
+        let preview_range = editor_preview_range(local_visible_range, lines.len());
+        let local_mermaid_previews = Rc::new(
+            cache
+                .mermaid_previews
+                .iter()
+                .filter_map(|(index, preview)| {
+                    index
+                        .checked_sub(cache_start)
+                        .filter(|index| *index < lines.len())
+                        .map(|index| (index, preview.clone()))
+                })
+                .collect(),
+        );
+        if let Some(expanded) = extend_mermaid_previews(
+            &local_mermaid_previews,
+            &lines,
+            dark_mode,
+            preview_range.clone(),
+        ) {
+            cache.mermaid_previews = Rc::new(
+                expanded
+                    .iter()
+                    .map(|(index, preview)| (cache_start + index, preview.clone()))
+                    .collect(),
+            );
+        }
+        if let Some(expanded) = extend_math_previews(
+            &cache.math_previews,
+            &lines,
+            dark_mode,
+            preview_range.clone(),
+        ) {
+            cache.math_previews = expanded;
+        }
+        if let Some(expanded) = extend_image_previews(
+            &cache.image_previews,
+            &lines,
+            vault_root,
+            relative_path,
+            preview_range,
+        ) {
+            cache.image_previews = expanded;
+        }
+        (
+            cache.mermaid_previews.clone(),
+            cache.math_previews.clone(),
+            cache.image_previews.clone(),
+        )
     }
 }
 
@@ -1505,21 +1929,179 @@ struct LargeDocumentRenderCache {
     vault_root: PathBuf,
     relative_path: PathBuf,
     revision: u64,
+    dark_mode: bool,
+    source_mode: bool,
     line_count: usize,
     cached_range: Range<usize>,
+    structure_generation: u64,
     lines: Rc<BTreeMap<usize, Rc<SourceLine>>>,
+    rich: bool,
+    rich_render_pending: bool,
+    mermaid_previews: Rc<BTreeMap<usize, MermaidPreview>>,
+    math_previews: Rc<BTreeMap<usize, MathPreview>>,
+    image_previews: Rc<BTreeMap<usize, MarkdownImagePreview>>,
 }
 
+type LargeDocumentPreviewMaps = (
+    Rc<BTreeMap<usize, MermaidPreview>>,
+    Rc<BTreeMap<usize, MathPreview>>,
+    Rc<BTreeMap<usize, MarkdownImagePreview>>,
+);
+
 impl LargeDocumentRenderCache {
+    fn matches(
+        &self,
+        vault_root: &Path,
+        relative_path: &Path,
+        revision: u64,
+        dark_mode: bool,
+        source_mode: bool,
+    ) -> bool {
+        self.vault_root == vault_root
+            && self.relative_path == relative_path
+            && self.revision == revision
+            && self.dark_mode == dark_mode
+            && self.source_mode == source_mode
+    }
+
+    fn covers(&self, line_range: &Range<usize>) -> bool {
+        self.cached_range.start <= line_range.start && self.cached_range.end >= line_range.end
+    }
+}
+
+struct LargeDocumentStructureCache {
+    vault_root: PathBuf,
+    relative_path: PathBuf,
+    revision: u64,
+    fences: Option<Rc<Vec<MarkdownFenceRange>>>,
+    tables: Option<Rc<Vec<MarkdownTableRange>>>,
+    pending: bool,
+    generation: u64,
+}
+
+impl LargeDocumentStructureCache {
     fn matches(&self, vault_root: &Path, relative_path: &Path, revision: u64) -> bool {
         self.vault_root == vault_root
             && self.relative_path == relative_path
             && self.revision == revision
     }
 
-    fn covers(&self, line_range: &Range<usize>) -> bool {
-        self.cached_range.start <= line_range.start && self.cached_range.end >= line_range.end
+    fn can_reuse_after_single_line_edit(&self, line_index: usize, updated_line: &str) -> bool {
+        let touches_fence = self
+            .fence_at_or_before(line_index)
+            .is_some_and(|fence| {
+                fence.opening_line == line_index || fence.closing_line == Some(line_index)
+            });
+        if touches_fence || markdown_fence_opener(updated_line).is_some() {
+            return false;
+        }
+
+        if self.tables.is_none() {
+            return false;
+        }
+        let table = self.table_at_line(line_index);
+        match table {
+            Some(table) if table.header_line == line_index || table.delimiter_line == line_index => {
+                false
+            }
+            Some(_) => markdown_table_row_candidate(updated_line),
+            None => !markdown_table_row_candidate(updated_line),
+        }
     }
+
+    fn fence_context_for_source_line(&self, line_index: usize) -> Option<MarkdownFenceContext> {
+        self.fence_at_or_before(line_index)
+            .filter(|fence| {
+                fence.opening_line < line_index && line_index < fence.content_end_line
+            })
+            .map(|fence| MarkdownFenceContext {
+                opening_source: fence.opening_source.clone(),
+                content_end_line: fence.content_end_line,
+            })
+    }
+
+    fn table_prefix_for_source_line(&self, line_index: usize) -> Option<String> {
+        self.table_at_line(line_index)
+            .filter(|table| table.header_line < line_index)
+            .map(|table| {
+                if line_index == table.delimiter_line {
+                    format!("{}\n", table.header_source)
+                } else {
+                    format!("{}\n{}\n", table.header_source, table.delimiter_source)
+                }
+            })
+    }
+
+    fn fence_at_or_before(&self, line_index: usize) -> Option<&MarkdownFenceRange> {
+        let fences = self.fences.as_ref()?;
+        let index = fences.partition_point(|fence| fence.opening_line <= line_index);
+        index.checked_sub(1).and_then(|index| fences.get(index))
+    }
+
+    fn table_at_line(&self, line_index: usize) -> Option<&MarkdownTableRange> {
+        let tables = self.tables.as_ref()?;
+        let index = tables.partition_point(|table| table.header_line <= line_index);
+        index
+            .checked_sub(1)
+            .and_then(|index| tables.get(index))
+            .filter(|table| line_index < table.end_line)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MarkdownFenceRange {
+    opening_line: usize,
+    closing_line: Option<usize>,
+    /// The first line after the opening delimiter that is no longer code content.
+    content_end_line: usize,
+    opening_source: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MarkdownTableRange {
+    header_line: usize,
+    delimiter_line: usize,
+    end_line: usize,
+    header_source: String,
+    delimiter_source: String,
+}
+
+struct MarkdownStructureScan {
+    fences: Vec<MarkdownFenceRange>,
+    tables: Vec<MarkdownTableRange>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MarkdownFenceContext {
+    opening_source: String,
+    content_end_line: usize,
+}
+
+struct LargeDocumentRichRenderContext {
+    vault_root: PathBuf,
+    relative_path: PathBuf,
+    revision: u64,
+    dark_mode: bool,
+    cursor: usize,
+    line_range: Range<usize>,
+    fence_context: Option<MarkdownFenceContext>,
+    table_prefix: Option<String>,
+    structure_generation: u64,
+}
+
+struct LargeDocumentRichRenderRequest {
+    vault_root: PathBuf,
+    relative_path: PathBuf,
+    revision: u64,
+    dark_mode: bool,
+    line_range: Range<usize>,
+    source_line_start: usize,
+    source_start_char: usize,
+    source_cursor: usize,
+    structure_generation: u64,
+    synthetic_prefix: String,
+    synthetic_fence_content_end_line: Option<usize>,
+    source: String,
 }
 
 #[derive(Clone)]
@@ -1661,7 +2243,9 @@ fn large_document_line_range(
     }
     let visible_range = if visible_range.is_empty() {
         cursor_line.min(line_count.saturating_sub(1))
-            ..cursor_line.min(line_count.saturating_sub(1)).saturating_add(1)
+            ..cursor_line
+                .min(line_count.saturating_sub(1))
+                .saturating_add(1)
     } else {
         visible_range.start.min(line_count)..visible_range.end.min(line_count)
     };
@@ -1671,6 +2255,22 @@ fn large_document_line_range(
     let end = visible_range
         .end
         .saturating_add(LARGE_DOCUMENT_CACHE_AHEAD_LINES)
+        .min(line_count);
+    start.min(end)..end
+}
+
+fn large_document_cache_range(
+    visible_range: Range<usize>,
+    line_count: usize,
+    cursor_line: usize,
+) -> Range<usize> {
+    let needed = large_document_line_range(visible_range, line_count, cursor_line);
+    let start = needed
+        .start
+        .saturating_sub(LARGE_DOCUMENT_CACHE_PREFETCH_BEHIND_LINES);
+    let end = needed
+        .end
+        .saturating_add(LARGE_DOCUMENT_CACHE_PREFETCH_AHEAD_LINES)
         .min(line_count);
     start.min(end)..end
 }
@@ -1688,6 +2288,307 @@ fn materialize_large_document_lines(
         lines.insert(line_index, Rc::new(line));
     }
     Rc::new(lines)
+}
+
+fn large_document_rich_render_request(
+    document: &NoteDocument,
+    context: LargeDocumentRichRenderContext,
+) -> Option<LargeDocumentRichRenderRequest> {
+    let LargeDocumentRichRenderContext {
+        vault_root,
+        relative_path,
+        revision,
+        dark_mode,
+        cursor,
+        line_range,
+        fence_context,
+        table_prefix,
+        structure_generation,
+    } = context;
+    if line_range.is_empty() || line_range.start >= document.line_count() {
+        return None;
+    }
+    let line_range = line_range.start..line_range.end.min(document.line_count());
+    let source_line_start = line_range
+        .start
+        .saturating_sub(LARGE_DOCUMENT_PARSE_CONTEXT_LINES);
+    let source_start_char = document.line_start_char(source_line_start);
+    let source_end_char = if line_range.end < document.line_count() {
+        document.line_start_char(line_range.end)
+    } else {
+        document.len_chars()
+    };
+    let source = document.slice(source_start_char..source_end_char).ok()?;
+    let (synthetic_prefix, synthetic_fence_content_end_line) = fence_context.map_or_else(
+        || (table_prefix.unwrap_or_default(), None),
+        |fence| {
+            (
+                format!("{}\n", fence.opening_source),
+                Some(fence.content_end_line),
+            )
+        },
+    );
+    let source_len = source.chars().count();
+    let prefix_len = synthetic_prefix.chars().count();
+    let source_cursor = if cursor < source_start_char {
+        0
+    } else if cursor > source_start_char.saturating_add(source_len) {
+        prefix_len.saturating_add(source_len).saturating_add(1)
+    } else {
+        prefix_len + cursor.saturating_sub(source_start_char)
+    };
+    Some(LargeDocumentRichRenderRequest {
+        vault_root,
+        relative_path,
+        revision,
+        dark_mode,
+        line_range,
+        source_line_start,
+        source_start_char,
+        source_cursor,
+        structure_generation,
+        synthetic_prefix,
+        synthetic_fence_content_end_line,
+        source,
+    })
+}
+
+fn materialize_large_document_rich_lines(
+    request: &LargeDocumentRichRenderRequest,
+) -> BTreeMap<usize, SourceLine> {
+    let prefix_len = request.synthetic_prefix.chars().count();
+    let prefix_line_count = request.synthetic_prefix.lines().count();
+    let mut parser_source =
+        String::with_capacity(request.synthetic_prefix.len() + request.source.len());
+    parser_source.push_str(&request.synthetic_prefix);
+    parser_source.push_str(&request.source);
+    let mut lines = source_lines(&parser_source, request.source_cursor, request.dark_mode);
+    offset_source_lines(
+        &mut lines,
+        request.source_start_char.saturating_sub(prefix_len),
+    );
+    let mut projected: BTreeMap<_, _> = lines
+        .into_iter()
+        .skip(
+            prefix_line_count
+                + request
+                    .line_range
+                    .start
+                    .saturating_sub(request.source_line_start),
+        )
+        .take(request.line_range.len())
+        .enumerate()
+        .map(|(offset, line)| (request.line_range.start + offset, line))
+        .collect();
+    // A synthetic Mermaid opening fence is only parser context: its visual anchor is not part
+    // of this window. Leaving the generated block metadata on its body would make every actual
+    // row a non-anchor and therefore invisible. Keep the block editable as highlighted code
+    // until the real opening line scrolls into the window.
+    if markdown_fence_is_mermaid(&request.synthetic_prefix) {
+        for line in projected.values_mut() {
+            line.presentation.mermaid_block = None;
+        }
+    }
+    if let Some(content_end_line) = request.synthetic_fence_content_end_line {
+        for (line_index, line) in &mut projected {
+            if *line_index >= content_end_line {
+                continue;
+            }
+            let Some(code) = line.presentation.code_line.as_mut() else {
+                continue;
+            };
+            code.is_first_content = false;
+            if content_end_line >= request.line_range.end {
+                code.is_last_content = false;
+            }
+        }
+    }
+    projected
+}
+
+struct ActiveMarkdownFence {
+    opening_line: usize,
+    marker: char,
+    marker_len: usize,
+    opening_source: String,
+}
+
+struct ActiveMarkdownTable {
+    header_line: usize,
+    delimiter_line: usize,
+    header_source: String,
+    delimiter_source: String,
+}
+
+fn scan_markdown_structure(source: &str) -> MarkdownStructureScan {
+    let lines: Vec<_> = source.split('\n').collect();
+    let mut fences = Vec::new();
+    let mut tables = Vec::new();
+    let mut active_fence: Option<ActiveMarkdownFence> = None;
+    let mut active_table: Option<ActiveMarkdownTable> = None;
+    let mut line_index = 0;
+
+    while line_index < lines.len() {
+        let raw_line = lines[line_index];
+        let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+        if let Some(fence) = active_fence.as_ref() {
+            if markdown_fence_closes(line, fence.marker, fence.marker_len) {
+                let fence = active_fence.take().expect("active fence was just checked");
+                fences.push(MarkdownFenceRange {
+                    opening_line: fence.opening_line,
+                    closing_line: Some(line_index),
+                    content_end_line: line_index,
+                    opening_source: fence.opening_source,
+                });
+            }
+            line_index += 1;
+            continue;
+        }
+
+        if active_table.is_some() {
+            if markdown_table_row_candidate(line) {
+                line_index += 1;
+                continue;
+            }
+            let table = active_table.take().expect("active table was just checked");
+            tables.push(MarkdownTableRange {
+                header_line: table.header_line,
+                delimiter_line: table.delimiter_line,
+                end_line: line_index,
+                header_source: table.header_source,
+                delimiter_source: table.delimiter_source,
+            });
+            continue;
+        }
+
+        if let Some((marker, marker_len)) = markdown_fence_opener(line) {
+            active_fence = Some(ActiveMarkdownFence {
+                opening_line: line_index,
+                marker,
+                marker_len,
+                opening_source: line.to_owned(),
+            });
+            line_index += 1;
+            continue;
+        }
+
+        let next = lines
+            .get(line_index + 1)
+            .copied()
+            .map(|line| line.strip_suffix('\r').unwrap_or(line));
+        if markdown_table_row_candidate(line)
+            && next.is_some_and(markdown_table_delimiter_candidate)
+        {
+            active_table = Some(ActiveMarkdownTable {
+                header_line: line_index,
+                delimiter_line: line_index + 1,
+                header_source: line.to_owned(),
+                delimiter_source: next.expect("table delimiter was just checked").to_owned(),
+            });
+            line_index += 2;
+            continue;
+        }
+        line_index += 1;
+    }
+
+    if let Some(fence) = active_fence {
+        fences.push(MarkdownFenceRange {
+            opening_line: fence.opening_line,
+            closing_line: None,
+            content_end_line: lines.len(),
+            opening_source: fence.opening_source,
+        });
+    }
+    if let Some(table) = active_table {
+        tables.push(MarkdownTableRange {
+            header_line: table.header_line,
+            delimiter_line: table.delimiter_line,
+            end_line: lines.len(),
+            header_source: table.header_source,
+            delimiter_source: table.delimiter_source,
+        });
+    }
+    MarkdownStructureScan { fences, tables }
+}
+
+#[cfg(test)]
+fn scan_markdown_fence_ranges(source: &str) -> Vec<MarkdownFenceRange> {
+    scan_markdown_structure(source).fences
+}
+
+fn markdown_fence_opener(line: &str) -> Option<(char, usize)> {
+    let (marker, marker_len, suffix) = markdown_fence_run(line)?;
+    // CommonMark permits an info string after a tilde fence, but backtick info strings may not
+    // contain another backtick. Keeping that distinction avoids treating inline Markdown as a
+    // long-lived block boundary.
+    (marker != '`' || !suffix.contains('`')).then_some((marker, marker_len))
+}
+
+fn markdown_fence_closes(line: &str, marker: char, marker_len: usize) -> bool {
+    markdown_fence_run(line).is_some_and(|(candidate, candidate_len, suffix)| {
+        candidate == marker && candidate_len >= marker_len && suffix.trim().is_empty()
+    })
+}
+
+fn markdown_fence_run(line: &str) -> Option<(char, usize, &str)> {
+    let indentation = line.chars().take_while(|character| *character == ' ').count();
+    if indentation > 3 {
+        return None;
+    }
+    let rest = &line[indentation..];
+    let marker = rest
+        .chars()
+        .next()
+        .filter(|marker| matches!(marker, '`' | '~'))?;
+    let marker_len = rest
+        .chars()
+        .take_while(|character| *character == marker)
+        .count();
+    (marker_len >= 3).then_some((marker, marker_len, &rest[marker_len..]))
+}
+
+fn markdown_fence_is_mermaid(source: &str) -> bool {
+    let Some((_, _, suffix)) = markdown_fence_run(source.lines().next().unwrap_or(""))
+    else {
+        return false;
+    };
+    suffix
+        .split_whitespace()
+        .next()
+        .is_some_and(|language| language.eq_ignore_ascii_case("mermaid"))
+}
+
+fn markdown_table_row_candidate(line: &str) -> bool {
+    let trimmed = line.trim();
+    !trimmed.is_empty() && trimmed.contains('|')
+}
+
+fn markdown_table_delimiter_candidate(line: &str) -> bool {
+    if !markdown_table_row_candidate(line) {
+        return false;
+    }
+    let trimmed = line.trim().trim_start_matches('|').trim_end_matches('|');
+    let mut cells = Vec::new();
+    let mut start = 0;
+    let mut escaped = false;
+    for (index, character) in trimmed.char_indices() {
+        if character == '|' && !escaped {
+            cells.push(&trimmed[start..index]);
+            start = index + character.len_utf8();
+        }
+        escaped = character == '\\' && !escaped;
+        if character != '\\' {
+            escaped = false;
+        }
+    }
+    cells.push(&trimmed[start..]);
+    !cells.is_empty()
+        && cells.iter().all(|cell| {
+            let cell = cell.trim();
+            let cell = cell.strip_prefix(':').unwrap_or(cell);
+            let cell = cell.strip_suffix(':').unwrap_or(cell);
+            cell.len() >= 3 && cell.bytes().all(|character| character == b'-')
+        })
 }
 
 fn editor_line_layout_matches(old: &SourceLine, new: &SourceLine) -> bool {
@@ -2800,6 +3701,32 @@ fn markdown_list_items_in_selection(text: &str, selection: Range<usize>) -> Vec<
     items
 }
 
+/// Extracts selected Markdown list rows without copying the rest of a large note.
+fn markdown_list_items_in_document_selection(
+    document: &NoteDocument,
+    selection: Range<usize>,
+) -> Vec<String> {
+    if selection.is_empty() || selection.end > document.len_chars() {
+        return Vec::new();
+    }
+
+    let start_line = document.char_to_line(selection.start);
+    let end_line = document.char_to_line(selection.end.saturating_sub(1));
+    let source_start = document.line_start_char(start_line);
+    let source_end = if end_line + 1 < document.line_count() {
+        document.line_start_char(end_line + 1)
+    } else {
+        document.len_chars()
+    };
+    let Ok(source) = document.slice(source_start..source_end) else {
+        return Vec::new();
+    };
+    markdown_list_items_in_selection(
+        &source,
+        selection.start.saturating_sub(source_start)..selection.end.saturating_sub(source_start),
+    )
+}
+
 fn markdown_list_item_text(line: &str) -> Option<String> {
     let trimmed = line.trim_start_matches([' ', '\t']);
     let content = match trimmed.as_bytes().first() {
@@ -3455,6 +4382,8 @@ pub(crate) fn run() {
                             editor_outline_hovered_index: None,
                             editor_render_cache: None,
                             large_document_render_cache: None,
+                            large_document_structure: None,
+                            large_document_structure_scan_token: Arc::new(AtomicU64::new(0)),
                             editor_blink: CursorBlinkState::default(),
                             markdown_source_mode: false,
                         }
@@ -3514,7 +4443,7 @@ mod tests {
 
     use super::document_outline::{css_cubic_bezier_0201, document_outline_tick_style};
 
-    use super::editor_surface::source_lines;
+    use super::editor_surface::{MarkdownBlockKind, source_lines};
     use super::{
         AppLanguage, DangerousAction, EDITOR_BODY_FONT_SIZE, EDITOR_BODY_LINE_HEIGHT,
         EDITOR_COMPACT_GUTTER, EDITOR_PAGE_MAX_WIDTH, EDITOR_REGULAR_GUTTER,
@@ -3526,28 +4455,32 @@ mod tests {
         SIDEBAR_SEARCH_CONTENT_WIDTH, SIDEBAR_SEARCH_INNER_PADDING, SIDEBAR_SEARCH_OUTER_MARGIN,
         SIDEBAR_SHORTCUT_ACTION_WIDTH, SIDEBAR_TREE_FONT_FAMILY, SIDEBAR_TREE_FONT_SIZE,
         SIDEBAR_TREE_ROW_HEIGHT, SLASH_MENU_ENTER_TRANSITION, SLASH_MENU_EXIT_TRANSITION,
-        SLASH_MENU_REVEAL_DELAY, SYNAPSE_APP_ICON_PNG, SlashCommand, TABLE_CELL_HORIZONTAL_PADDING,
-        TABLE_CELL_VERTICAL_PADDING, TABLE_FONT_SIZE, TABLE_ROW_MIN_HEIGHT, TITLEBAR_HEIGHT,
-        TODO_AUTO_CLEAR_COMPLETED_HOLD, TODO_AUTO_CLEAR_EXIT, TODO_AUTO_CLEAR_EXIT_OFFSET,
-        ThemePreference, TreeTarget, ShellState, active_document_outline_index,
-        build_document_outline,
-        build_file_tree_rows, build_image_previews, build_math_previews, build_mermaid_previews,
-        changed_line_span, clipboard_image_extension, code_block_edges,
-        command_palette_key_bindings, default_window_size, document_outline_horizontal_layout,
-        document_outline_is_visible, document_outline_layout, editor_backtick_key_bindings,
-        editor_horizontal_gutter, editor_page_content_width, editor_preview_range,
-        embedded_app_icon_png_metadata, fenced_code_block_edit, file_manager_reveal_command,
-        filtered_slash_commands, inline_format_edit, inline_format_is_active,
-        is_tab_context_trigger, linked_vault_note, markd_panel_spring_progress,
-        large_document_line_range, materialize_large_document_lines, markdown_link_context,
-        markdown_list_items_in_selection, normalize_clipboard_text,
-        normalize_markdown_link_destination, note_breadcrumb_parts, note_link_candidates,
-        parse_boolean_preference, path_is_inside_macos_app_bundle, persist_clipboard_image,
-        prune_collapsed_directories, resolve_markdown_image, select_startup_vault_path,
-        settings_language_indicator_left, settings_spring_progress, settings_theme_indicator_left,
-        settings_titlebar_options, settings_window_options, source_lines_from_buffer,
-        synapse_mermaid_theme, synapse_theme_palette, synapse_titlebar_options,
-        titlebar_left_inset,
+        SLASH_MENU_REVEAL_DELAY, SYNAPSE_APP_ICON_PNG, ShellState, SlashCommand,
+        TABLE_CELL_HORIZONTAL_PADDING, TABLE_CELL_VERTICAL_PADDING, TABLE_FONT_SIZE,
+        TABLE_ROW_MIN_HEIGHT, TITLEBAR_HEIGHT, TODO_AUTO_CLEAR_COMPLETED_HOLD,
+        TODO_AUTO_CLEAR_EXIT, TODO_AUTO_CLEAR_EXIT_OFFSET, ThemePreference, TreeTarget,
+        active_document_outline_index, build_document_outline, build_file_tree_rows,
+        build_image_previews, build_math_previews, build_mermaid_previews, changed_line_span,
+        clipboard_image_extension, code_block_edges, command_palette_key_bindings,
+        default_window_size, document_outline_horizontal_layout, document_outline_is_visible,
+        document_outline_layout, editor_backtick_key_bindings, editor_horizontal_gutter,
+        editor_page_content_width, editor_preview_range, embedded_app_icon_png_metadata,
+        fenced_code_block_edit, file_manager_reveal_command, filtered_slash_commands,
+        inline_format_edit, inline_format_is_active, is_tab_context_trigger,
+        large_document_cache_range, large_document_line_range,
+        large_document_rich_render_request, LargeDocumentRichRenderContext,
+        LargeDocumentRichRenderRequest, linked_vault_note, markd_panel_spring_progress,
+        markdown_link_context, markdown_list_items_in_selection, materialize_large_document_lines,
+        materialize_large_document_rich_lines, scan_markdown_fence_ranges,
+        scan_markdown_structure,
+        MarkdownFenceContext,
+        normalize_clipboard_text, normalize_markdown_link_destination, note_breadcrumb_parts,
+        note_link_candidates, parse_boolean_preference, path_is_inside_macos_app_bundle,
+        persist_clipboard_image, prune_collapsed_directories, resolve_markdown_image,
+        select_startup_vault_path, settings_language_indicator_left, settings_spring_progress,
+        settings_theme_indicator_left, settings_titlebar_options, settings_window_options,
+        source_lines_from_buffer, synapse_mermaid_theme, synapse_theme_palette,
+        synapse_titlebar_options, titlebar_left_inset,
     };
     fn sfnt_table<'a>(font: &'a [u8], tag: &[u8; 4]) -> Option<&'a [u8]> {
         let table_count = usize::from(u16::from_be_bytes(font.get(4..6)?.try_into().ok()?));
@@ -3939,9 +4872,243 @@ mod tests {
     #[test]
     fn large_document_cache_window_follows_the_viewport_without_growing_with_the_note() {
         assert_eq!(large_document_line_range(0..0, 10_000, 500), 436..757);
-        assert_eq!(large_document_line_range(1_000..1_012, 10_000, 500), 936..1_268);
-        assert_eq!(large_document_line_range(9_980..10_000, 10_000, 0), 9_916..10_000);
+        assert_eq!(
+            large_document_line_range(1_000..1_012, 10_000, 500),
+            936..1_268
+        );
+        assert_eq!(
+            large_document_line_range(9_980..10_000, 10_000, 0),
+            9_916..10_000
+        );
         assert_eq!(large_document_line_range(0..0, 0, 0), 0..0);
+        assert_eq!(large_document_cache_range(0..0, 10_000, 500), 180..1_525);
+        assert_eq!(
+            large_document_cache_range(9_980..10_000, 10_000, 0),
+            9_660..10_000
+        );
+    }
+
+    #[test]
+    fn large_document_rich_projection_keeps_markdown_and_global_source_offsets() {
+        let request = LargeDocumentRichRenderRequest {
+            vault_root: PathBuf::new(),
+            relative_path: PathBuf::from("large.md"),
+            revision: 0,
+            dark_mode: false,
+            line_range: 48..51,
+            source_line_start: 48,
+            source_start_char: 120,
+            source_cursor: 0,
+            structure_generation: 0,
+            synthetic_prefix: String::new(),
+            synthetic_fence_content_end_line: None,
+            source: "# 总览\n- [ ] **待办**\n普通 `代码`".to_owned(),
+        };
+        let projected = materialize_large_document_rich_lines(&request);
+
+        let heading = projected.get(&48).unwrap();
+        assert_eq!(heading.start_char, 120);
+        assert!(matches!(
+            heading.presentation.kind,
+            MarkdownBlockKind::Heading(1)
+        ));
+        assert_eq!(heading.presentation.display, "总览");
+
+        let task = projected.get(&49).unwrap();
+        assert_eq!(task.start_char, 125);
+        let task_item = task.presentation.task_item.as_ref().unwrap();
+        assert_eq!(
+            task_item.checkbox_start_char..task_item.checkbox_end_char,
+            127..130
+        );
+        assert_eq!(task_item.content_start_char, 131);
+        assert!(task.presentation.runs.iter().any(|run| run.bold));
+
+        let inline = projected.get(&50).unwrap();
+        assert!(inline.presentation.runs.iter().any(|run| run.mono));
+    }
+
+    #[test]
+    fn large_document_rich_projection_uses_context_before_the_cached_rows() {
+        let request = LargeDocumentRichRenderRequest {
+            vault_root: PathBuf::new(),
+            relative_path: PathBuf::from("large.md"),
+            revision: 0,
+            dark_mode: true,
+            line_range: 102..105,
+            source_line_start: 100,
+            source_start_char: 1_000,
+            source_cursor: 0,
+            structure_generation: 0,
+            synthetic_prefix: String::new(),
+            synthetic_fence_content_end_line: None,
+            source: "intro\n```rust\nlet x = 1;\n```\nafter".to_owned(),
+        };
+        let projected = materialize_large_document_rich_lines(&request);
+
+        let first_code_line = projected
+            .get(&102)
+            .and_then(|line| line.presentation.code_line.as_ref())
+            .unwrap();
+        assert!(first_code_line.is_first_content);
+        assert_eq!(first_code_line.content_start_char, 1_014);
+        assert_eq!(first_code_line.content_end_char, 1_024);
+        assert!(
+            projected
+                .get(&103)
+            .is_some_and(|line| line.presentation.code_line.is_some())
+        );
+    }
+
+    #[test]
+    fn large_document_fence_index_preserves_long_code_blocks_across_windows() {
+        let body = (0..400)
+            .map(|index| format!("let value_{index} = {index};"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let source = format!("```rust\n{body}\n```\n");
+        let fences = scan_markdown_fence_ranges(&source);
+        assert_eq!(fences.len(), 1);
+        assert_eq!(fences[0].opening_line, 0);
+        assert_eq!(fences[0].closing_line, Some(401));
+        assert_eq!(fences[0].content_end_line, 401);
+
+        let window_start = 300;
+        let window_end = 304;
+        let source_lines: Vec<_> = source.split('\n').collect();
+        let window_source = format!("{}\n", source_lines[window_start..window_end].join("\n"));
+        let source_start_char = source_lines[..window_start]
+            .iter()
+            .map(|line| line.chars().count() + 1)
+            .sum();
+        let fence_context = MarkdownFenceContext {
+            opening_source: fences[0].opening_source.clone(),
+            content_end_line: fences[0].content_end_line,
+        };
+        let request = LargeDocumentRichRenderRequest {
+            vault_root: PathBuf::new(),
+            relative_path: PathBuf::from("large.md"),
+            revision: 0,
+            dark_mode: false,
+            line_range: window_start..window_end,
+            source_line_start: window_start,
+            source_start_char,
+            source_cursor: 0,
+            structure_generation: 0,
+            synthetic_prefix: format!("{}\n", fence_context.opening_source),
+            synthetic_fence_content_end_line: Some(fence_context.content_end_line),
+            source: window_source,
+        };
+        let projected = materialize_large_document_rich_lines(&request);
+        let code = projected
+            .get(&window_start)
+            .and_then(|line| line.presentation.code_line.as_ref())
+            .unwrap();
+        assert_eq!(code.language, "Rust");
+        assert!(!code.is_first_content);
+        assert!(!code.is_last_content);
+    }
+
+    #[test]
+    fn long_mermaid_window_stays_editable_instead_of_becoming_an_empty_preview() {
+        let body = (0..400)
+            .map(|index| format!("node_{index} --> node_{}", index + 1))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let source = format!("```mermaid\n{body}\n```\n");
+        let fences = scan_markdown_fence_ranges(&source);
+        let window_start = 300;
+        let window_end = 304;
+        let source_lines: Vec<_> = source.split('\n').collect();
+        let window_source = format!("{}\n", source_lines[window_start..window_end].join("\n"));
+        let source_start_char = source_lines[..window_start]
+            .iter()
+            .map(|line| line.chars().count() + 1)
+            .sum();
+        let request = LargeDocumentRichRenderRequest {
+            vault_root: PathBuf::new(),
+            relative_path: PathBuf::from("large.md"),
+            revision: 0,
+            dark_mode: false,
+            line_range: window_start..window_end,
+            source_line_start: window_start,
+            source_start_char,
+            source_cursor: 0,
+            structure_generation: 0,
+            synthetic_prefix: format!("{}\n", fences[0].opening_source),
+            synthetic_fence_content_end_line: Some(fences[0].content_end_line),
+            source: window_source,
+        };
+        let projected = materialize_large_document_rich_lines(&request);
+        let line = projected.get(&window_start).unwrap();
+        assert!(line.presentation.code_line.is_some());
+        assert!(line.presentation.mermaid_block.is_none());
+        assert!(line.presentation.display.contains("node_"));
+    }
+
+    #[test]
+    fn large_document_table_index_preserves_table_cells_across_windows() {
+        let body = (0..400)
+            .map(|index| format!("| **item_{index}** | `value_{index}` |"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let source = format!("| Name | Value |\n| --- | --- |\n{body}\nAfter");
+        let structure = scan_markdown_structure(&source);
+        assert_eq!(structure.tables.len(), 1);
+        let table = &structure.tables[0];
+        assert_eq!(table.header_line, 0);
+        assert_eq!(table.delimiter_line, 1);
+        assert_eq!(table.end_line, 402);
+
+        let window_start = 300;
+        let window_end = 304;
+        let source_lines: Vec<_> = source.split('\n').collect();
+        let window_source = format!("{}\n", source_lines[window_start..window_end].join("\n"));
+        let source_start_char = source_lines[..window_start]
+            .iter()
+            .map(|line| line.chars().count() + 1)
+            .sum();
+        let request = LargeDocumentRichRenderRequest {
+            vault_root: PathBuf::new(),
+            relative_path: PathBuf::from("large.md"),
+            revision: 0,
+            dark_mode: false,
+            line_range: window_start..window_end,
+            source_line_start: window_start,
+            source_start_char,
+            source_cursor: 0,
+            structure_generation: 0,
+            synthetic_prefix: format!("{}\n{}\n", table.header_source, table.delimiter_source),
+            synthetic_fence_content_end_line: None,
+            source: window_source,
+        };
+        let projected = materialize_large_document_rich_lines(&request);
+        let table_row = projected
+            .get(&window_start)
+            .and_then(|line| line.presentation.table_row.as_ref())
+            .unwrap();
+        assert!(!table_row.is_header);
+        assert!(!table_row.is_first);
+        assert!(table_row.cell_presentations[0]
+            .presentation
+            .runs
+            .iter()
+            .any(|run| run.bold));
+        assert!(table_row.cell_presentations[1]
+            .presentation
+            .runs
+            .iter()
+            .any(|run| run.mono));
+    }
+
+    #[test]
+    fn large_document_structure_ignores_table_syntax_inside_code_fences() {
+        let source = "```text\n| not | a table |\n| --- | --- |\n```\n\n| Name | Value |\n| --- | --- |\n| item | value |";
+        let structure = scan_markdown_structure(source);
+
+        assert_eq!(structure.fences.len(), 1);
+        assert_eq!(structure.tables.len(), 1);
+        assert_eq!(structure.tables[0].header_line, 5);
     }
 
     #[test]
@@ -3962,6 +5129,14 @@ mod tests {
         let document = state.active_document().unwrap();
         assert!(document.len_bytes() >= TARGET_BYTES);
 
+        let writ_parse_at = Instant::now();
+        let mut writ_buffer: writ::buffer::Buffer = source.parse().unwrap();
+        let writ_parse_elapsed = writ_parse_at.elapsed();
+        let writ_snapshot_at = Instant::now();
+        let writ_snapshot = writ_buffer.render_snapshot();
+        let writ_styles = writ_snapshot.inline_styles_by_line();
+        let writ_snapshot_elapsed = writ_snapshot_at.elapsed();
+
         let list_at = Instant::now();
         let list_state = ListState::new(document.line_count(), ListAlignment::Top, px(100.0));
         let list_elapsed = list_at.elapsed();
@@ -3970,18 +5145,87 @@ mod tests {
         let viewport_lines = materialize_large_document_lines(document, 0..256);
         let viewport_elapsed = viewport_at.elapsed();
 
+        let rich_viewport_source = source.lines().take(384).collect::<Vec<_>>().join("\n");
+        let rich_viewport_at = Instant::now();
+        let rich_viewport_lines = source_lines(&rich_viewport_source, 0, false);
+        let rich_viewport_elapsed = rich_viewport_at.elapsed();
+
         let rich_at = Instant::now();
         let rich_lines = source_lines(&source, 0, false);
         let rich_elapsed = rich_at.elapsed();
 
         eprintln!(
-            "3 MiB markdown: open={open_elapsed:?}, list={} rows in {list_elapsed:?}, viewport={} rows in {viewport_elapsed:?}, full rich={} rows in {rich_elapsed:?}",
+            "3 MiB markdown: open={open_elapsed:?}, writ parse={writ_parse_elapsed:?}, writ snapshot={writ_snapshot_elapsed:?} for {} style rows, list={} rows in {list_elapsed:?}, source viewport={} rows in {viewport_elapsed:?}, rich viewport={} rows in {rich_viewport_elapsed:?}, full rich={} rows in {rich_elapsed:?}",
+            writ_styles.len(),
             list_state.item_count(),
             viewport_lines.len(),
+            rich_viewport_lines.len(),
             rich_lines.len(),
         );
         assert_eq!(viewport_lines.len(), 256);
+        assert_eq!(rich_viewport_lines.len(), 384);
         assert!(rich_lines.len() > viewport_lines.len());
+    }
+
+    #[test]
+    #[ignore = "manual progressive large-document performance probe"]
+    fn large_document_progressive_projection_scales_with_the_window() {
+        const ROW: &str = "## Section\nA normal paragraph with enough content to represent a realistic Markdown document.\n\n";
+
+        for target_bytes in [3 * 1024 * 1024, 10 * 1024 * 1024] {
+            let mut source = ROW.repeat(target_bytes / ROW.len() + 1);
+            source.truncate(target_bytes);
+            let vault = tempdir().unwrap();
+            fs::write(vault.path().join("large.md"), &source).unwrap();
+
+            let mut state = ShellState::from_vault_argument(Some(vault.path().into()));
+            let open_at = Instant::now();
+            state.select_note(Path::new("large.md")).unwrap();
+            let open_elapsed = open_at.elapsed();
+            let document = state.active_document().unwrap();
+            let cache_range = large_document_cache_range(0..0, document.line_count(), 0);
+
+            let snapshot_at = Instant::now();
+            let snapshot = document.text_snapshot();
+            let snapshot_elapsed = snapshot_at.elapsed();
+            let structure_at = Instant::now();
+            let structure = scan_markdown_structure(&snapshot.text());
+            let structure_elapsed = structure_at.elapsed();
+
+            let raw_at = Instant::now();
+            let raw_lines = materialize_large_document_lines(document, cache_range.clone());
+            let raw_elapsed = raw_at.elapsed();
+
+            let request = large_document_rich_render_request(
+                document,
+                LargeDocumentRichRenderContext {
+                    vault_root: vault.path().to_path_buf(),
+                    relative_path: PathBuf::from("large.md"),
+                    revision: document.revision(),
+                    dark_mode: false,
+                    cursor: 0,
+                    line_range: cache_range.clone(),
+                    fence_context: None,
+                    table_prefix: None,
+                    structure_generation: 0,
+                },
+            )
+            .unwrap();
+            let rich_at = Instant::now();
+            let rich_lines = materialize_large_document_rich_lines(&request);
+            let rich_elapsed = rich_at.elapsed();
+
+            eprintln!(
+                "{} MiB progressive window: open={open_elapsed:?}, rope snapshot={snapshot_elapsed:?}, background structure={structure_elapsed:?} ({} fences, {} tables), raw={} rows in {raw_elapsed:?}, rich={} rows in {rich_elapsed:?}",
+                target_bytes / 1024 / 1024,
+                structure.fences.len(),
+                structure.tables.len(),
+                raw_lines.len(),
+                rich_lines.len(),
+            );
+            assert_eq!(raw_lines.len(), cache_range.len());
+            assert_eq!(rich_lines.len(), cache_range.len());
+        }
     }
 
     #[test]

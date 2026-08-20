@@ -80,18 +80,47 @@ impl Render for SynapseApp {
                 },
                 cx,
             )
-        } else if let Some(document) = self.state.active_document() {
+        } else if self.state.active_document().is_some() {
             let cursor = self.state.cursor();
             let vault_root = self
                 .state
                 .vault_root()
                 .map_or_else(PathBuf::new, Path::to_path_buf);
-            let relative_path = document.relative_path().to_path_buf();
-            let revision = document.revision();
-            let document_len = document.len_chars();
             let dark_mode = theme.is_dark();
             let source_mode = self.markdown_source_mode;
-            let large_document = document.len_bytes() >= LARGE_DOCUMENT_THRESHOLD_BYTES;
+            let (
+                relative_path,
+                revision,
+                document_len,
+                large_document,
+                structure_snapshot,
+            ) = {
+                let document = self
+                    .state
+                    .active_document()
+                    .expect("active document was checked above");
+                let large_document = document.len_bytes() >= LARGE_DOCUMENT_THRESHOLD_BYTES;
+                (
+                    document.relative_path().to_path_buf(),
+                    document.revision(),
+                    document.len_chars(),
+                    large_document,
+                    (large_document && !source_mode).then(|| document.text_snapshot()),
+                )
+            };
+            if let Some(snapshot) = structure_snapshot {
+                self.ensure_large_document_structure(
+                    snapshot,
+                    vault_root.clone(),
+                    relative_path.clone(),
+                    revision,
+                    cx,
+                );
+            }
+            let document = self
+                .state
+                .active_document()
+                .expect("active document was checked above");
             let previous_revision = self.editor_render_cache.as_ref().and_then(|cache| {
                 (cache.vault_root == vault_root && cache.relative_path == relative_path)
                     .then_some(cache.revision)
@@ -115,12 +144,24 @@ impl Render for SynapseApp {
             ) = if large_document {
                 self.editor_render_cache = None;
                 let line_count = document.line_count();
-                let same_document = self
-                    .large_document_render_cache
-                    .as_ref()
-                    .is_some_and(|cache| {
-                        cache.vault_root == vault_root && cache.relative_path == relative_path
-                    });
+                let same_document =
+                    self.large_document_render_cache
+                        .as_ref()
+                        .is_some_and(|cache| {
+                            cache.vault_root == vault_root && cache.relative_path == relative_path
+                        });
+                let same_render_context =
+                    self.large_document_render_cache
+                        .as_ref()
+                        .is_some_and(|cache| {
+                            cache.matches(
+                                &vault_root,
+                                &relative_path,
+                                revision,
+                                dark_mode,
+                                source_mode,
+                            )
+                        });
                 let previous_line_count = self
                     .large_document_render_cache
                     .as_ref()
@@ -145,19 +186,18 @@ impl Render for SynapseApp {
                 {
                     let anchor = document.char_to_line(cursor).min(line_count);
                     if line_count > previous_line_count {
-                        self.editor_list_state.splice(
-                            anchor..anchor,
-                            line_count - previous_line_count,
-                        );
+                        self.editor_list_state
+                            .splice(anchor..anchor, line_count - previous_line_count);
                     } else {
-                        self.editor_list_state.splice(
-                            anchor..anchor + (previous_line_count - line_count),
-                            0,
-                        );
+                        self.editor_list_state
+                            .splice(anchor..anchor + (previous_line_count - line_count), 0);
                     }
                     self.editor_line_layouts.borrow_mut().clear();
                 }
                 if previous_revision.is_some_and(|previous| previous != revision) {
+                    self.editor_line_layouts.borrow_mut().clear();
+                }
+                if !same_render_context {
                     self.editor_line_layouts.borrow_mut().clear();
                 }
                 let visible_line_range = large_document_line_range(
@@ -165,226 +205,360 @@ impl Render for SynapseApp {
                     line_count,
                     document.char_to_line(cursor),
                 );
-                let lines = self
+                let cached_window = self
                     .large_document_render_cache
                     .as_ref()
                     .filter(|cache| {
-                        cache.matches(&vault_root, &relative_path, revision)
-                            && cache.covers(&visible_line_range)
+                        cache.matches(
+                            &vault_root,
+                            &relative_path,
+                            revision,
+                            dark_mode,
+                            source_mode,
+                        ) && cache.covers(&visible_line_range)
                     })
-                    .map(|cache| cache.lines.clone())
-                    .unwrap_or_else(|| {
-                        let lines = materialize_large_document_lines(
-                            document,
-                            visible_line_range.clone(),
+                    .map(|cache| {
+                        (
+                            cache.lines.clone(),
+                            cache.cached_range.clone(),
+                            !source_mode && !cache.rich && !cache.rich_render_pending,
+                        )
+                    });
+                let (lines, rich_request) =
+                    if let Some((lines, cache_range, should_render_rich)) = cached_window {
+                        let rich_request = should_render_rich
+                            .then(|| {
+                                let source_line_start = cache_range
+                                    .start
+                                    .saturating_sub(LARGE_DOCUMENT_PARSE_CONTEXT_LINES);
+                                let fence_context = self.large_document_fence_context(
+                                    &vault_root,
+                                    &relative_path,
+                                    revision,
+                                    source_line_start,
+                                );
+                                let table_prefix = fence_context.is_none().then(|| {
+                                    self.large_document_table_prefix(
+                                        &vault_root,
+                                        &relative_path,
+                                        revision,
+                                        source_line_start,
+                                    )
+                                })
+                                .flatten();
+                                large_document_rich_render_request(
+                                    document,
+                                    LargeDocumentRichRenderContext {
+                                        vault_root: vault_root.clone(),
+                                        relative_path: relative_path.clone(),
+                                        revision,
+                                        dark_mode,
+                                        cursor,
+                                        line_range: cache_range,
+                                        fence_context,
+                                        table_prefix,
+                                        structure_generation: self
+                                            .large_document_structure_generation(
+                                                &vault_root,
+                                                &relative_path,
+                                                revision,
+                                            ),
+                                    },
+                                )
+                            })
+                            .flatten();
+                        if rich_request.is_some()
+                            && let Some(cache) = self.large_document_render_cache.as_mut()
+                        {
+                            cache.rich_render_pending = true;
+                        }
+                        (lines, rich_request)
+                    } else {
+                        let cache_range = large_document_cache_range(
+                            self.editor_visible_range.clone(),
+                            line_count,
+                            document.char_to_line(cursor),
                         );
+                        let lines = materialize_large_document_lines(document, cache_range.clone());
+                        let rich_request = (!source_mode)
+                            .then(|| {
+                                let source_line_start = cache_range
+                                    .start
+                                    .saturating_sub(LARGE_DOCUMENT_PARSE_CONTEXT_LINES);
+                                let fence_context = self.large_document_fence_context(
+                                    &vault_root,
+                                    &relative_path,
+                                    revision,
+                                    source_line_start,
+                                );
+                                let table_prefix = fence_context.is_none().then(|| {
+                                    self.large_document_table_prefix(
+                                        &vault_root,
+                                        &relative_path,
+                                        revision,
+                                        source_line_start,
+                                    )
+                                })
+                                .flatten();
+                                large_document_rich_render_request(
+                                    document,
+                                    LargeDocumentRichRenderContext {
+                                        vault_root: vault_root.clone(),
+                                        relative_path: relative_path.clone(),
+                                        revision,
+                                        dark_mode,
+                                        cursor,
+                                        line_range: cache_range.clone(),
+                                        fence_context,
+                                        table_prefix,
+                                        structure_generation: self
+                                            .large_document_structure_generation(
+                                                &vault_root,
+                                                &relative_path,
+                                                revision,
+                                            ),
+                                    },
+                                )
+                            })
+                            .flatten();
                         self.large_document_render_cache = Some(LargeDocumentRenderCache {
                             vault_root: vault_root.clone(),
                             relative_path: relative_path.clone(),
                             revision,
+                            dark_mode,
+                            source_mode,
                             line_count,
-                            cached_range: visible_line_range,
-                            lines: lines.clone(),
-                        });
-                        lines
+                            cached_range: cache_range,
+                            structure_generation: self.large_document_structure_generation(
+                                &vault_root,
+                                &relative_path,
+                                revision,
+                            ),
+                        lines: lines.clone(),
+                        rich: false,
+                        rich_render_pending: rich_request.is_some(),
+                        mermaid_previews: Rc::new(BTreeMap::new()),
+                        math_previews: Rc::new(BTreeMap::new()),
+                        image_previews: Rc::new(BTreeMap::new()),
                     });
+                        (lines, rich_request)
+                    };
+                if let Some(request) = rich_request {
+                    self.schedule_large_document_rich_render(request, cx);
+                }
+                let (mermaid_previews, math_previews, image_previews) =
+                    self.large_document_preview_maps(
+                        self.editor_visible_range.clone(),
+                        &vault_root,
+                        &relative_path,
+                        dark_mode,
+                    );
                 (
                     EditorRows::Large { line_count, lines },
                     None,
                     Rc::new(Vec::new()),
-                    Rc::new(BTreeMap::new()),
-                    Rc::new(BTreeMap::new()),
-                    Rc::new(BTreeMap::new()),
-                )
-            } else {
-                self.large_document_render_cache = None;
-                let (lines, outline, mermaid_previews, math_previews, image_previews) = if cache_hit {
-                let cache = self
-                    .editor_render_cache
-                    .as_ref()
-                    .expect("cache hit requires an editor render cache");
-                (
-                    cache.lines.clone(),
-                    cache.outline.clone(),
-                    cache.mermaid_previews.clone(),
-                    cache.math_previews.clone(),
-                    cache.image_previews.clone(),
-                )
-            } else {
-                let previous_lines = self
-                    .editor_render_cache
-                    .as_ref()
-                    .filter(|cache| {
-                        cache.vault_root == vault_root && cache.relative_path == relative_path
-                    })
-                    .map(|cache| cache.lines.clone());
-                let previous_mermaid_previews = self
-                    .editor_render_cache
-                    .as_ref()
-                    .filter(|cache| {
-                        cache.can_reuse_mermaid_previews(
-                            &vault_root,
-                            &relative_path,
-                            revision,
-                            dark_mode,
-                            source_mode,
-                        )
-                    })
-                    .map(|cache| cache.mermaid_previews.clone());
-                let previous_outline = self
-                    .editor_render_cache
-                    .as_ref()
-                    .filter(|cache| cache.can_reuse_outline(&vault_root, &relative_path, revision))
-                    .map(|cache| cache.outline.clone());
-                let previous_math_previews = self
-                    .editor_render_cache
-                    .as_ref()
-                    .filter(|cache| {
-                        cache.can_reuse_math_previews(
-                            &vault_root,
-                            &relative_path,
-                            revision,
-                            dark_mode,
-                            source_mode,
-                        )
-                    })
-                    .map(|cache| cache.math_previews.clone());
-                let previous_image_previews = self
-                    .editor_render_cache
-                    .as_ref()
-                    .filter(|cache| {
-                        cache.can_reuse_image_previews(
-                            &vault_root,
-                            &relative_path,
-                            revision,
-                            source_mode,
-                        )
-                    })
-                    .map(|cache| cache.image_previews.clone());
-                let (cached_writ_buffer, mut code_syntax_cache, code_syntax_edit) = self
-                    .editor_render_cache
-                    .take()
-                    .filter(|cache| {
-                        !source_mode
-                            && !cache.source_mode
-                            && cache.vault_root == vault_root
-                            && cache.relative_path == relative_path
-                            && cache.writ_revision == revision
-                    })
-                    .map(|cache| {
-                        (
-                            Some(cache.writ_buffer),
-                            cache.code_syntax_cache,
-                            cache.code_syntax_edit,
-                        )
-                    })
-                    .unwrap_or_else(|| (None, CodeSyntaxCache::default(), None));
-                let text = (source_mode || cached_writ_buffer.is_none()).then(|| document.text());
-                let mut writ_buffer = cached_writ_buffer.unwrap_or_else(|| {
-                    text.as_deref()
-                        .expect("a Writ cache miss requires document text")
-                        .parse()
-                        .expect("writ buffer parsing is infallible")
-                });
-                let parsed_lines = if source_mode {
-                    source_lines_with_mode(
-                        text.as_deref()
-                            .expect("source mode requires the document text"),
-                        cursor,
-                        dark_mode,
-                        true,
-                    )
-                } else {
-                    source_lines_from_buffer_with_syntax_cache(
-                        &mut writ_buffer,
-                        cursor,
-                        dark_mode,
-                        &mut code_syntax_cache,
-                        code_syntax_edit.as_ref(),
-                    )
-                };
-                let parsed = Rc::new(parsed_lines.into_iter().map(Rc::new).collect::<Vec<_>>());
-                if let Some(previous_lines) = previous_lines {
-                    if let Some((old_range, new_count)) =
-                        changed_line_span(&previous_lines, &parsed)
-                    {
-                        self.editor_list_state.splice(old_range.clone(), new_count);
-                        splice_editor_line_layouts(
-                            &mut self.editor_line_layouts.borrow_mut(),
-                            old_range,
-                            new_count,
-                        );
-                    }
-                } else {
-                    self.editor_list_state.reset(parsed.len());
-                    self.editor_line_layouts.borrow_mut().clear();
-                    self.editor_visible_range = 0..0;
-                    self.editor_outline_hovered_index = None;
-                }
-                let structural_edit = previous_revision.is_none_or(|previous| previous != revision);
-                let outline = if structural_edit {
-                    Rc::new(build_document_outline_from_lines(&parsed))
-                } else {
-                    previous_outline
-                        .unwrap_or_else(|| Rc::new(build_document_outline_from_lines(&parsed)))
-                };
-                let mermaid_previews = if source_mode {
-                    Rc::new(BTreeMap::new())
-                } else {
-                    previous_mermaid_previews.unwrap_or_else(|| {
-                        build_mermaid_previews(
-                            &parsed,
-                            dark_mode,
-                            initial_editor_preview_range(parsed.len()),
-                        )
-                    })
-                };
-                let math_previews = if source_mode {
-                    Rc::new(BTreeMap::new())
-                } else {
-                    previous_math_previews.unwrap_or_else(|| {
-                        build_math_previews(
-                            &parsed,
-                            dark_mode,
-                            initial_editor_preview_range(parsed.len()),
-                        )
-                    })
-                };
-                let image_previews = if source_mode {
-                    Rc::new(BTreeMap::new())
-                } else {
-                    previous_image_previews.unwrap_or_else(|| {
-                        build_image_previews(
-                            &parsed,
-                            &vault_root,
-                            &relative_path,
-                            initial_editor_preview_range(parsed.len()),
-                        )
-                    })
-                };
-                self.editor_render_cache = Some(EditorRenderCache {
-                    vault_root: vault_root.clone(),
-                    relative_path: relative_path.clone(),
-                    revision,
-                    dark_mode,
-                    source_mode,
-                    writ_revision: revision,
-                    writ_buffer,
-                    code_syntax_cache,
-                    code_syntax_edit: None,
-                    lines: parsed.clone(),
-                    outline: outline.clone(),
-                    mermaid_previews: mermaid_previews.clone(),
-                    math_previews: math_previews.clone(),
-                    image_previews: image_previews.clone(),
-                });
-                (
-                    parsed,
-                    outline,
                     mermaid_previews,
                     math_previews,
                     image_previews,
                 )
+            } else {
+                self.large_document_render_cache = None;
+                if self.large_document_structure.take().is_some() {
+                    self.large_document_structure_scan_token
+                        .fetch_add(1, Ordering::AcqRel);
+                }
+                let (lines, outline, mermaid_previews, math_previews, image_previews) = if cache_hit
+                {
+                    let cache = self
+                        .editor_render_cache
+                        .as_ref()
+                        .expect("cache hit requires an editor render cache");
+                    (
+                        cache.lines.clone(),
+                        cache.outline.clone(),
+                        cache.mermaid_previews.clone(),
+                        cache.math_previews.clone(),
+                        cache.image_previews.clone(),
+                    )
+                } else {
+                    let previous_lines = self
+                        .editor_render_cache
+                        .as_ref()
+                        .filter(|cache| {
+                            cache.vault_root == vault_root && cache.relative_path == relative_path
+                        })
+                        .map(|cache| cache.lines.clone());
+                    let previous_mermaid_previews = self
+                        .editor_render_cache
+                        .as_ref()
+                        .filter(|cache| {
+                            cache.can_reuse_mermaid_previews(
+                                &vault_root,
+                                &relative_path,
+                                revision,
+                                dark_mode,
+                                source_mode,
+                            )
+                        })
+                        .map(|cache| cache.mermaid_previews.clone());
+                    let previous_outline = self
+                        .editor_render_cache
+                        .as_ref()
+                        .filter(|cache| {
+                            cache.can_reuse_outline(&vault_root, &relative_path, revision)
+                        })
+                        .map(|cache| cache.outline.clone());
+                    let previous_math_previews = self
+                        .editor_render_cache
+                        .as_ref()
+                        .filter(|cache| {
+                            cache.can_reuse_math_previews(
+                                &vault_root,
+                                &relative_path,
+                                revision,
+                                dark_mode,
+                                source_mode,
+                            )
+                        })
+                        .map(|cache| cache.math_previews.clone());
+                    let previous_image_previews = self
+                        .editor_render_cache
+                        .as_ref()
+                        .filter(|cache| {
+                            cache.can_reuse_image_previews(
+                                &vault_root,
+                                &relative_path,
+                                revision,
+                                source_mode,
+                            )
+                        })
+                        .map(|cache| cache.image_previews.clone());
+                    let (cached_writ_buffer, mut code_syntax_cache, code_syntax_edit) = self
+                        .editor_render_cache
+                        .take()
+                        .filter(|cache| {
+                            !source_mode
+                                && !cache.source_mode
+                                && cache.vault_root == vault_root
+                                && cache.relative_path == relative_path
+                                && cache.writ_revision == revision
+                        })
+                        .map(|cache| {
+                            (
+                                Some(cache.writ_buffer),
+                                cache.code_syntax_cache,
+                                cache.code_syntax_edit,
+                            )
+                        })
+                        .unwrap_or_else(|| (None, CodeSyntaxCache::default(), None));
+                    let text =
+                        (source_mode || cached_writ_buffer.is_none()).then(|| document.text());
+                    let mut writ_buffer = cached_writ_buffer.unwrap_or_else(|| {
+                        text.as_deref()
+                            .expect("a Writ cache miss requires document text")
+                            .parse()
+                            .expect("writ buffer parsing is infallible")
+                    });
+                    let parsed_lines = if source_mode {
+                        source_lines_with_mode(
+                            text.as_deref()
+                                .expect("source mode requires the document text"),
+                            cursor,
+                            dark_mode,
+                            true,
+                        )
+                    } else {
+                        source_lines_from_buffer_with_syntax_cache(
+                            &mut writ_buffer,
+                            cursor,
+                            dark_mode,
+                            &mut code_syntax_cache,
+                            code_syntax_edit.as_ref(),
+                        )
+                    };
+                    let parsed = Rc::new(parsed_lines.into_iter().map(Rc::new).collect::<Vec<_>>());
+                    if let Some(previous_lines) = previous_lines {
+                        if let Some((old_range, new_count)) =
+                            changed_line_span(&previous_lines, &parsed)
+                        {
+                            self.editor_list_state.splice(old_range.clone(), new_count);
+                            splice_editor_line_layouts(
+                                &mut self.editor_line_layouts.borrow_mut(),
+                                old_range,
+                                new_count,
+                            );
+                        }
+                    } else {
+                        self.editor_list_state.reset(parsed.len());
+                        self.editor_line_layouts.borrow_mut().clear();
+                        self.editor_visible_range = 0..0;
+                        self.editor_outline_hovered_index = None;
+                    }
+                    let structural_edit =
+                        previous_revision.is_none_or(|previous| previous != revision);
+                    let outline = if structural_edit {
+                        Rc::new(build_document_outline_from_lines(&parsed))
+                    } else {
+                        previous_outline
+                            .unwrap_or_else(|| Rc::new(build_document_outline_from_lines(&parsed)))
+                    };
+                    let mermaid_previews = if source_mode {
+                        Rc::new(BTreeMap::new())
+                    } else {
+                        previous_mermaid_previews.unwrap_or_else(|| {
+                            build_mermaid_previews(
+                                &parsed,
+                                dark_mode,
+                                initial_editor_preview_range(parsed.len()),
+                            )
+                        })
+                    };
+                    let math_previews = if source_mode {
+                        Rc::new(BTreeMap::new())
+                    } else {
+                        previous_math_previews.unwrap_or_else(|| {
+                            build_math_previews(
+                                &parsed,
+                                dark_mode,
+                                initial_editor_preview_range(parsed.len()),
+                            )
+                        })
+                    };
+                    let image_previews = if source_mode {
+                        Rc::new(BTreeMap::new())
+                    } else {
+                        previous_image_previews.unwrap_or_else(|| {
+                            build_image_previews(
+                                &parsed,
+                                &vault_root,
+                                &relative_path,
+                                initial_editor_preview_range(parsed.len()),
+                            )
+                        })
+                    };
+                    self.editor_render_cache = Some(EditorRenderCache {
+                        vault_root: vault_root.clone(),
+                        relative_path: relative_path.clone(),
+                        revision,
+                        dark_mode,
+                        source_mode,
+                        writ_revision: revision,
+                        writ_buffer,
+                        code_syntax_cache,
+                        code_syntax_edit: None,
+                        lines: parsed.clone(),
+                        outline: outline.clone(),
+                        mermaid_previews: mermaid_previews.clone(),
+                        math_previews: math_previews.clone(),
+                        image_previews: image_previews.clone(),
+                    });
+                    (
+                        parsed,
+                        outline,
+                        mermaid_previews,
+                        math_previews,
+                        image_previews,
+                    )
                 };
                 (
                     EditorRows::Rich(lines.clone()),
@@ -945,10 +1119,7 @@ impl Render for SynapseApp {
                     let strike_active =
                         self.selected_inline_format_active(InlineFormat::Strikethrough);
                     let code_active = self.selected_inline_format_active(InlineFormat::Code);
-                    let link_active = self.state.active_document().is_some_and(|document| {
-                        markdown_link_context(&document.text(), self.editor_selection.range())
-                            .is_some()
-                    });
+                    let link_active = self.selection_link_active();
                     let ask_value_empty =
                         self.selection_ask_input.read(cx).value().trim().is_empty();
                     let ask_submit_icon_color = if ask_value_empty {
@@ -1808,8 +1979,8 @@ impl Render for SynapseApp {
                                 .text_size(px(11.0))
                                 .text_color(theme.muted_foreground)
                                 .child(self.language.text(
-                                    "大文件性能模式",
-                                    "Large-file performance mode",
+                                    "大文件渐进渲染",
+                                    "Large-file progressive rendering",
                                 )),
                         )
                     })
@@ -1818,11 +1989,10 @@ impl Render for SynapseApp {
                             .text()
                             .rounded(ButtonRounded::None)
                             .size(px(40.0))
-                            .disabled(large_document)
                             .tooltip(if large_document {
                                 self.language.text(
-                                    "大文件使用轻量源码编辑，已关闭富文本渲染",
-                                    "Large files use lightweight source editing; rich rendering is off",
+                                    "切换 Markdown 源码；默认以渐进方式显示富文本",
+                                    "Toggle Markdown source; rich text is rendered progressively by default",
                                 )
                             } else if source_mode {
                                 self.language.text("显示富文本编辑器", "Show rich editor")
@@ -1830,13 +2000,13 @@ impl Render for SynapseApp {
                                 self.language.text("显示 Markdown 源码", "Show Markdown source")
                             })
                             .child(
-                                if source_mode || large_document {
+                                if source_mode {
                                     Icon::RichText
                                 } else {
                                     Icon::Code
                                 }
                                 .render(15.0)
-                                .text_color(if source_mode || large_document {
+                                .text_color(if source_mode {
                                     theme.foreground
                                 } else {
                                     theme.muted_foreground
@@ -2874,14 +3044,10 @@ impl Render for SynapseApp {
             let paste_app = app_entity.clone();
             let add_todos_app = app_entity.clone();
             let has_selection = !self.editor_selection.is_empty();
-            let has_list_items = !self.large_document_active()
-                && self.state.active_document().is_some_and(|document| {
-                    !markdown_list_items_in_selection(
-                        &document.text(),
-                        self.editor_selection.range(),
-                    )
+            let has_list_items = self.state.active_document().is_some_and(|document| {
+                !markdown_list_items_in_document_selection(document, self.editor_selection.range())
                     .is_empty()
-                });
+            });
             let panel = div()
                 .id(SharedString::from(format!(
                     "editor-context-menu-{context_menu_theme_key}"

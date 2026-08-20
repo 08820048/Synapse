@@ -1,5 +1,139 @@
 use super::*;
 
+const EDITOR_COMMAND_CONTEXT_BEHIND_LINES: usize = 256;
+const EDITOR_COMMAND_CONTEXT_AHEAD_LINES: usize = 256;
+
+fn code_text_input_candidate(inserted: &str) -> bool {
+    let mut characters = inserted.chars();
+    let Some(character) = characters.next() else {
+        return false;
+    };
+    characters.next().is_none()
+        && matches!(
+            character,
+            '(' | ')' | '[' | ']' | '{' | '}' | '"' | '\'' | '`'
+        )
+}
+
+/// A bounded source slice used by editing commands that need Markdown context.
+///
+/// Normal notes use the complete document, while large notes provide only a small
+/// line window around the edit. The conversion helpers keep command results in
+/// the document's global character coordinate space.
+struct EditorSourceWindow {
+    source: String,
+    source_start_char: usize,
+    source_end_char: usize,
+    synthetic_prefix_chars: usize,
+}
+
+impl EditorSourceWindow {
+    fn full(document: &NoteDocument) -> Self {
+        Self {
+            source: document.text(),
+            source_start_char: 0,
+            source_end_char: document.len_chars(),
+            synthetic_prefix_chars: 0,
+        }
+    }
+
+    fn around(
+        document: &NoteDocument,
+        range: &Range<usize>,
+        synthetic_prefix: String,
+    ) -> Option<Self> {
+        if range.start > range.end || range.end > document.len_chars() {
+            return None;
+        }
+
+        let start_line = document.char_to_line(range.start);
+        let end_line = if range.is_empty() {
+            start_line
+        } else {
+            document.char_to_line(range.end.saturating_sub(1))
+        };
+        let source_start_line = start_line.saturating_sub(EDITOR_COMMAND_CONTEXT_BEHIND_LINES);
+        let source_end_line = end_line
+            .saturating_add(EDITOR_COMMAND_CONTEXT_AHEAD_LINES)
+            .saturating_add(1)
+            .min(document.line_count());
+        let source_start_char = document.line_start_char(source_start_line);
+        let source_end_char = if source_end_line < document.line_count() {
+            document.line_start_char(source_end_line)
+        } else {
+            document.len_chars()
+        };
+        let source = document.slice(source_start_char..source_end_char).ok()?;
+        let synthetic_prefix_chars = synthetic_prefix.chars().count();
+        let mut combined = String::with_capacity(synthetic_prefix.len() + source.len());
+        combined.push_str(&synthetic_prefix);
+        combined.push_str(&source);
+        Some(Self {
+            source: combined,
+            source_start_char,
+            source_end_char,
+            synthetic_prefix_chars,
+        })
+    }
+
+    fn local_range(&self, range: Range<usize>) -> Option<Range<usize>> {
+        if range.start < self.source_start_char || range.end > self.source_end_char {
+            return None;
+        }
+        let start = range.start.checked_sub(self.source_start_char)?;
+        let end = range.end.checked_sub(self.source_start_char)?;
+        (start <= end).then_some(
+            start + self.synthetic_prefix_chars..end + self.synthetic_prefix_chars,
+        )
+    }
+
+    fn local_pairs(&self, pairs: &[AutoPair]) -> Vec<AutoPair> {
+        pairs
+            .iter()
+            .copied()
+            .filter(|pair| {
+                pair.open >= self.source_start_char && pair.close < self.source_end_char
+            })
+            .map(|mut pair| {
+                pair.open = pair.open - self.source_start_char + self.synthetic_prefix_chars;
+                pair.close = pair.close - self.source_start_char + self.synthetic_prefix_chars;
+                pair
+            })
+            .collect()
+    }
+
+    fn global_range(&self, range: Range<usize>) -> Range<usize> {
+        range.start.saturating_sub(self.synthetic_prefix_chars) + self.source_start_char
+            ..range.end.saturating_sub(self.synthetic_prefix_chars) + self.source_start_char
+    }
+
+    fn global_index(&self, index: usize) -> usize {
+        index.saturating_sub(self.synthetic_prefix_chars) + self.source_start_char
+    }
+
+    fn globalize_code_edit(&self, mut edit: CodeEdit) -> CodeEdit {
+        edit.range = self.global_range(edit.range);
+        edit.cursor = self.global_index(edit.cursor);
+        if let Some(selection) = edit.selection.take() {
+            edit.selection = Some(self.global_range(selection));
+        }
+        if let Some(pair) = edit.new_pair.as_mut() {
+            pair.open = self.global_index(pair.open);
+            pair.close = self.global_index(pair.close);
+        }
+        edit
+    }
+
+    fn globalize_code_input(&self, input: CodeTextInput) -> CodeTextInput {
+        match input {
+            CodeTextInput::Edit(edit) => CodeTextInput::Edit(self.globalize_code_edit(edit)),
+            CodeTextInput::SkipTrackedCloser { cursor } => CodeTextInput::SkipTrackedCloser {
+                cursor: self.global_index(cursor),
+            },
+        }
+    }
+}
+
 impl SynapseApp {
     pub(in crate::app) fn restart_vault_watcher(&mut self, cx: &mut Context<Self>) {
         self.vault_watcher.take();
@@ -1591,9 +1725,6 @@ impl SynapseApp {
     }
 
     pub(in crate::app) fn toggle_markdown_source_mode(&mut self, cx: &mut Context<Self>) {
-        if self.large_document_active() {
-            return;
-        }
         self.markdown_source_mode = !self.markdown_source_mode;
         self.selection_menu_mode = SelectionMenuMode::Formatting;
         self.clear_slash_surfaces_immediately();
@@ -1879,14 +2010,86 @@ impl SynapseApp {
         }
     }
 
+    fn active_editor_source_window(&self, range: &Range<usize>) -> Option<EditorSourceWindow> {
+        let document = self.state.active_document()?;
+        if self.large_document_active() {
+            let cursor_line = document.char_to_line(range.start);
+            let source_start_line = cursor_line.saturating_sub(EDITOR_COMMAND_CONTEXT_BEHIND_LINES);
+            let vault_root = self
+                .state
+                .vault_root()
+                .map_or_else(PathBuf::new, Path::to_path_buf);
+            let synthetic_prefix = self
+                .large_document_fence_context(
+                    &vault_root,
+                    document.relative_path(),
+                    document.revision(),
+                    source_start_line,
+                )
+                .map(|fence| format!("{}\n", fence.opening_source))
+                .unwrap_or_default();
+            EditorSourceWindow::around(document, range, synthetic_prefix)
+        } else {
+            Some(EditorSourceWindow::full(document))
+        }
+    }
+
+    /// Once the background structure index is ready, ordinary large-document text must not take
+    /// the code-editor path just to discover that it is not inside a fenced block. That path
+    /// builds a bounded Markdown window and is still unnecessary work for every backspace,
+    /// delete, or bracket typed in a regular paragraph.
+    fn large_document_cursor_is_known_not_code(&self, cursor: usize) -> bool {
+        if !self.large_document_active() {
+            return false;
+        }
+        self.state.active_document().is_some_and(|document| {
+            matches!(
+                self.large_document_code_context_known(document, cursor),
+                Some(false)
+            )
+        })
+    }
+
     pub(in crate::app) fn code_text_input_behavior(
         &mut self,
-        source: &str,
         range: Range<usize>,
         inserted: &str,
     ) -> Option<CodeTextInput> {
+        if !code_text_input_candidate(inserted)
+            || (range.is_empty()
+                && self.large_document_cursor_is_known_not_code(range.start))
+        {
+            return None;
+        }
         self.ensure_code_auto_pairs_for_active_document();
-        code_text_input(source, range, inserted, &self.code_auto_pairs)
+        let source_window = self.active_editor_source_window(&range)?;
+        let local_range = source_window.local_range(range)?;
+        let pairs = source_window.local_pairs(&self.code_auto_pairs);
+        code_text_input(&source_window.source, local_range, inserted, &pairs)
+            .map(|input| source_window.globalize_code_input(input))
+    }
+
+    fn code_edit_from_active_source_window(
+        &mut self,
+        range: Range<usize>,
+        edit: impl FnOnce(&str, Range<usize>) -> Option<CodeEdit>,
+    ) -> Option<CodeEdit> {
+        let source_window = self.active_editor_source_window(&range)?;
+        let local_range = source_window.local_range(range)?;
+        edit(&source_window.source, local_range).map(|edit| source_window.globalize_code_edit(edit))
+    }
+
+    fn paired_code_edit_range(
+        &mut self,
+        cursor: usize,
+        edit: impl FnOnce(&str, usize, &[AutoPair]) -> Option<Range<usize>>,
+    ) -> Option<Range<usize>> {
+        self.ensure_code_auto_pairs_for_active_document();
+        let source_window = self.active_editor_source_window(&(cursor..cursor))?;
+        let local_cursor = source_window.local_range(cursor..cursor)?.start;
+        let pairs = source_window.local_pairs(&self.code_auto_pairs);
+        edit(&source_window.source, local_cursor, &pairs)
+            .map(|range| source_window.global_range(range))
     }
 
     pub(in crate::app) fn apply_code_editor_edit(
@@ -1944,10 +2147,12 @@ impl SynapseApp {
     }
 
     pub(in crate::app) fn indent_code_block(&mut self, cx: &mut Context<Self>) -> bool {
-        let Some(source) = self.state.active_document().map(|document| document.text()) else {
-            return false;
-        };
-        let Some(edit) = code_indent_edit(&source, self.editor_selection.range()) else {
+        let selection = self.editor_selection.range();
+        let Some(edit) = self
+            .code_edit_from_active_source_window(selection, |source, selection| {
+                code_indent_edit(source, selection)
+            })
+        else {
             return false;
         };
         self.apply_code_editor_edit(edit, cx)
@@ -1959,10 +2164,12 @@ impl SynapseApp {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(source) = self.state.active_document().map(|document| document.text()) else {
-            return;
-        };
-        if let Some(edit) = code_outdent_edit(&source, self.editor_selection.range()) {
+        let selection = self.editor_selection.range();
+        if let Some(edit) = self
+            .code_edit_from_active_source_window(selection, |source, selection| {
+                code_outdent_edit(source, selection)
+            })
+        {
             self.apply_code_editor_edit(edit, cx);
         }
         cx.stop_propagation();
@@ -1983,9 +2190,6 @@ impl SynapseApp {
         cx: &mut Context<Self>,
     ) {
         self.editor_marked_range = None;
-        let source = (!self.large_document_active())
-            .then(|| self.state.active_document().map(|document| document.text()))
-            .flatten();
         let previous_revision = self
             .state
             .active_document()
@@ -1993,9 +2197,9 @@ impl SynapseApp {
         let edit = if self.editor_selection.is_empty() {
             let cursor = self.state.cursor();
             self.ensure_code_auto_pairs_for_active_document();
-            let paired_range: Option<Range<usize>> = source
-                .as_deref()
-                .and_then(|source| paired_backspace_range(source, cursor, &self.code_auto_pairs));
+            let paired_range = (!self.large_document_cursor_is_known_not_code(cursor))
+                .then(|| self.paired_code_edit_range(cursor, paired_backspace_range))
+                .flatten();
             if let Some(range) = paired_range {
                 let _ = self.state.replace_active_range(range.clone(), "");
                 Some(range)
@@ -2026,9 +2230,6 @@ impl SynapseApp {
         cx: &mut Context<Self>,
     ) {
         self.editor_marked_range = None;
-        let source = (!self.large_document_active())
-            .then(|| self.state.active_document().map(|document| document.text()))
-            .flatten();
         let previous_revision = self
             .state
             .active_document()
@@ -2040,9 +2241,9 @@ impl SynapseApp {
         let edit = if self.editor_selection.is_empty() {
             let cursor = self.state.cursor();
             self.ensure_code_auto_pairs_for_active_document();
-            let paired_range: Option<Range<usize>> = source.as_deref().and_then(|source| {
-                paired_delete_forward_range(source, cursor, &self.code_auto_pairs)
-            });
+            let paired_range = (!self.large_document_cursor_is_known_not_code(cursor))
+                .then(|| self.paired_code_edit_range(cursor, paired_delete_forward_range))
+                .flatten();
             if let Some(range) = paired_range {
                 let _ = self.state.replace_active_range(range.clone(), "");
                 Some(range)
@@ -2383,10 +2584,11 @@ impl SynapseApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(text) = self.state.active_document().map(|document| document.text()) else {
+        let selection = self.editor_selection.range();
+        let Some(document) = self.state.active_document() else {
             return;
         };
-        let items = markdown_list_items_in_selection(&text, self.editor_selection.range());
+        let items = markdown_list_items_in_document_selection(document, selection);
         if items.is_empty() {
             self.dismiss_context_menus(cx);
             return;
@@ -2432,27 +2634,8 @@ impl SynapseApp {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.large_document_active() {
-            let range = self.editor_selection.range();
-            let previous_revision = self
-                .state
-                .active_document()
-                .map_or(0, |document| document.revision());
-            if self.state.replace_active_range(range.clone(), "`").is_ok() {
-                self.sync_writ_render_buffer(previous_revision, range, "`");
-                self.editor_marked_range = None;
-                self.editor_selection.collapse(self.state.cursor());
-                self.restart_editor_cursor_blink(cx);
-                cx.notify();
-            }
-            cx.stop_propagation();
-            return;
-        }
-        let Some(source) = self.state.active_document().map(|document| document.text()) else {
-            return;
-        };
         let range = self.editor_selection.range();
-        if let Some(input) = self.code_text_input_behavior(&source, range.clone(), "`") {
+        if let Some(input) = self.code_text_input_behavior(range.clone(), "`") {
             match input {
                 CodeTextInput::Edit(edit) => {
                     self.apply_code_editor_edit(edit, cx);
@@ -2494,37 +2677,27 @@ impl SynapseApp {
             return;
         }
         self.editor_marked_range = None;
-        if self.large_document_active() {
-            let range = self.editor_selection.range();
-            self.apply_code_editor_edit(
-                CodeEdit {
-                    cursor: range.start + 1,
-                    range,
-                    replacement: "\n".to_owned(),
-                    selection: None,
-                    new_pair: None,
-                },
-                cx,
-            );
-            self.begin_close_slash_menu(cx);
-            cx.stop_propagation();
-            return;
-        }
-        let Some(source) = self.state.active_document().map(|document| document.text()) else {
-            return;
-        };
         let selection = self.editor_selection.range();
         if selection.is_empty() {
             let cursor = self.state.cursor();
+            let Some(source_window) = self.active_editor_source_window(&selection) else {
+                return;
+            };
+            let Some(local_cursor) = source_window
+                .local_range(cursor..cursor)
+                .map(|range| range.start)
+            else {
+                return;
+            };
             // Preserve Markdown's third-Enter code-fence exit behavior before
             // applying language-aware indentation within the block.
-            let markdown_edit = smart_enter_edit(&source, cursor);
-            if code_block_exit_requested(&source, cursor) {
+            let markdown_edit = smart_enter_edit(&source_window.source, local_cursor);
+            if code_block_exit_requested(&source_window.source, local_cursor) {
                 self.apply_code_editor_edit(
                     CodeEdit {
-                        range: markdown_edit.range,
+                        range: source_window.global_range(markdown_edit.range),
                         replacement: markdown_edit.replacement,
-                        cursor: markdown_edit.cursor,
+                        cursor: source_window.global_index(markdown_edit.cursor),
                         selection: None,
                         new_pair: None,
                     },
@@ -2535,17 +2708,18 @@ impl SynapseApp {
                 return;
             }
             self.ensure_code_auto_pairs_for_active_document();
-            if let Some(edit) = code_newline_edit(&source, cursor, &self.code_auto_pairs) {
-                self.apply_code_editor_edit(edit, cx);
+            let pairs = source_window.local_pairs(&self.code_auto_pairs);
+            if let Some(edit) = code_newline_edit(&source_window.source, local_cursor, &pairs) {
+                self.apply_code_editor_edit(source_window.globalize_code_edit(edit), cx);
                 self.begin_close_slash_menu(cx);
                 cx.stop_propagation();
                 return;
             }
             self.apply_code_editor_edit(
                 CodeEdit {
-                    range: markdown_edit.range,
+                    range: source_window.global_range(markdown_edit.range),
                     replacement: markdown_edit.replacement,
-                    cursor: markdown_edit.cursor,
+                    cursor: source_window.global_index(markdown_edit.cursor),
                     selection: None,
                     new_pair: None,
                 },
@@ -2629,8 +2803,7 @@ impl SynapseApp {
         include_empty_prefix: bool,
         cx: &mut Context<Self>,
     ) {
-        if self.large_document_active()
-            || self.markdown_source_mode
+        if self.markdown_source_mode
             || self.workspace_view != WorkspaceView::Note
             || !self.editor_selection.is_empty()
             || self.editor_marked_range.is_some()
@@ -2644,12 +2817,30 @@ impl SynapseApp {
         };
         let document_path = document.relative_path().to_path_buf();
         let document_revision = document.revision();
-        let source = document.text();
         let cursor = self.state.cursor();
-        let Some(context) = code_completion_context(&source, cursor) else {
+        if self.large_document_active()
+            && self
+                .large_document_code_context_known(document, cursor)
+                .is_some_and(|inside_code| !inside_code)
+        {
+            self.dismiss_code_completion();
+            return;
+        }
+        let Some(source_window) = self.active_editor_source_window(&(cursor..cursor)) else {
             self.dismiss_code_completion();
             return;
         };
+        let Some(local_cursor) = source_window.local_range(cursor..cursor).map(|range| range.start)
+        else {
+            self.dismiss_code_completion();
+            return;
+        };
+        let Some(mut context) = code_completion_context(&source_window.source, local_cursor) else {
+            self.dismiss_code_completion();
+            return;
+        };
+        context.code_range = source_window.global_range(context.code_range);
+        context.replacement_range = source_window.global_range(context.replacement_range);
         if context.prefix.is_empty() && !include_empty_prefix {
             self.dismiss_code_completion();
             return;
@@ -2901,8 +3092,7 @@ impl SynapseApp {
     }
 
     pub(in crate::app) fn refresh_slash_menu(&mut self, cx: &mut Context<Self>) {
-        if self.large_document_active()
-            || self.markdown_source_mode
+        if self.markdown_source_mode
             || self.workspace_view != WorkspaceView::Note
             || !self.editor_selection.is_empty()
             || self.note_link_picker.is_some()
@@ -2910,14 +3100,24 @@ impl SynapseApp {
             self.begin_close_slash_menu(cx);
             return;
         }
-        let Some(trigger) = self
-            .state
-            .active_document()
-            .and_then(|document| slash_trigger(&document.text(), self.state.cursor()))
+        let cursor = self.state.cursor();
+        let Some(document) = self.state.active_document() else {
+            self.begin_close_slash_menu(cx);
+            return;
+        };
+        let line_index = document.char_to_line(cursor);
+        let line_start = document.line_start_char(line_index);
+        let Some(line_prefix) = document.slice(line_start..cursor).ok() else {
+            self.begin_close_slash_menu(cx);
+            return;
+        };
+        let local_cursor = line_prefix.chars().count();
+        let Some(mut trigger) = slash_trigger(&line_prefix, local_cursor)
         else {
             self.begin_close_slash_menu(cx);
             return;
         };
+        trigger.range = trigger.range.start + line_start..trigger.range.end + line_start;
         let allow_note_links = self.state.vault_root().is_some();
         let command_count =
             filtered_slash_commands(&trigger.query, self.language, allow_note_links).len();
@@ -3055,25 +3255,29 @@ impl SynapseApp {
             return;
         }
 
-        let Some(source) = self.state.active_document().map(|document| document.text()) else {
+        let Some(source_window) = self.active_editor_source_window(&trigger_range) else {
             return;
         };
-        let Some(edit) = slash_command_edit(&source, trigger_range, command) else {
+        let Some(local_range) = source_window.local_range(trigger_range) else {
+            return;
+        };
+        let Some(edit) = slash_command_edit(&source_window.source, local_range, command) else {
             return;
         };
         let previous_revision = self
             .state
             .active_document()
             .map_or(0, |document| document.revision());
-        let cache_range = edit.range.clone();
+        let cache_range = source_window.global_range(edit.range);
+        let cursor = source_window.global_index(edit.cursor);
         if self
             .state
-            .replace_active_range(edit.range, &edit.replacement)
+            .replace_active_range(cache_range.clone(), &edit.replacement)
             .is_ok()
         {
             self.sync_writ_render_buffer(previous_revision, cache_range, &edit.replacement);
-            self.state.set_cursor(edit.cursor);
-            self.editor_selection.collapse(edit.cursor);
+            self.state.set_cursor(cursor);
+            self.editor_selection.collapse(cursor);
             self.editor_marked_range = None;
             self.begin_close_slash_menu(cx);
             self.begin_close_note_link_picker(cx);
@@ -3192,9 +3396,6 @@ impl SynapseApp {
     }
 
     pub(in crate::app) fn selection_menu_anchor(&self) -> Option<Point<Pixels>> {
-        if self.large_document_active() {
-            return None;
-        }
         let range = self.editor_selection.range();
         if range.is_empty() || self.editor_selection.is_dragging() {
             return None;
@@ -3232,10 +3433,24 @@ impl SynapseApp {
 
     pub(in crate::app) fn selected_inline_format_active(&self, format: InlineFormat) -> bool {
         let range = self.editor_selection.range();
-        let Some(text) = self.state.active_document().map(|document| document.text()) else {
+        let Some(source_window) = self.active_editor_source_window(&range) else {
             return false;
         };
-        inline_format_is_active(&text, range, format)
+        let Some(local_range) = source_window.local_range(range) else {
+            return false;
+        };
+        inline_format_is_active(&source_window.source, local_range, format)
+    }
+
+    pub(in crate::app) fn selection_link_active(&self) -> bool {
+        let range = self.editor_selection.range();
+        self.active_editor_source_window(&range)
+            .and_then(|source_window| {
+                source_window
+                    .local_range(range)
+                    .and_then(|range| markdown_link_context(&source_window.source, range))
+            })
+            .is_some()
     }
 
     pub(in crate::app) fn toggle_selected_inline_format(
@@ -3244,20 +3459,30 @@ impl SynapseApp {
         cx: &mut Context<Self>,
     ) {
         let range = self.editor_selection.range();
-        let Some(text) = self.state.active_document().map(|document| document.text()) else {
+        let Some(source_window) = self.active_editor_source_window(&range) else {
             return;
         };
-        let Some(edit) = inline_format_edit(&text, range, format) else {
+        let Some(local_range) = source_window.local_range(range) else {
             return;
         };
+        let Some(edit) = inline_format_edit(&source_window.source, local_range, format) else {
+            return;
+        };
+        let replace_range = source_window.global_range(edit.replace_range);
+        let selection = source_window.global_range(edit.selection);
+        let previous_revision = self
+            .state
+            .active_document()
+            .map_or(0, |document| document.revision());
         if self
             .state
-            .replace_active_range(edit.replace_range, &edit.replacement)
+            .replace_active_range(replace_range.clone(), &edit.replacement)
             .is_ok()
         {
-            self.editor_selection.collapse(edit.selection.start);
-            self.editor_selection.select_to(edit.selection.end);
-            self.state.set_cursor(edit.selection.end);
+            self.sync_writ_render_buffer(previous_revision, replace_range, &edit.replacement);
+            self.editor_selection.collapse(selection.start);
+            self.editor_selection.select_to(selection.end);
+            self.state.set_cursor(selection.end);
             self.selection_menu_mode = SelectionMenuMode::Formatting;
             self.editor_marked_range = None;
             self.restart_editor_cursor_blink(cx);
@@ -3326,22 +3551,33 @@ impl SynapseApp {
         cx: &mut Context<Self>,
     ) {
         let range = self.editor_selection.range();
-        let Some(text) = self.state.active_document().map(|document| document.text()) else {
+        let Some(source_window) = self.active_editor_source_window(&range) else {
             cx.stop_propagation();
             return;
         };
-        let Some(edit) = fenced_code_block_edit(&text, range) else {
+        let Some(local_range) = source_window.local_range(range) else {
             cx.stop_propagation();
             return;
         };
+        let Some(edit) = fenced_code_block_edit(&source_window.source, local_range) else {
+            cx.stop_propagation();
+            return;
+        };
+        let replace_range = source_window.global_range(edit.replace_range);
+        let selection = source_window.global_range(edit.selection);
+        let previous_revision = self
+            .state
+            .active_document()
+            .map_or(0, |document| document.revision());
         if self
             .state
-            .replace_active_range(edit.replace_range, &edit.replacement)
+            .replace_active_range(replace_range.clone(), &edit.replacement)
             .is_ok()
         {
-            self.editor_selection.collapse(edit.selection.start);
-            self.editor_selection.select_to(edit.selection.end);
-            self.state.set_cursor(edit.selection.end);
+            self.sync_writ_render_buffer(previous_revision, replace_range, &edit.replacement);
+            self.editor_selection.collapse(selection.start);
+            self.editor_selection.select_to(selection.end);
+            self.state.set_cursor(selection.end);
             self.editor_marked_range = None;
             self.selection_menu_mode = SelectionMenuMode::Formatting;
             self.restart_editor_cursor_blink(cx);
@@ -3356,10 +3592,13 @@ impl SynapseApp {
         cx: &mut Context<Self>,
     ) {
         let range = self.editor_selection.range();
-        let Some(text) = self.state.active_document().map(|document| document.text()) else {
+        let Some(source_window) = self.active_editor_source_window(&range) else {
             return;
         };
-        let existing = markdown_link_context(&text, range)
+        let Some(local_range) = source_window.local_range(range) else {
+            return;
+        };
+        let existing = markdown_link_context(&source_window.source, local_range)
             .map(|link| link.destination)
             .unwrap_or_default();
         self.selection_link_input.update(cx, |input, cx| {
@@ -3376,16 +3615,21 @@ impl SynapseApp {
         cx: &mut Context<Self>,
     ) {
         let range = self.editor_selection.range();
-        let Some(text) = self.state.active_document().map(|document| document.text()) else {
+        let Some(source_window) = self.active_editor_source_window(&range) else {
+            self.close_selection_submenu(window, cx);
+            return;
+        };
+        let Some(local_range) = source_window.local_range(range) else {
             self.close_selection_submenu(window, cx);
             return;
         };
         let input = self.selection_link_input.read(cx).value().trim().to_owned();
-        let context = markdown_link_context(&text, range.clone());
-        let selected = text
+        let context = markdown_link_context(&source_window.source, local_range.clone());
+        let selected = source_window
+            .source
             .chars()
-            .skip(range.start)
-            .take(range.len())
+            .skip(local_range.start)
+            .take(local_range.len())
             .collect::<String>();
         let label = context
             .as_ref()
@@ -3396,13 +3640,22 @@ impl SynapseApp {
             let destination = normalize_markdown_link_destination(&input);
             format!("[{label}]({destination})")
         };
-        let replace_range = context.as_ref().map_or(range, |link| link.outer.clone());
+        let replace_range = source_window.global_range(
+            context
+                .as_ref()
+                .map_or(local_range, |link| link.outer.clone()),
+        );
         let label_start = replace_range.start + usize::from(!input.is_empty());
+        let previous_revision = self
+            .state
+            .active_document()
+            .map_or(0, |document| document.revision());
         if self
             .state
-            .replace_active_range(replace_range, &replacement)
+            .replace_active_range(replace_range.clone(), &replacement)
             .is_ok()
         {
+            self.sync_writ_render_buffer(previous_revision, replace_range, &replacement);
             let label_end = label_start + label.chars().count();
             self.editor_selection.collapse(label_start);
             self.editor_selection.select_to(label_end);
@@ -3509,14 +3762,14 @@ impl SynapseApp {
                 cursor = edit.cursor;
             }
         }
-        let linked_note = (!self.large_document_active())
-            .then(|| {
-                self.state
-                    .active_document()
-                    .and_then(|document| markdown_link_context(&document.text(), cursor..cursor))
-                    .and_then(|link| linked_vault_note(&link.destination, &self.state.entries))
+        let linked_note = self
+            .active_editor_source_window(&(cursor..cursor))
+            .and_then(|source_window| {
+                source_window
+                    .local_range(cursor..cursor)
+                    .and_then(|range| markdown_link_context(&source_window.source, range))
             })
-            .flatten();
+            .and_then(|link| linked_vault_note(&link.destination, &self.state.entries));
         if let Some(relative_path) = linked_note {
             self.select_note(relative_path, window, cx);
             cx.stop_propagation();
@@ -3651,6 +3904,11 @@ impl SynapseApp {
     ) {
         self.ensure_code_auto_pairs_for_active_document();
         adjust_auto_pairs(&mut self.code_auto_pairs, &range, replacement);
+        self.refresh_large_document_render_cache_after_edit(
+            previous_revision,
+            range.clone(),
+            replacement,
+        );
         let Some(cache) = self.editor_render_cache.as_mut() else {
             return;
         };
@@ -3679,5 +3937,41 @@ impl SynapseApp {
         } else {
             cache.code_syntax_edit = Some(CodeSyntaxEdit::new(range, replacement));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EditorSourceWindow, code_text_input, code_text_input_candidate};
+
+    #[test]
+    fn ordinary_text_does_not_materialize_code_command_context() {
+        assert!(!code_text_input_candidate("a"));
+        assert!(!code_text_input_candidate("中文"));
+        assert!(!code_text_input_candidate("ab"));
+        assert!(code_text_input_candidate("("));
+        assert!(code_text_input_candidate("}"));
+    }
+
+    #[test]
+    fn synthetic_code_context_keeps_edits_in_global_document_coordinates() {
+        let prefix = "```rust\n";
+        let window = EditorSourceWindow {
+            source: format!("{prefix}let value = "),
+            source_start_char: 900,
+            source_end_char: 912,
+            synthetic_prefix_chars: prefix.chars().count(),
+        };
+        let cursor = 912;
+        let local = window.local_range(cursor..cursor).unwrap();
+        let input = code_text_input(&window.source, local, "(", &[]).unwrap();
+        let edit = match window.globalize_code_input(input) {
+            super::CodeTextInput::Edit(edit) => edit,
+            super::CodeTextInput::SkipTrackedCloser { .. } => unreachable!(),
+        };
+
+        assert_eq!(edit.range, cursor..cursor);
+        assert_eq!(edit.cursor, cursor + 1);
+        assert_eq!(edit.replacement, "()");
     }
 }

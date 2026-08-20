@@ -20,6 +20,21 @@ pub struct NoteDocument {
     saved_revision: u64,
 }
 
+/// A cheap, immutable rope snapshot for background readers.
+///
+/// Cloning the rope shares its internal chunks, so callers can defer string materialization to a
+/// worker without copying the document's UTF-16 index or blocking the editor thread.
+#[derive(Clone)]
+pub struct NoteTextSnapshot {
+    buffer: Rope,
+}
+
+impl NoteTextSnapshot {
+    pub fn text(&self) -> String {
+        self.buffer.to_string()
+    }
+}
+
 impl NoteDocument {
     pub(crate) fn from_text(relative_path: PathBuf, text: &str) -> Self {
         Self {
@@ -41,6 +56,12 @@ impl NoteDocument {
 
     pub fn text(&self) -> String {
         self.buffer.to_string()
+    }
+
+    pub fn text_snapshot(&self) -> NoteTextSnapshot {
+        NoteTextSnapshot {
+            buffer: self.buffer.clone(),
+        }
     }
 
     pub fn len_chars(&self) -> usize {
@@ -269,6 +290,16 @@ mod tests {
 
         assert_eq!(document.slice(1..3).unwrap(), "你好");
         assert!(document.slice(0..5).is_err());
+    }
+
+    #[test]
+    fn text_snapshot_shares_a_stable_background_read_view() {
+        let mut document = NoteDocument::from_text(PathBuf::from("note.md"), "before");
+        let snapshot = document.text_snapshot();
+        document.insert(6, " after").unwrap();
+
+        assert_eq!(snapshot.text(), "before");
+        assert_eq!(document.text(), "before after");
     }
 
     #[test]
