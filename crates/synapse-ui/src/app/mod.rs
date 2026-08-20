@@ -146,6 +146,7 @@ const SETTINGS_WINDOW_HEIGHT: f32 = 700.0;
 const SETTINGS_WINDOW_MIN_WIDTH: f32 = 760.0;
 const SETTINGS_WINDOW_MIN_HEIGHT: f32 = 520.0;
 const VAULT_REFRESH_DEBOUNCE: Duration = Duration::from_millis(180);
+const AUTOSAVE_INTERVAL: Duration = Duration::from_secs(1);
 const PANEL_TRANSITION: Duration = Duration::from_millis(180);
 const MARKD_PANEL_SPRING_STIFFNESS: f32 = 420.0;
 const MARKD_PANEL_SPRING_DAMPING: f32 = 40.0;
@@ -665,6 +666,118 @@ fn vault_preference_path() -> Option<PathBuf> {
     synapse_config_directory().map(|directory| directory.join("vault"))
 }
 
+fn session_preference_path() -> Option<PathBuf> {
+    synapse_config_directory().map(|directory| directory.join("session"))
+}
+
+type SessionPreference = (Vec<(PathBuf, usize, bool)>, Option<usize>);
+
+fn recovery_preference_path() -> Option<PathBuf> {
+    synapse_config_directory().map(|directory| directory.join("recovery"))
+}
+
+fn load_recovery_preference(root: &Path) -> Option<(PathBuf, String, String)> {
+    let contents = fs::read_to_string(recovery_preference_path()?).ok()?;
+    parse_recovery_preference(&contents, root)
+}
+
+fn parse_recovery_preference(contents: &str, root: &Path) -> Option<(PathBuf, String, String)> {
+    let (header, payload) = contents.split_once("\n\n")?;
+    let mut lines = header.lines();
+    let saved_root = PathBuf::from(lines.next()?.strip_prefix("vault=")?);
+    if saved_root != root {
+        return None;
+    }
+    let path = PathBuf::from(lines.next()?.strip_prefix("path=")?);
+    let saved_bytes = lines.next()?.strip_prefix("saved-bytes=")?.parse().ok()?;
+    if !payload.is_char_boundary(saved_bytes) {
+        return None;
+    }
+    let (saved_text, text) = payload.split_at(saved_bytes);
+    Some((path, saved_text.to_owned(), text.to_owned()))
+}
+
+fn save_recovery_preference(state: &ShellState) -> io::Result<bool> {
+    let Some((relative_path, saved_text, text)) = state.recovery_snapshot() else {
+        return Ok(false);
+    };
+    let root = state
+        .vault_root()
+        .ok_or_else(|| io::Error::other("no vault is open"))?;
+    let path = recovery_preference_path()
+        .ok_or_else(|| io::Error::other("unable to locate the user configuration directory"))?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(
+        path,
+        format!(
+            "vault={}\npath={}\nsaved-bytes={}\n\n{saved_text}{text}",
+            root.display(),
+            relative_path.display(),
+            saved_text.len(),
+        ),
+    )?;
+    Ok(true)
+}
+
+fn clear_recovery_preference() -> io::Result<()> {
+    let Some(path) = recovery_preference_path() else {
+        return Ok(());
+    };
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn load_session_preference(root: &Path) -> Option<SessionPreference> {
+    let contents = fs::read_to_string(session_preference_path()?).ok()?;
+    parse_session_preference(&contents, root)
+}
+
+fn parse_session_preference(
+    contents: &str,
+    root: &Path,
+) -> Option<SessionPreference> {
+    let mut lines = contents.lines();
+    let saved_root = PathBuf::from(lines.next()?.strip_prefix("vault=")?);
+    if saved_root != root {
+        return None;
+    }
+    let active = lines
+        .next()
+        .and_then(|line| line.strip_prefix("active=")?.parse::<usize>().ok());
+    let paths = lines
+        .filter_map(|line| {
+            let value = line.strip_prefix("tab=")?;
+            let mut fields = value.splitn(3, '\t');
+            let cursor = fields.next()?.parse().ok()?;
+            let pinned = fields.next()?.parse().ok()?;
+            Some((PathBuf::from(fields.next()?), cursor, pinned))
+        })
+        .collect();
+    Some((paths, active))
+}
+
+fn save_session_preference(state: &ShellState) -> io::Result<()> {
+    let Some(root) = state.vault_root() else {
+        return Ok(());
+    };
+    let path = session_preference_path()
+        .ok_or_else(|| io::Error::other("unable to locate the user configuration directory"))?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let (tabs, active) = state.session_snapshot();
+    let mut contents = format!("vault={}\nactive={}\n", root.display(), active.unwrap_or(0));
+    for (path, cursor, pinned) in tabs {
+        contents.push_str(&format!("tab={cursor}\t{pinned}\t{}\n", path.display()));
+    }
+    fs::write(path, contents)
+}
+
 fn dismissed_update_path() -> Option<PathBuf> {
     synapse_config_directory().map(|directory| directory.join("dismissed-update"))
 }
@@ -1030,6 +1143,15 @@ struct TreeTarget {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum DangerousAction {
+    DiscardTab {
+        index: usize,
+        display_name: String,
+    },
+    DiscardTabs {
+        indices: Vec<usize>,
+        closed_active: Option<usize>,
+        count: usize,
+    },
     TrashTreeEntry {
         target: TreeTarget,
     },
@@ -1088,11 +1210,41 @@ impl DangerousAction {
             Self::TrashTreeEntry { .. } | Self::TrashActiveNote { .. }
         ) {
             language.text("移到废纸篓", "Move to Trash").to_owned()
+        } else if matches!(self, Self::DiscardTab { .. } | Self::DiscardTabs { .. }) {
+            language.text("放弃更改", "Discard Changes").to_owned()
         } else {
             language.text("确认删除", "Delete").to_owned()
         };
         let success_title = language.text("操作成功", "Action completed").to_owned();
         let (title, description, success_message) = match self {
+            Self::DiscardTab { display_name, .. } => (
+                language
+                    .text("放弃未保存的更改？", "Discard Unsaved Changes?")
+                    .to_owned(),
+                match language {
+                    AppLanguage::SimplifiedChinese => {
+                        format!("关闭“{display_name}”并放弃其中未保存的更改？")
+                    }
+                    AppLanguage::English => {
+                        format!("Close “{display_name}” and discard its unsaved changes?")
+                    }
+                },
+                language.text("页签已关闭", "Tab closed").to_owned(),
+            ),
+            Self::DiscardTabs { count, .. } => (
+                language
+                    .text("放弃未保存的更改？", "Discard Unsaved Changes?")
+                    .to_owned(),
+                match language {
+                    AppLanguage::SimplifiedChinese => {
+                        format!("关闭这些页签并放弃其中 {count} 个未保存页签的更改？")
+                    }
+                    AppLanguage::English => format!(
+                        "Close these tabs and discard changes in {count} unsaved tab(s)?"
+                    ),
+                },
+                language.text("页签已关闭", "Tabs closed").to_owned(),
+            ),
             Self::TrashTreeEntry { target } => {
                 let kind = match target.kind {
                     VaultEntryKind::Directory => language.text("文件夹", "folder"),
@@ -1245,6 +1397,34 @@ struct TreeDrag {
     target: TreeTarget,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TabDrag {
+    index: usize,
+}
+
+struct TabDragPreview {
+    drag: TabDrag,
+    position: Point<Pixels>,
+}
+
+impl Render for TabDragPreview {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .pl(self.position.x - px(12.0))
+            .pt(self.position.y - px(16.0))
+            .child(
+                div()
+                    .px_3()
+                    .py_2()
+                    .rounded_md()
+                    .bg(hsla(220.0 / 360.0, 0.15, 0.18, 0.96))
+                    .text_sm()
+                    .text_color(rgb(0xdce2ed))
+                    .child(format!("Tab {}", self.drag.index + 1)),
+            )
+    }
+}
+
 struct TreeDragPreview {
     drag: TreeDrag,
     position: Point<Pixels>,
@@ -1295,12 +1475,16 @@ actions!(
         DeleteForward,
         MoveLeft,
         MoveRight,
+        MovePreviousWord,
+        MoveNextWord,
         MoveUp,
         MoveDown,
         MoveHome,
         MoveEnd,
         SelectLeft,
         SelectRight,
+        SelectPreviousWord,
+        SelectNextWord,
         SelectUp,
         SelectDown,
         SelectHome,
@@ -1323,6 +1507,12 @@ actions!(
         AcceptSlashCommand,
         DismissSlashMenu,
         OpenCommandPalette,
+        OpenFind,
+        FindNext,
+        FindPrevious,
+        ReplaceNext,
+        ReplaceAll,
+        DismissFind,
     ]
 );
 
@@ -1366,10 +1556,103 @@ struct NoteLinkCandidate {
     folder: Option<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct VaultSearchResult {
+    relative_path: PathBuf,
+    title: String,
+    preview: String,
+}
+
+fn search_vault_entries(
+    entries: &[VaultEntry],
+    vault_root: Option<&Path>,
+    query: &str,
+    active_document: Option<(&Path, &str)>,
+) -> Vec<VaultSearchResult> {
+    // ponytail: scan files directly while Vaults are small; add a background index only when
+    // measured search latency warrants maintaining one.
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return Vec::new();
+    }
+    entries
+        .iter()
+        .filter(|entry| entry.kind == VaultEntryKind::Note)
+        .filter_map(|entry| {
+            let path = entry.relative_path.to_string_lossy();
+            let content = active_document
+                .filter(|(path, _)| *path == entry.relative_path)
+                .map_or_else(
+                    || {
+                        vault_root
+                            .and_then(|root| {
+                                fs::read_to_string(root.join(&entry.relative_path)).ok()
+                            })
+                            .unwrap_or_default()
+                    },
+                    |(_, content)| content.to_owned(),
+                );
+            let path_match = path.to_lowercase().contains(&query);
+            let content_match = content.to_lowercase().contains(&query);
+            if !path_match && !content_match {
+                return None;
+            }
+            let preview = content
+                .lines()
+                .find(|line| line.to_lowercase().contains(&query))
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .unwrap_or(path.as_ref())
+                .to_owned();
+            Some(VaultSearchResult {
+                relative_path: entry.relative_path.clone(),
+                title: entry
+                    .relative_path
+                    .file_stem()
+                    .map(|stem| stem.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| entry.name.clone()),
+                preview,
+            })
+        })
+        .take(50)
+        .collect()
+}
+
+fn next_command_palette_selection(current: usize, count: usize, direction: i32) -> usize {
+    if count == 0 {
+        return 0;
+    }
+    (current as i32 + direction).rem_euclid(count as i32) as usize
+}
+
+fn command_palette_scroll_item_index(
+    selected: usize,
+    search_count: usize,
+    query_nonempty: bool,
+) -> usize {
+    if !query_nonempty {
+        return 1 + selected + usize::from(selected >= 4);
+    }
+    if search_count > 0 && selected < search_count {
+        return 2 + selected;
+    }
+    let menu_index = selected.saturating_sub(search_count);
+    let menu_start = if search_count == 0 {
+        3
+    } else {
+        2 + search_count
+    };
+    menu_start + menu_index + usize::from(menu_index >= 4)
+}
+
 struct SynapseApp {
     state: ShellState,
     editor_focus: FocusHandle,
     command_search: Entity<InputState>,
+    find_input: Entity<InputState>,
+    replace_input: Entity<InputState>,
+    command_search_results: Vec<VaultSearchResult>,
+    find_bar_open: bool,
     todo_tag_input: Entity<InputState>,
     todo_item_input: Entity<InputState>,
     todo_edit_input: Entity<InputState>,
@@ -1420,6 +1703,8 @@ struct SynapseApp {
     command_palette_open: bool,
     command_palette_closing: bool,
     command_palette_generation: u64,
+    command_palette_selected: usize,
+    command_palette_scroll: ScrollHandle,
     tab_context_menu: Option<TabContextMenu>,
     tree_context_menu: Option<TreeContextMenu>,
     editor_context_menu: Option<EditorContextMenu>,
@@ -3776,14 +4061,13 @@ fn strip_markdown_inline_formatting(text: &str) -> String {
     let mut index = 0;
 
     while index < chars.len() {
-        if chars[index] == '\\' {
-            if let Some(next) = chars.get(index + 1).copied()
-                && matches!(next, '\\' | '*' | '_' | '~' | '`' | '[' | ']' | '(' | ')')
-            {
-                output.push(next);
-                index += 2;
-                continue;
-            }
+        if chars[index] == '\\'
+            && let Some(next) = chars.get(index + 1).copied()
+            && matches!(next, '\\' | '*' | '_' | '~' | '`' | '[' | ']' | '(' | ')')
+        {
+            output.push(next);
+            index += 2;
+            continue;
         }
 
         // Markdown links and images contribute their label/alt text, not the destination.
@@ -3799,7 +4083,7 @@ fn strip_markdown_inline_formatting(text: &str) -> String {
         {
             let label_end = label_start + 1 + label_end;
             if chars.get(label_end + 1) == Some(&'(')
-                && chars[label_end + 2..].iter().any(|c| *c == ')')
+                && chars[label_end + 2..].contains(&')')
             {
                 let label = chars[label_start + 1..label_end].iter().collect::<String>();
                 output.push_str(&strip_markdown_inline_formatting(&label));
@@ -4101,6 +4385,15 @@ pub(crate) fn run() {
     let mut state = ShellState::from_vault_argument(startup_vault);
     if let Some(error) = startup_vault_error {
         state.set_error_message(format!("Unable to prepare the default workspace: {error}"));
+    } else if let Some(root) = state.vault_root().map(Path::to_path_buf) {
+        if let Some((paths, active)) = load_session_preference(&root) {
+            let _ = state.restore_session(&paths, active);
+        }
+        if let Some((path, saved_text, text)) = load_recovery_preference(&root)
+            && let Err(error) = state.restore_recovery(&path, &saved_text, &text)
+        {
+            state.set_error_message(error.to_string());
+        }
     }
     let theme_preference = load_theme_preference();
     let language = load_language_preference();
@@ -4122,6 +4415,13 @@ pub(crate) fn run() {
             cx.bind_keys([
                 KeyBinding::new(macos_palette_key, OpenCommandPalette, None),
                 KeyBinding::new(cross_platform_palette_key, OpenCommandPalette, None),
+                KeyBinding::new("cmd-f", OpenFind, Some("SynapseEditor")),
+                KeyBinding::new("ctrl-f", OpenFind, Some("SynapseEditor")),
+                KeyBinding::new("enter", FindNext, Some("SynapseFind")),
+                KeyBinding::new("shift-enter", FindPrevious, Some("SynapseFind")),
+                KeyBinding::new("cmd-alt-enter", ReplaceNext, Some("SynapseFind")),
+                KeyBinding::new("cmd-alt-shift-enter", ReplaceAll, Some("SynapseFind")),
+                KeyBinding::new("escape", DismissFind, Some("SynapseFind")),
                 KeyBinding::new("cmd-s", Save, Some("SynapseEditor")),
                 KeyBinding::new("ctrl-s", Save, Some("SynapseEditor")),
                 KeyBinding::new("cmd-z", Undo, Some("SynapseEditor")),
@@ -4133,12 +4433,20 @@ pub(crate) fn run() {
                 KeyBinding::new("delete", DeleteForward, Some("SynapseEditor")),
                 KeyBinding::new("left", MoveLeft, Some("SynapseEditor")),
                 KeyBinding::new("right", MoveRight, Some("SynapseEditor")),
+                KeyBinding::new("alt-left", MovePreviousWord, Some("SynapseEditor")),
+                KeyBinding::new("alt-right", MoveNextWord, Some("SynapseEditor")),
+                KeyBinding::new("ctrl-left", MovePreviousWord, Some("SynapseEditor")),
+                KeyBinding::new("ctrl-right", MoveNextWord, Some("SynapseEditor")),
                 KeyBinding::new("up", MoveUp, Some("SynapseEditor")),
                 KeyBinding::new("down", MoveDown, Some("SynapseEditor")),
                 KeyBinding::new("home", MoveHome, Some("SynapseEditor")),
                 KeyBinding::new("end", MoveEnd, Some("SynapseEditor")),
                 KeyBinding::new("shift-left", SelectLeft, Some("SynapseEditor")),
                 KeyBinding::new("shift-right", SelectRight, Some("SynapseEditor")),
+                KeyBinding::new("alt-shift-left", SelectPreviousWord, Some("SynapseEditor")),
+                KeyBinding::new("alt-shift-right", SelectNextWord, Some("SynapseEditor")),
+                KeyBinding::new("ctrl-shift-left", SelectPreviousWord, Some("SynapseEditor")),
+                KeyBinding::new("ctrl-shift-right", SelectNextWord, Some("SynapseEditor")),
                 KeyBinding::new("shift-up", SelectUp, Some("SynapseEditor")),
                 KeyBinding::new("shift-down", SelectDown, Some("SynapseEditor")),
                 KeyBinding::new("shift-home", SelectHome, Some("SynapseEditor")),
@@ -4198,6 +4506,16 @@ pub(crate) fn run() {
                             )
                             .clean_on_escape()
                     });
+                    let find_input = cx.new(|cx| {
+                        InputState::new(window, cx)
+                            .placeholder(language.text("查找…", "Find…"))
+                            .clean_on_escape()
+                    });
+                    let replace_input = cx.new(|cx| {
+                        InputState::new(window, cx)
+                            .placeholder(language.text("替换为…", "Replace with…"))
+                            .clean_on_escape()
+                    });
                     let todo_tag_input = cx.new(|cx| {
                         InputState::new(window, cx)
                             .placeholder(language.text("标签名称", "Tag name"))
@@ -4250,6 +4568,48 @@ pub(crate) fn run() {
                     let editor_list_state = ListState::new(0, ListAlignment::Top, px(320.0));
                     let app = cx.new(|cx| {
                         let input_subscriptions = vec![
+                            cx.subscribe_in(
+                                &command_search,
+                                window,
+                                |this: &mut SynapseApp, _, event: &InputEvent, window, cx| {
+                                    match event {
+                                        InputEvent::Change => {
+                                            this.command_palette_selected = 0;
+                                            this.refresh_command_search(cx);
+                                        }
+                                        InputEvent::PressEnter { secondary: false } => {
+                                            this.activate_command_palette_selection(window, cx);
+                                        }
+                                        _ => {}
+                                    }
+                                },
+                            ),
+                            cx.subscribe_in(
+                                &find_input,
+                                window,
+                                |this: &mut SynapseApp, _, event: &InputEvent, window, cx| {
+                                    match event {
+                                        InputEvent::Change => cx.notify(),
+                                        InputEvent::PressEnter { secondary: false } => {
+                                            this.find_next(window, cx);
+                                        }
+                                        _ => {}
+                                    }
+                                },
+                            ),
+                            cx.subscribe_in(
+                                &replace_input,
+                                window,
+                                |this: &mut SynapseApp, _, event: &InputEvent, window, cx| {
+                                    match event {
+                                        InputEvent::Change => cx.notify(),
+                                        InputEvent::PressEnter { secondary: false } => {
+                                            this.replace_next(window, cx);
+                                        }
+                                        _ => {}
+                                    }
+                                },
+                            ),
                             cx.subscribe_in(
                                 &todo_tag_input,
                                 window,
@@ -4395,6 +4755,10 @@ pub(crate) fn run() {
                             state,
                             editor_focus: cx.focus_handle(),
                             command_search,
+                            find_input,
+                            replace_input,
+                            command_search_results: Vec::new(),
+                            find_bar_open: false,
                             todo_tag_input,
                             todo_item_input,
                             todo_edit_input,
@@ -4445,6 +4809,8 @@ pub(crate) fn run() {
                             command_palette_open: false,
                             command_palette_closing: false,
                             command_palette_generation: 0,
+                            command_palette_selected: 0,
+                            command_palette_scroll: ScrollHandle::new(),
                             tab_context_menu: None,
                             tree_context_menu: None,
                             editor_context_menu: None,
@@ -4497,8 +4863,33 @@ pub(crate) fn run() {
                             });
                         }
                     });
+                    let close_app = app.clone();
+                    window.on_window_should_close(cx, move |window, cx| {
+                        let result = close_app.update(cx, |this, _| {
+                            if this.state.active_is_dirty() {
+                                this.state
+                                    .save_active()
+                                    .map_err(|error| error.to_string())?;
+                            }
+                            let _ = clear_recovery_preference();
+                            this.persist_session();
+                            Ok::<(), String>(())
+                        });
+                        if let Err(error) = result {
+                            push_alert_notification(
+                                window,
+                                cx,
+                                AppNotificationVariant::Error,
+                                "Unable to close Synapse",
+                                error,
+                            );
+                            return false;
+                        }
+                        true
+                    });
                     app.update(cx, |app, cx| {
                         app.restart_editor_cursor_blink(cx);
+                        app.start_autosave(cx);
                         app.restart_vault_watcher(cx);
                         app.check_for_updates(UpdateCheckOrigin::Startup, window, cx);
                         cx.observe_window_appearance(window, |app, window, cx| {
@@ -4567,10 +4958,13 @@ mod tests {
         materialize_large_document_rich_lines, scan_markdown_fence_ranges,
         scan_markdown_structure,
         MarkdownFenceContext,
+        command_palette_scroll_item_index, next_command_palette_selection,
         strip_markdown_inline_formatting,
         normalize_clipboard_text, normalize_markdown_link_destination, note_breadcrumb_parts,
         note_link_candidates, parse_boolean_preference, path_is_inside_macos_app_bundle,
+        parse_recovery_preference, parse_session_preference,
         persist_clipboard_image, prune_collapsed_directories, resolve_markdown_image,
+        search_vault_entries,
         select_startup_vault_path, settings_language_indicator_left, settings_spring_progress,
         settings_theme_indicator_left, settings_titlebar_options, settings_window_options,
         source_lines_from_buffer, synapse_mermaid_theme, synapse_theme_palette,
@@ -5451,6 +5845,20 @@ mod tests {
     }
 
     #[test]
+    fn command_palette_selection_wraps_and_handles_empty_results() {
+        assert_eq!(next_command_palette_selection(0, 6, -1), 5);
+        assert_eq!(next_command_palette_selection(5, 6, 1), 0);
+        assert_eq!(next_command_palette_selection(2, 4, 1), 3);
+        assert_eq!(next_command_palette_selection(0, 0, 1), 0);
+
+        assert_eq!(command_palette_scroll_item_index(0, 0, false), 1);
+        assert_eq!(command_palette_scroll_item_index(4, 0, false), 6);
+        assert_eq!(command_palette_scroll_item_index(2, 5, true), 4);
+        assert_eq!(command_palette_scroll_item_index(5, 5, true), 7);
+        assert_eq!(command_palette_scroll_item_index(0, 0, true), 3);
+    }
+
+    #[test]
     fn editor_accepts_both_plain_and_option_grave_backtick_input() {
         assert_eq!(editor_backtick_key_bindings(), ["`", "alt-`"]);
     }
@@ -5989,6 +6397,26 @@ mod tests {
     }
 
     #[test]
+    fn dirty_tab_close_copy_requires_explicit_discard() {
+        let copy = DangerousAction::DiscardTab {
+            index: 0,
+            display_name: "draft.md".to_owned(),
+        }
+        .copy(AppLanguage::English);
+        assert_eq!(copy.confirm_label, "Discard Changes");
+        assert!(copy.description.contains("draft.md"));
+
+        let copy = DangerousAction::DiscardTabs {
+            indices: vec![0, 1],
+            closed_active: None,
+            count: 2,
+        }
+        .copy(AppLanguage::English);
+        assert_eq!(copy.confirm_label, "Discard Changes");
+        assert!(copy.description.contains('2'));
+    }
+
+    #[test]
     fn notification_spec_clear_completed_requires_a_nonzero_count() {
         assert!(!DangerousAction::ClearCompletedTodos { count: 0 }.is_actionable());
 
@@ -6063,5 +6491,69 @@ mod tests {
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].title, "规划");
         assert_eq!(candidates[0].folder.as_deref(), Some("产品"));
+    }
+
+    #[test]
+    fn command_search_matches_filenames_content_and_unsaved_active_text() {
+        let root = tempdir().unwrap();
+        fs::write(root.path().join("saved.md"), "archive material").unwrap();
+        fs::write(root.path().join("other.md"), "ordinary note").unwrap();
+        let entries = vec![
+            VaultEntry {
+                relative_path: PathBuf::from("saved.md"),
+                name: "saved".to_owned(),
+                kind: VaultEntryKind::Note,
+            },
+            VaultEntry {
+                relative_path: PathBuf::from("other.md"),
+                name: "other".to_owned(),
+                kind: VaultEntryKind::Note,
+            },
+        ];
+
+        let results = search_vault_entries(&entries, Some(root.path()), "ARCHIVE", None);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].relative_path, PathBuf::from("saved.md"));
+
+        let results = search_vault_entries(
+            &entries,
+            Some(root.path()),
+            "draft",
+            Some((Path::new("other.md"), "draft content")),
+        );
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].relative_path, PathBuf::from("other.md"));
+        assert_eq!(results[0].preview, "draft content");
+    }
+
+    #[test]
+    fn session_preference_is_scoped_to_the_current_vault() {
+        let contents = "vault=/notes\nactive=1\ntab=4\tfalse\tone.md\ntab=9\ttrue\tfolder/two.md\n";
+        assert_eq!(
+            parse_session_preference(contents, Path::new("/notes")),
+            Some((
+                vec![
+                    (PathBuf::from("one.md"), 4, false),
+                    (PathBuf::from("folder/two.md"), 9, true),
+                ],
+                Some(1),
+            ))
+        );
+        assert_eq!(parse_session_preference(contents, Path::new("/other")), None);
+    }
+
+    #[test]
+    fn recovery_preference_preserves_multiline_markdown() {
+        let contents =
+            "vault=/notes\npath=draft.md\nsaved-bytes=8\n\n# Draft\n# Draft\n\nunfinished";
+        assert_eq!(
+            parse_recovery_preference(contents, Path::new("/notes")),
+            Some((
+                PathBuf::from("draft.md"),
+                "# Draft\n".to_owned(),
+                "# Draft\n\nunfinished".to_owned(),
+            ))
+        );
+        assert_eq!(parse_recovery_preference(contents, Path::new("/other")), None);
     }
 }

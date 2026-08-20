@@ -3,6 +3,44 @@ use super::*;
 const EDITOR_COMMAND_CONTEXT_BEHIND_LINES: usize = 256;
 const EDITOR_COMMAND_CONTEXT_AHEAD_LINES: usize = 256;
 
+fn editor_word_range(text: &str, cursor: usize) -> Option<Range<usize>> {
+    let chars = text.chars().collect::<Vec<_>>();
+    if chars.is_empty() {
+        return None;
+    }
+    let index = cursor.min(chars.len()).saturating_sub(usize::from(cursor >= chars.len()));
+    let kind = |character: char| {
+        if character.is_alphanumeric() || character == '_' {
+            0
+        } else if character.is_whitespace() {
+            1
+        } else {
+            2
+        }
+    };
+    let target_kind = kind(chars[index]);
+    let mut start = index;
+    let mut end = index + 1;
+    while start > 0 && kind(chars[start - 1]) == target_kind {
+        start -= 1;
+    }
+    while end < chars.len() && kind(chars[end]) == target_kind {
+        end += 1;
+    }
+    Some(start..end)
+}
+
+fn editor_line_range(document: &NoteDocument, cursor: usize) -> Range<usize> {
+    let line = document.char_to_line(cursor);
+    let start = document.line_start_char(line);
+    let end = if line + 1 < document.line_count() {
+        document.line_start_char(line + 1)
+    } else {
+        document.len_chars()
+    };
+    start..end
+}
+
 fn code_text_input_candidate(inserted: &str) -> bool {
     let mut characters = inserted.chars();
     let Some(character) = characters.next() else {
@@ -13,6 +51,29 @@ fn code_text_input_candidate(inserted: &str) -> bool {
             character,
             '(' | ')' | '[' | ']' | '{' | '}' | '"' | '\'' | '`'
         )
+}
+
+fn find_char_matches(text: &str, query: &str) -> Vec<Range<usize>> {
+    let text = text.chars().collect::<Vec<_>>();
+    let query = query.trim().chars().collect::<Vec<_>>();
+    if query.is_empty() || query.len() > text.len() {
+        return Vec::new();
+    }
+    let mut matches = Vec::new();
+    let mut start = 0;
+    while start + query.len() <= text.len() {
+        if text[start..start + query.len()]
+            .iter()
+            .zip(&query)
+            .all(|(left, right)| left.eq_ignore_ascii_case(right))
+        {
+            matches.push(start..start + query.len());
+            start += query.len();
+        } else {
+            start += 1;
+        }
+    }
+    matches
 }
 
 /// A bounded source slice used by editing commands that need Markdown context.
@@ -135,6 +196,277 @@ impl EditorSourceWindow {
 }
 
 impl SynapseApp {
+    pub(in crate::app) fn persist_session(&mut self) {
+        self.vault_persistence_error = save_session_preference(&self.state).err().map(|error| {
+            format!(
+                "{}: {error}",
+                self.language
+                    .text("页签状态无法保存", "Tab state could not be saved")
+            )
+        });
+    }
+
+    pub(in crate::app) fn start_autosave(&mut self, cx: &mut Context<Self>) {
+        let executor = cx.background_executor().clone();
+        cx.spawn(async move |this, cx| loop {
+            executor.timer(AUTOSAVE_INTERVAL).await;
+            let active = this
+                .update(cx, |this, cx| {
+                    if !this.state.active_is_dirty() {
+                        return true;
+                    }
+                    if let Err(error) = save_recovery_preference(&this.state) {
+                        this.state.set_error_message(format!(
+                            "{}: {error}",
+                            this.language
+                                .text("恢复副本无法保存", "Recovery copy could not be saved")
+                        ));
+                        cx.notify();
+                        return true;
+                    }
+                    if this.state.save_active().is_ok() {
+                        let _ = clear_recovery_preference();
+                        this.persist_session();
+                    }
+                    cx.notify();
+                    true
+                })
+                .unwrap_or(false);
+            if !active {
+                break;
+            }
+        })
+        .detach();
+    }
+
+    pub(in crate::app) fn refresh_command_search(&mut self, cx: &mut Context<Self>) {
+        let query = self.command_search.read(cx).value();
+        let active_document = self.state.active_document().map(|document| {
+            (
+                document.relative_path().to_path_buf(),
+                document.text(),
+            )
+        });
+        self.command_search_results = search_vault_entries(
+            &self.state.entries,
+            self.state.vault_root(),
+            &query,
+            active_document
+                .as_ref()
+                .map(|(path, content)| (path.as_path(), content.as_str())),
+        );
+        cx.notify();
+    }
+
+    pub(in crate::app) fn open_search_result(
+        &mut self,
+        relative_path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.state.select_note(&relative_path).is_ok() {
+            self.workspace_view = WorkspaceView::Note;
+            self.editor_selection.collapse(self.state.cursor());
+            self.editor_marked_range = None;
+            self.clear_slash_surfaces_immediately();
+            self.restart_editor_cursor_blink(cx);
+            window.focus(&self.editor_focus);
+            self.persist_session();
+        }
+        self.dismiss_command_palette(cx);
+        cx.notify();
+    }
+
+    pub(in crate::app) fn open_find(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.state.active_document().is_none() {
+            return;
+        }
+        self.find_bar_open = true;
+        self.selection_menu_mode = SelectionMenuMode::Formatting;
+        self.clear_slash_surfaces_immediately();
+        window.focus(&self.find_input.focus_handle(cx));
+        cx.notify();
+    }
+
+    pub(in crate::app) fn open_find_action(
+        &mut self,
+        _: &OpenFind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_find(window, cx);
+    }
+
+    pub(in crate::app) fn dismiss_find(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.find_bar_open = false;
+        window.focus(&self.editor_focus);
+        cx.notify();
+    }
+
+    pub(in crate::app) fn dismiss_find_action(
+        &mut self,
+        _: &DismissFind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.dismiss_find(window, cx);
+    }
+
+    pub(in crate::app) fn active_find_matches(&self, cx: &mut Context<Self>) -> Vec<Range<usize>> {
+        let query = self.find_input.read(cx).value();
+        self.state
+            .active_document()
+            .map(|document| find_char_matches(&document.text(), &query))
+            .unwrap_or_default()
+    }
+
+    fn select_find_match(&mut self, range: Range<usize>) {
+        self.editor_selection.collapse(range.start);
+        self.editor_selection.select_to(range.end);
+        self.state.set_cursor(range.end);
+    }
+
+    pub(in crate::app) fn find_next(
+        &mut self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let matches = self.active_find_matches(cx);
+        if matches.is_empty() {
+            cx.notify();
+            return;
+        }
+        let current = self.editor_selection.range();
+        let range = matches
+            .iter()
+            .find(|candidate| candidate.start > current.start)
+            .cloned()
+            .unwrap_or_else(|| matches[0].clone());
+        self.select_find_match(range);
+        cx.notify();
+    }
+
+    pub(in crate::app) fn find_previous(
+        &mut self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let matches = self.active_find_matches(cx);
+        if matches.is_empty() {
+            cx.notify();
+            return;
+        }
+        let current = self.editor_selection.range();
+        let range = matches
+            .iter()
+            .rev()
+            .find(|candidate| candidate.start < current.start)
+            .cloned()
+            .unwrap_or_else(|| matches.last().expect("non-empty matches").clone());
+        self.select_find_match(range);
+        cx.notify();
+    }
+
+    pub(in crate::app) fn replace_next(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let matches = self.active_find_matches(cx);
+        let current = self.editor_selection.range();
+        let Some(range) = matches.iter().find(|candidate| **candidate == current).cloned() else {
+            self.find_next(window, cx);
+            return;
+        };
+        let replacement = self.replace_input.read(cx).value();
+        let previous_revision = self
+            .state
+            .active_document()
+            .map_or(0, |document| document.revision());
+        if self
+            .state
+            .replace_active_range(range.clone(), &replacement)
+            .is_ok()
+        {
+            self.sync_writ_render_buffer(previous_revision, range.clone(), &replacement);
+            let end = range.start + replacement.chars().count();
+            self.select_find_match(end..end);
+            self.find_next(window, cx);
+        }
+        cx.notify();
+    }
+
+    pub(in crate::app) fn replace_all(
+        &mut self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let matches = self.active_find_matches(cx);
+        if matches.is_empty() {
+            return;
+        }
+        let replacement = self.replace_input.read(cx).value();
+        for range in matches.into_iter().rev() {
+            let previous_revision = self
+                .state
+                .active_document()
+                .map_or(0, |document| document.revision());
+            if self
+                .state
+                .replace_active_range(range.clone(), &replacement)
+                .is_ok()
+            {
+                self.sync_writ_render_buffer(previous_revision, range, &replacement);
+            }
+        }
+        self.editor_selection.collapse(self.state.cursor());
+        cx.notify();
+    }
+
+    pub(in crate::app) fn find_next_action(
+        &mut self,
+        _: &FindNext,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.find_next(window, cx);
+    }
+
+    pub(in crate::app) fn find_previous_action(
+        &mut self,
+        _: &FindPrevious,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.find_previous(window, cx);
+    }
+
+    pub(in crate::app) fn replace_next_action(
+        &mut self,
+        _: &ReplaceNext,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.replace_next(window, cx);
+    }
+
+    pub(in crate::app) fn replace_all_action(
+        &mut self,
+        _: &ReplaceAll,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.replace_all(window, cx);
+    }
+
     pub(in crate::app) fn restart_vault_watcher(&mut self, cx: &mut Context<Self>) {
         self.vault_watcher.take();
         self.vault_watcher_generation = self.vault_watcher_generation.wrapping_add(1);
@@ -213,16 +545,25 @@ impl SynapseApp {
                 {
                     return;
                 }
-                match this.state.refresh_vault_entries() {
-                    Ok(true) => {
+                let entries_changed = this.state.refresh_vault_entries();
+                let documents_changed = this.state.refresh_external_documents();
+                match (entries_changed, documents_changed) {
+                    (Ok(entries_changed), Ok(documents_changed))
+                        if entries_changed || documents_changed =>
+                    {
                         prune_collapsed_directories(
                             &mut this.collapsed_directories,
                             &this.state.entries,
                         );
+                        if documents_changed {
+                            this.editor_render_cache = None;
+                            this.large_document_render_cache = None;
+                            this.editor_selection.collapse(this.state.cursor());
+                        }
                         cx.notify();
                     }
-                    Ok(false) => {}
-                    Err(_) => cx.notify(),
+                    (Ok(_), Ok(_)) => {}
+                    _ => cx.notify(),
                 }
             });
         })
@@ -936,6 +1277,62 @@ impl SynapseApp {
         });
     }
 
+    pub(in crate::app) fn request_close_tab(
+        index: usize,
+        app: Entity<Self>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let action = app.read(cx).state.tabs().get(index).and_then(|tab| {
+            tab.is_dirty.then(|| DangerousAction::DiscardTab {
+                index,
+                display_name: tab.title.clone(),
+            })
+        });
+        if let Some(action) = action {
+            Self::request_dangerous_action(action, app, window, cx);
+        } else {
+            app.update(cx, |this, cx| this.close_tab(index, cx));
+        }
+    }
+
+    pub(in crate::app) fn request_close_tabs(
+        indices: Vec<usize>,
+        closed_active: Option<usize>,
+        app: Entity<Self>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let dirty_count = {
+            let tabs = app.read(cx).state.tabs();
+            indices
+                .iter()
+                .filter(|&&index| tabs.get(index).is_some_and(|tab| tab.is_dirty))
+                .count()
+        };
+        if dirty_count > 0 {
+            Self::request_dangerous_action(
+                DangerousAction::DiscardTabs {
+                    indices,
+                    closed_active,
+                    count: dirty_count,
+                },
+                app,
+                window,
+                cx,
+            );
+        } else {
+            app.update(cx, |this, cx| {
+                if this.state.discard_tabs(indices, closed_active).is_ok() {
+                    this.editor_selection.collapse(this.state.cursor());
+                    this.editor_marked_range = None;
+                    this.persist_session();
+                    this.dismiss_context_menus(cx);
+                }
+            });
+        }
+    }
+
     pub(in crate::app) fn execute_dangerous_action(
         &mut self,
         action: &DangerousAction,
@@ -951,6 +1348,26 @@ impl SynapseApp {
         };
 
         match action {
+            DangerousAction::DiscardTab { index, .. } => {
+                self.state
+                    .discard_tab(*index)
+                    .map_err(|error| error.to_string())?;
+                self.editor_selection.collapse(self.state.cursor());
+                self.editor_marked_range = None;
+                self.persist_session();
+            }
+            DangerousAction::DiscardTabs {
+                indices,
+                closed_active,
+                ..
+            } => {
+                self.state
+                    .discard_tabs(indices.clone(), *closed_active)
+                    .map_err(|error| error.to_string())?;
+                self.editor_selection.collapse(self.state.cursor());
+                self.editor_marked_range = None;
+                self.persist_session();
+            }
             DangerousAction::TrashTreeEntry { target } => {
                 self.state
                     .trash_entry(&target.relative_path)
@@ -1407,6 +1824,11 @@ impl SynapseApp {
                 &self.command_search,
                 language.text("搜索笔记和命令…", "Search notes and commands…"),
             ),
+            (&self.find_input, language.text("查找…", "Find…")),
+            (
+                &self.replace_input,
+                language.text("替换为…", "Replace with…"),
+            ),
             (&self.todo_tag_input, language.text("标签名称", "Tag name")),
             (
                 &self.todo_item_input,
@@ -1500,6 +1922,7 @@ impl SynapseApp {
                                     this.editor_selection.collapse(0);
                                     this.editor_marked_range = None;
                                     this.restart_vault_watcher(cx);
+                                    this.persist_session();
                                     push_alert_notification(
                                         window,
                                         cx,
@@ -1585,6 +2008,7 @@ impl SynapseApp {
             self.editor_context_menu = None;
             window.focus(&self.editor_focus);
             self.restart_editor_cursor_blink(cx);
+            self.persist_session();
         }
         cx.notify();
     }
@@ -1606,41 +2030,30 @@ impl SynapseApp {
             self.editor_context_menu = None;
             window.focus(&self.editor_focus);
             self.restart_editor_cursor_blink(cx);
+            self.persist_session();
         }
         cx.notify();
     }
 
     pub(in crate::app) fn toggle_tab_pin(&mut self, index: usize, cx: &mut Context<Self>) {
-        let _ = self.state.toggle_tab_pin(index);
+        if self.state.toggle_tab_pin(index).is_ok() {
+            self.persist_session();
+        }
         self.dismiss_context_menus(cx);
+    }
+
+    pub(in crate::app) fn reorder_tab(&mut self, from: usize, to: usize, cx: &mut Context<Self>) {
+        if self.state.reorder_tab(from, to).is_ok() {
+            self.persist_session();
+            self.dismiss_context_menus(cx);
+            cx.notify();
+        }
     }
 
     pub(in crate::app) fn close_tab(&mut self, index: usize, cx: &mut Context<Self>) {
-        let _ = self.state.close_tab(index);
-        self.editor_selection.collapse(self.state.cursor());
-        self.editor_marked_range = None;
-        self.selection_menu_mode = SelectionMenuMode::Formatting;
-        self.dismiss_context_menus(cx);
-    }
-
-    pub(in crate::app) fn close_tabs_left(&mut self, index: usize, cx: &mut Context<Self>) {
-        let _ = self.state.close_tabs_left(index);
-        self.editor_selection.collapse(self.state.cursor());
-        self.editor_marked_range = None;
-        self.selection_menu_mode = SelectionMenuMode::Formatting;
-        self.dismiss_context_menus(cx);
-    }
-
-    pub(in crate::app) fn close_tabs_right(&mut self, index: usize, cx: &mut Context<Self>) {
-        let _ = self.state.close_tabs_right(index);
-        self.editor_selection.collapse(self.state.cursor());
-        self.editor_marked_range = None;
-        self.selection_menu_mode = SelectionMenuMode::Formatting;
-        self.dismiss_context_menus(cx);
-    }
-
-    pub(in crate::app) fn close_all_tabs(&mut self, cx: &mut Context<Self>) {
-        let _ = self.state.close_all_tabs();
+        if self.state.close_tab(index).is_ok() {
+            self.persist_session();
+        }
         self.editor_selection.collapse(self.state.cursor());
         self.editor_marked_range = None;
         self.selection_menu_mode = SelectionMenuMode::Formatting;
@@ -1653,6 +2066,9 @@ impl SynapseApp {
         cx: &mut Context<Self>,
     ) {
         self.command_palette_open = true;
+        self.refresh_command_search(cx);
+        self.command_palette_selected = 0;
+        self.command_palette_scroll.set_offset(point(px(0.0), px(0.0)));
         self.clear_slash_surfaces_immediately();
         self.command_palette_closing = false;
         self.command_palette_generation = self.command_palette_generation.wrapping_add(1);
@@ -1661,6 +2077,89 @@ impl SynapseApp {
         self.editor_context_menu = None;
         window.focus(&self.command_search.focus_handle(cx));
         cx.notify();
+    }
+
+    fn command_palette_item_count(&self, cx: &mut Context<Self>) -> usize {
+        let search_count = if self.command_search.read(cx).value().trim().is_empty() {
+            0
+        } else {
+            self.command_search_results.len()
+        };
+        search_count + 6
+    }
+
+    fn move_command_palette_selection(&mut self, direction: i32, cx: &mut Context<Self>) {
+        let count = self.command_palette_item_count(cx);
+        self.command_palette_selected = next_command_palette_selection(
+            self.command_palette_selected,
+            count,
+            direction,
+        );
+        let query_nonempty = !self.command_search.read(cx).value().trim().is_empty();
+        let search_count = if query_nonempty {
+            self.command_search_results.len()
+        } else {
+            0
+        };
+        self.command_palette_scroll
+            .scroll_to_item(command_palette_scroll_item_index(
+                self.command_palette_selected,
+                search_count,
+                query_nonempty,
+            ));
+        cx.notify();
+    }
+
+    pub(in crate::app) fn command_palette_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event.keystroke.key.as_str() {
+            "up" => self.move_command_palette_selection(-1, cx),
+            "down" => self.move_command_palette_selection(1, cx),
+            _ => return,
+        }
+        cx.stop_propagation();
+    }
+
+    pub(in crate::app) fn activate_command_palette_selection(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let query_is_nonempty = !self.command_search.read(cx).value().trim().is_empty();
+        let search_count = if query_is_nonempty {
+            self.command_search_results.len()
+        } else {
+            0
+        };
+        if query_is_nonempty && self.command_palette_selected < search_count {
+            if let Some(result) = self
+                .command_search_results
+                .get(self.command_palette_selected)
+                .cloned()
+            {
+                self.open_search_result(result.relative_path, window, cx);
+            }
+            return;
+        }
+        match self.command_palette_selected.saturating_sub(search_count) {
+            0 => self.create_untitled_note(Path::new(""), window, cx),
+            1 => {
+                self.dismiss_command_palette(cx);
+                self.prompt_for_vault(window, cx);
+            }
+            2 => self.open_todo_workspace(window, cx),
+            3 => self.open_bookmark_workspace(window, cx),
+            4 => {
+                self.dismiss_command_palette(cx);
+                self.check_for_updates(UpdateCheckOrigin::Manual, window, cx);
+            }
+            5 => self.open_settings_window(cx),
+            _ => {}
+        }
     }
 
     pub(in crate::app) fn open_command_palette_action(
@@ -1811,6 +2310,7 @@ impl SynapseApp {
             self.editor_marked_range = None;
             window.focus(&self.editor_focus);
             self.restart_editor_cursor_blink(cx);
+            self.persist_session();
         }
         self.dismiss_command_palette(cx);
         self.dismiss_context_menus(cx);
@@ -1942,8 +2442,20 @@ impl SynapseApp {
         self.dismiss_context_menus(cx);
     }
 
-    pub(in crate::app) fn save(&mut self, _: &Save, _: &mut Window, cx: &mut Context<Self>) {
-        let _ = self.state.save_active();
+    pub(in crate::app) fn save(&mut self, _: &Save, window: &mut Window, cx: &mut Context<Self>) {
+        match self.state.save_active() {
+            Ok(_) => {
+                let _ = clear_recovery_preference();
+                self.persist_session();
+            }
+            Err(error) => push_alert_notification(
+                window,
+                cx,
+                AppNotificationVariant::Error,
+                self.language.text("保存失败", "Save failed"),
+                error.to_string(),
+            ),
+        }
         cx.stop_propagation();
         cx.notify();
     }
@@ -2307,6 +2819,46 @@ impl SynapseApp {
         cx.notify();
     }
 
+    pub(in crate::app) fn move_previous_word(
+        &mut self,
+        _: &MovePreviousWord,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.editor_marked_range = None;
+        if self.editor_selection.is_empty() {
+            self.state.move_previous_word();
+        } else {
+            self.state.set_cursor(self.editor_selection.range().start);
+        }
+        self.editor_selection.collapse(self.state.cursor());
+        self.refresh_slash_menu(cx);
+        self.dismiss_code_completion();
+        self.restart_editor_cursor_blink(cx);
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    pub(in crate::app) fn move_next_word(
+        &mut self,
+        _: &MoveNextWord,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.editor_marked_range = None;
+        if self.editor_selection.is_empty() {
+            self.state.move_next_word();
+        } else {
+            self.state.set_cursor(self.editor_selection.range().end);
+        }
+        self.editor_selection.collapse(self.state.cursor());
+        self.refresh_slash_menu(cx);
+        self.dismiss_code_completion();
+        self.restart_editor_cursor_blink(cx);
+        cx.stop_propagation();
+        cx.notify();
+    }
+
     pub(in crate::app) fn move_up(&mut self, _: &MoveUp, _: &mut Window, cx: &mut Context<Self>) {
         if self.move_code_completion_selection(-1, cx) {
             cx.stop_propagation();
@@ -2392,6 +2944,28 @@ impl SynapseApp {
         cx: &mut Context<Self>,
     ) {
         self.state.move_right();
+        self.extend_editor_selection(cx);
+    }
+
+    pub(in crate::app) fn select_previous_word(
+        &mut self,
+        _: &SelectPreviousWord,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.editor_marked_range = None;
+        self.state.move_previous_word();
+        self.extend_editor_selection(cx);
+    }
+
+    pub(in crate::app) fn select_next_word(
+        &mut self,
+        _: &SelectNextWord,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.editor_marked_range = None;
+        self.state.move_next_word();
         self.extend_editor_selection(cx);
     }
 
@@ -3762,18 +4336,66 @@ impl SynapseApp {
                 cursor = edit.cursor;
             }
         }
-        let linked_note = self
-            .active_editor_source_window(&(cursor..cursor))
-            .and_then(|source_window| {
-                source_window
-                    .local_range(cursor..cursor)
-                    .and_then(|range| markdown_link_context(&source_window.source, range))
-            })
-            .and_then(|link| linked_vault_note(&link.destination, &self.state.entries));
-        if let Some(relative_path) = linked_note {
-            self.select_note(relative_path, window, cx);
-            cx.stop_propagation();
-            return;
+        if event.click_count == 1 {
+            let linked_note = self
+                .active_editor_source_window(&(cursor..cursor))
+                .and_then(|source_window| {
+                    source_window
+                        .local_range(cursor..cursor)
+                        .and_then(|range| markdown_link_context(&source_window.source, range))
+                })
+                .and_then(|link| linked_vault_note(&link.destination, &self.state.entries));
+            if let Some(relative_path) = linked_note {
+                self.select_note(relative_path, window, cx);
+                cx.stop_propagation();
+                return;
+            }
+        }
+
+        if event.click_count >= 3 {
+            let range = self
+                .state
+                .active_document()
+                .map(|document| editor_line_range(document, cursor));
+            if let Some(range) = range {
+                self.editor_marked_range = None;
+                self.selection_menu_mode = SelectionMenuMode::Formatting;
+                self.begin_close_slash_menu(cx);
+                self.begin_close_note_link_picker(cx);
+                self.dismiss_code_completion();
+                self.state.set_cursor(range.end);
+                self.editor_selection.collapse(range.start);
+                self.editor_selection.select_to(range.end);
+                self.editor_selection.finish_drag();
+                self.state.break_history_coalesce();
+                window.focus(&self.editor_focus);
+                self.restart_editor_cursor_blink(cx);
+                cx.stop_propagation();
+                cx.notify();
+                return;
+            }
+        } else if event.click_count == 2 {
+            let range = self
+                .state
+                .active_document()
+                .and_then(|document| editor_word_range(&document.text(), cursor));
+            if let Some(range) = range {
+                self.editor_marked_range = None;
+                self.selection_menu_mode = SelectionMenuMode::Formatting;
+                self.begin_close_slash_menu(cx);
+                self.begin_close_note_link_picker(cx);
+                self.dismiss_code_completion();
+                self.state.set_cursor(range.end);
+                self.editor_selection.collapse(range.start);
+                self.editor_selection.select_to(range.end);
+                self.editor_selection.finish_drag();
+                self.state.break_history_coalesce();
+                window.focus(&self.editor_focus);
+                self.restart_editor_cursor_blink(cx);
+                cx.stop_propagation();
+                cx.notify();
+                return;
+            }
         }
         self.editor_marked_range = None;
         self.selection_menu_mode = SelectionMenuMode::Formatting;
@@ -3942,7 +4564,10 @@ impl SynapseApp {
 
 #[cfg(test)]
 mod tests {
-    use super::{EditorSourceWindow, code_text_input, code_text_input_candidate};
+    use super::{
+        EditorSourceWindow, code_text_input, code_text_input_candidate, editor_word_range,
+        find_char_matches,
+    };
 
     #[test]
     fn ordinary_text_does_not_materialize_code_command_context() {
@@ -3951,6 +4576,25 @@ mod tests {
         assert!(!code_text_input_candidate("ab"));
         assert!(code_text_input_candidate("("));
         assert!(code_text_input_candidate("}"));
+    }
+
+    #[test]
+    fn find_matches_use_character_ranges_and_ascii_case_insensitivity() {
+        assert_eq!(
+            find_char_matches("One 中文 one", "one"),
+            vec![0..3, 7..10]
+        );
+        assert_eq!(find_char_matches("中文内容", "内容"), vec![2..4]);
+        assert_eq!(find_char_matches("aaaa", "aa"), vec![0..2, 2..4]);
+        assert!(find_char_matches("abc", "").is_empty());
+    }
+
+    #[test]
+    fn mouse_selection_ranges_cover_words_and_complete_lines() {
+        assert_eq!(editor_word_range("one, two", 1), Some(0..3));
+        assert_eq!(editor_word_range("one, two", 3), Some(3..4));
+        assert_eq!(editor_word_range("中文 test", 1), Some(0..2));
+        assert_eq!(editor_word_range("", 0), None);
     }
 
     #[test]

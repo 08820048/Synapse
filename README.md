@@ -22,7 +22,7 @@
 
 Synapse opens an ordinary folder of Markdown files. There is no account, no required cloud, and no database. The filesystem is the source of truth.
 
-This is an early public preview (`0.1.0`). Daily Markdown editing works on macOS. Windows installers are built in CI but the Windows app is not first-class yet. Undo and full search are still missing.
+This is an early public preview (`0.1.0`). Daily Markdown editing works on macOS. Windows installers are built in CI but the Windows app is not first-class yet.
 
 ## Features
 
@@ -35,6 +35,8 @@ This is an early public preview (`0.1.0`). Daily Markdown editing works on macOS
 - Native todo and bookmark workspaces, persisted in the user config directory
 - System / Light / Dark themes and Simplified Chinese / English UI
 - External filesystem changes refresh the sidebar without touching unsaved buffers
+- Filename/full-text search, in-note find/replace, and native word/line selection
+- Restored and drag-reorderable tabs, one-second autosave, conflict detection, and crash recovery
 
 ## Requirements
 
@@ -105,6 +107,8 @@ The installer is written to `target/release/bundle/windows/Synapse-<version>-win
 | Undo | `Cmd+Z` | `Ctrl+Z` |
 | Redo | `Cmd+Shift+Z` | `Ctrl+Shift+Z` or `Ctrl+Y` |
 | Command palette | `Cmd+K` | `Ctrl+K` |
+| Find / replace | `Cmd+F` | `Ctrl+F` |
+| Move / select by word | `Option+←/→` / add `Shift` | `Ctrl+←/→` / add `Shift` |
 | Bold / italic / underline | `Cmd+B` / `I` / `U` | `Ctrl+B` / `I` / `U` |
 | Strikethrough | `Cmd+Shift+S` | `Ctrl+Shift+S` |
 | Inline code | `Cmd+E` | `Ctrl+E` |
@@ -134,9 +138,6 @@ Web UI stacks are out of scope. See [AGENT.md](AGENT.md) for the product constra
 
 ## Current limitations
 
-- Undo / redo, word-wise movement, double-click word select, and find/replace
-- Filename and full-text search (the command palette is a launcher, not a search index)
-- Tab drag-reorder, session restore, and unsaved-close confirmation
 - Table caret visibility
 - Windows is packaged, but the editor experience is still macOS-first
 - Linux packages are not built yet
@@ -172,7 +173,7 @@ Issues and pull requests are welcome. Please read [CONTRIBUTING.md](CONTRIBUTING
 
 Synapse 是一款使用 Rust 与 GPUI 构建的高性能、本地优先 Markdown 编辑器。它直接打开普通文件夹，不绑定账号、数据库或强制云服务。文件系统是笔记的真实来源。
 
-当前是公开预览（`0.1.0`）。macOS 上已经可以日常写 Markdown。Windows 安装包会随版本标签构建，但 Windows 体验还不是一等公民。撤销/重做和完整搜索仍未就绪。
+当前是公开预览（`0.1.0`）。macOS 上已经可以日常写 Markdown。Windows 安装包会随版本标签构建，但 Windows 体验还不是一等公民。
 
 ## 它能做什么
 
@@ -184,6 +185,8 @@ Synapse 是一款使用 Rust 与 GPUI 构建的高性能、本地优先 Markdown
 - 原生待办和书签工作区
 - 系统 / 浅色 / 深色主题，简体中文 / English 界面
 - 外部文件变化会刷新侧栏，不会覆盖未保存缓冲区
+- 文件名/全文搜索、笔记内查找替换，以及按词和按行选择
+- 页签会话恢复与拖拽排序、秒级自动保存、外部冲突检测和崩溃恢复
 
 ## 安装
 
@@ -220,9 +223,6 @@ Windows（需安装 Inno Setup 6）：
 
 ## 已知限制
 
-- 撤销 / 重做、按词移动、双击选词、查找替换
-- 文件名和全文搜索（命令面板目前只是启动器）
-- 页签拖拽排序、会话恢复、未保存关闭确认
 - 表格内光标可见性
 - Windows 已有安装包，但编辑体验仍以 macOS 为准
 - 尚未构建 Linux 安装包

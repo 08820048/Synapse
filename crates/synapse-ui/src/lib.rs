@@ -22,6 +22,7 @@ use edit_history::{EditHistory, HistoryEntry, forward_range, inverse_range};
 #[derive(Debug)]
 struct OpenTab {
     document: NoteDocument,
+    saved_text: String,
     cursor: usize,
     preferred_column: Option<usize>,
     title_linked: bool,
@@ -123,6 +124,33 @@ impl ShellState {
         self.refresh_entries()?;
         self.vault_error = None;
         Ok(self.entries != previous)
+    }
+
+    pub fn refresh_external_documents(&mut self) -> Result<bool, SessionError> {
+        let Some(vault) = self.vault.as_ref() else {
+            return Err(SessionError::NoVault);
+        };
+        let mut changed = false;
+        for index in 0..self.tabs.len() {
+            if self.tabs[index].history.is_dirty() {
+                continue;
+            }
+            let path = self.tabs[index].document.relative_path().to_path_buf();
+            let document = match vault.open_note(&path) {
+                Ok(document) => document,
+                Err(error) if vault_error_is_not_found(&error) => continue,
+                Err(error) => return Err(SessionError::Vault(error)),
+            };
+            let text = document.text();
+            if text == self.tabs[index].saved_text {
+                continue;
+            }
+            self.tabs[index].cursor = self.tabs[index].cursor.min(document.len_chars());
+            self.tabs[index].document = document;
+            self.tabs[index].saved_text = text;
+            changed = true;
+        }
+        Ok(changed)
     }
 
     pub fn create_directory(&mut self, parent: &Path, name: &str) -> Result<PathBuf, SessionError> {
@@ -388,6 +416,123 @@ impl ShellState {
         self.active_tab
     }
 
+    pub fn active_is_dirty(&self) -> bool {
+        self.active_tab
+            .and_then(|index| self.tabs.get(index))
+            .is_some_and(|tab| tab.history.is_dirty())
+    }
+
+    pub fn recovery_snapshot(&self) -> Option<(PathBuf, String, String)> {
+        let tab = self.active_tab.and_then(|index| self.tabs.get(index))?;
+        tab.history.is_dirty().then(|| {
+            (
+                tab.document.relative_path().to_path_buf(),
+                tab.saved_text.clone(),
+                tab.document.text(),
+            )
+        })
+    }
+
+    pub fn restore_recovery(
+        &mut self,
+        relative_path: &Path,
+        saved_text: &str,
+        text: &str,
+    ) -> Result<bool, SessionError> {
+        self.select_note(relative_path)?;
+        let Some(document) = self.active_document() else {
+            return Ok(false);
+        };
+        if document.text() == text {
+            return Ok(false);
+        }
+        if document.text() != saved_text {
+            return Err(SessionError::RecoveryConflict(relative_path.to_path_buf()));
+        }
+        let len = document.len_chars();
+        self.replace_active_range(0..len, text)?;
+        Ok(true)
+    }
+
+    pub fn session_snapshot(&self) -> (Vec<(PathBuf, usize, bool)>, Option<usize>) {
+        (
+            self.tabs
+                .iter()
+                .map(|tab| {
+                    (
+                        tab.document.relative_path().to_path_buf(),
+                        tab.cursor,
+                        tab.pinned,
+                    )
+                })
+                .collect(),
+            self.active_tab,
+        )
+    }
+
+    pub fn restore_session(
+        &mut self,
+        tabs: &[(PathBuf, usize, bool)],
+        active: Option<usize>,
+    ) -> Result<usize, SessionError> {
+        if !self.tabs.is_empty() {
+            return Ok(0);
+        }
+        let Some(vault) = self.vault.as_ref() else {
+            return Err(SessionError::NoVault);
+        };
+        let mut restored = 0;
+        let mut restored_active = None;
+        for (original_index, (path, cursor, pinned)) in tabs.iter().enumerate() {
+            let Ok(document) = vault.open_note(path) else {
+                continue;
+            };
+            let cursor = (*cursor).min(document.len_chars());
+            let saved_text = document.text();
+            self.tabs.push(OpenTab {
+                document,
+                saved_text,
+                cursor,
+                preferred_column: None,
+                title_linked: false,
+                pinned: *pinned,
+                history: EditHistory::default(),
+            });
+            if active == Some(original_index) {
+                restored_active = Some(self.tabs.len() - 1);
+            }
+            restored += 1;
+        }
+        self.active_tab = restored_active;
+        if self.active_tab.is_none() && !self.tabs.is_empty() {
+            self.active_tab = Some(0);
+        }
+        self.refresh_active_status();
+        Ok(restored)
+    }
+
+    pub fn reorder_tab(&mut self, from: usize, to: usize) -> Result<(), SessionError> {
+        self.ensure_valid_tab(from)?;
+        self.ensure_valid_tab(to)?;
+        if from == to {
+            return Ok(());
+        }
+        let tab = self.tabs.remove(from);
+        self.tabs.insert(to, tab);
+        self.active_tab = self.active_tab.map(|active| {
+            if active == from {
+                to
+            } else if from < active && active <= to {
+                active - 1
+            } else if to <= active && active < from {
+                active + 1
+            } else {
+                active
+            }
+        });
+        Ok(())
+    }
+
     pub fn activate_tab(&mut self, index: usize) -> Result<(), SessionError> {
         if index >= self.tabs.len() {
             let error = SessionError::InvalidTabIndex { index };
@@ -422,8 +567,10 @@ impl ShellState {
             .and_then(|vault| vault.open_note(relative_path).map_err(SessionError::Vault));
         match result {
             Ok(document) => {
+                let saved_text = document.text();
                 self.tabs.push(OpenTab {
                     document,
+                    saved_text,
                     cursor: 0,
                     preferred_column: None,
                     title_linked: false,
@@ -587,6 +734,24 @@ impl ShellState {
         }
     }
 
+    pub fn move_previous_word(&mut self) {
+        self.break_history_coalesce();
+        if let Some(tab) = self.active_tab.and_then(|index| self.tabs.get_mut(index)) {
+            let text = tab.document.text();
+            tab.cursor = previous_word_boundary(&text, tab.cursor);
+            tab.preferred_column = None;
+        }
+    }
+
+    pub fn move_next_word(&mut self) {
+        self.break_history_coalesce();
+        if let Some(tab) = self.active_tab.and_then(|index| self.tabs.get_mut(index)) {
+            let text = tab.document.text();
+            tab.cursor = next_word_boundary(&text, tab.cursor);
+            tab.preferred_column = None;
+        }
+    }
+
     pub fn move_home(&mut self) {
         self.break_history_coalesce();
         let Some(tab) = self.active_tab.and_then(|index| self.tabs.get_mut(index)) else {
@@ -683,6 +848,20 @@ impl ShellState {
             return Err(SessionError::NoVault);
         };
 
+        if self.tabs[index].history.is_dirty() {
+            let path = self.tabs[index].document.relative_path().to_path_buf();
+            match vault.open_note(&path) {
+                Ok(document) if document.text() != self.tabs[index].saved_text => {
+                    let error = SessionError::ExternalConflict(path);
+                    self.record_error(&error);
+                    return Err(error);
+                }
+                Ok(_) => {}
+                Err(error) if vault_error_is_not_found(&error) => {}
+                Err(error) => return Err(SessionError::Vault(error)),
+            }
+        }
+
         let first_result = vault.save_note(&mut self.tabs[index].document);
         let save_result = match first_result {
             Err(error)
@@ -699,6 +878,7 @@ impl ShellState {
 
         match save_result {
             Ok(()) => {
+                self.tabs[index].saved_text = self.tabs[index].document.text();
                 self.tabs[index].history.mark_saved();
                 self.status_message = "Saved".to_owned();
                 self.vault_error = None;
@@ -724,6 +904,18 @@ impl ShellState {
         self.ensure_valid_tab(index)?;
         self.ensure_tabs_clean(index..index + 1)?;
 
+        self.remove_tab(index);
+        Ok(true)
+    }
+
+    pub fn discard_tab(&mut self, index: usize) -> Result<bool, SessionError> {
+        self.ensure_valid_tab(index)?;
+
+        self.remove_tab(index);
+        Ok(true)
+    }
+
+    fn remove_tab(&mut self, index: usize) {
         let old_active = self.active_tab;
         self.tabs.remove(index);
         self.active_tab = match old_active {
@@ -733,7 +925,6 @@ impl ShellState {
             active => active,
         };
         self.refresh_active_status();
-        Ok(true)
     }
 
     pub fn close_tabs_left(&mut self, index: usize) -> Result<usize, SessionError> {
@@ -862,9 +1053,31 @@ impl ShellState {
             return Err(error);
         }
 
+        Ok(self.remove_tabs_at_indices(indices, closed_active))
+    }
+
+    pub fn discard_tabs(
+        &mut self,
+        indices: Vec<usize>,
+        closed_active: Option<usize>,
+    ) -> Result<usize, SessionError> {
+        if let Some(&index) = indices.iter().find(|&&index| index >= self.tabs.len()) {
+            let error = SessionError::InvalidTabIndex { index };
+            self.record_error(&error);
+            return Err(error);
+        }
+        Ok(self.remove_tabs_at_indices(indices, closed_active))
+    }
+
+    fn remove_tabs_at_indices(
+        &mut self,
+        indices: Vec<usize>,
+        closed_active: Option<usize>,
+    ) -> usize {
+
         let count = indices.len();
         if count == 0 {
-            return Ok(0);
+            return 0;
         }
 
         let old_active = self.active_tab;
@@ -884,7 +1097,7 @@ impl ShellState {
         }
         self.active_tab = new_active.filter(|&index| index < self.tabs.len());
         self.refresh_active_status();
-        Ok(count)
+        count
     }
 
     fn ensure_tabs_clean(&mut self, range: std::ops::Range<usize>) -> Result<(), SessionError> {
@@ -999,6 +1212,42 @@ impl ShellState {
     }
 }
 
+fn is_word_character(character: char) -> bool {
+    character.is_alphanumeric() || character == '_'
+}
+
+fn previous_word_boundary(text: &str, cursor: usize) -> usize {
+    let chars = text.chars().collect::<Vec<_>>();
+    let mut index = cursor.min(chars.len());
+    while index > 0 && chars[index - 1].is_whitespace() {
+        index -= 1;
+    }
+    if index > 0 && is_word_character(chars[index - 1]) {
+        while index > 0 && is_word_character(chars[index - 1]) {
+            index -= 1;
+        }
+    } else {
+        index = index.saturating_sub(1);
+    }
+    index
+}
+
+fn next_word_boundary(text: &str, cursor: usize) -> usize {
+    let chars = text.chars().collect::<Vec<_>>();
+    let mut index = cursor.min(chars.len());
+    while index < chars.len() && chars[index].is_whitespace() {
+        index += 1;
+    }
+    if index < chars.len() && is_word_character(chars[index]) {
+        while index < chars.len() && is_word_character(chars[index]) {
+            index += 1;
+        }
+    } else if index < chars.len() {
+        index += 1;
+    }
+    index
+}
+
 fn notes_from_entries(entries: &[VaultEntry]) -> Vec<NoteEntry> {
     entries
         .iter()
@@ -1060,6 +1309,8 @@ pub enum SessionError {
     NoVault,
     NoActiveNote,
     UnsavedChanges,
+    ExternalConflict(PathBuf),
+    RecoveryConflict(PathBuf),
     InvalidTabIndex { index: usize },
     Vault(VaultError),
     Buffer(BufferError),
@@ -1076,6 +1327,16 @@ impl fmt::Display for SessionError {
                     "Save modified tabs before closing or switching Vaults"
                 )
             }
+            Self::ExternalConflict(path) => write!(
+                formatter,
+                "{} changed outside Synapse; reload or resolve it before saving",
+                path.display()
+            ),
+            Self::RecoveryConflict(path) => write!(
+                formatter,
+                "{} changed after its recovery copy was created; recovery was not applied",
+                path.display()
+            ),
             Self::InvalidTabIndex { index } => {
                 write!(formatter, "Tab index {index} does not exist")
             }
@@ -1093,6 +1354,8 @@ impl Error for SessionError {
             Self::NoVault
             | Self::NoActiveNote
             | Self::UnsavedChanges
+            | Self::ExternalConflict(_)
+            | Self::RecoveryConflict(_)
             | Self::InvalidTabIndex { .. } => None,
         }
     }
@@ -2037,6 +2300,115 @@ mod tests {
         assert_eq!(state.active_document().unwrap().text(), "a");
         state.undo().unwrap();
         assert_eq!(state.active_document().unwrap().text(), "");
+    }
+
+    #[test]
+    fn word_movement_uses_word_boundaries_and_skips_whitespace() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("note.md"), "one two\nthree").unwrap();
+        let mut state =
+            ShellState::from_vault_argument(Some(OsString::from(directory.path().as_os_str())));
+        state.select_note(Path::new("note.md")).unwrap();
+
+        state.move_next_word();
+        assert_eq!(state.cursor(), 3);
+        state.move_next_word();
+        assert_eq!(state.cursor(), 7);
+        state.move_previous_word();
+        assert_eq!(state.cursor(), 4);
+        state.move_previous_word();
+        assert_eq!(state.cursor(), 0);
+    }
+
+    #[test]
+    fn session_restore_and_tab_reorder_preserve_active_tab() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("one.md"), "one").unwrap();
+        fs::write(directory.path().join("two.md"), "two").unwrap();
+        fs::write(directory.path().join("three.md"), "three").unwrap();
+
+        let mut state = ShellState::from_vault_argument(Some(OsString::from(
+            directory.path().as_os_str(),
+        )));
+        state
+            .restore_session(
+                &[
+                    (PathBuf::from("one.md"), 0, false),
+                    (PathBuf::from("two.md"), 1, true),
+                    (PathBuf::from("three.md"), 0, false),
+                ],
+                Some(1),
+            )
+            .unwrap();
+        assert_eq!(state.active_tab_index(), Some(1));
+        state.reorder_tab(1, 0).unwrap();
+        assert_eq!(state.tabs()[0].relative_path, PathBuf::from("two.md"));
+        assert_eq!(state.active_tab_index(), Some(0));
+        let (paths, active) = state.session_snapshot();
+        assert_eq!(
+            paths,
+            [
+                (PathBuf::from("two.md"), 1, true),
+                (PathBuf::from("one.md"), 0, false),
+                (PathBuf::from("three.md"), 0, false),
+            ]
+        );
+        assert_eq!(active, Some(0));
+
+        let mut restored = ShellState::from_vault_argument(Some(OsString::from(
+            directory.path().as_os_str(),
+        )));
+        restored
+            .restore_session(
+                &[
+                    (PathBuf::from("missing.md"), 0, false),
+                    (PathBuf::from("three.md"), 2, false),
+                ],
+                Some(1),
+            )
+            .unwrap();
+        assert_eq!(restored.active_tab_index(), Some(0));
+        assert_eq!(restored.cursor(), 2);
+    }
+
+    #[test]
+    fn external_changes_reload_clean_tabs_and_block_dirty_overwrites() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("note.md");
+        fs::write(&path, "original").unwrap();
+        let mut state = ShellState::from_vault_argument(Some(OsString::from(
+            directory.path().as_os_str(),
+        )));
+        state.select_note(Path::new("note.md")).unwrap();
+
+        fs::write(&path, "external").unwrap();
+        assert!(state.refresh_external_documents().unwrap());
+        assert_eq!(state.active_document().unwrap().text(), "external");
+
+        state.insert_text("local ").unwrap();
+        fs::write(&path, "new external").unwrap();
+        assert!(matches!(
+            state.save_active(),
+            Err(super::SessionError::ExternalConflict(_))
+        ));
+        assert_eq!(fs::read_to_string(path).unwrap(), "new external");
+    }
+
+    #[test]
+    fn confirmed_discard_closes_a_dirty_tab_without_saving_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("note.md");
+        fs::write(&path, "saved").unwrap();
+        let mut state = ShellState::from_vault_argument(Some(OsString::from(
+            directory.path().as_os_str(),
+        )));
+        state.select_note(Path::new("note.md")).unwrap();
+        state.insert_text("local ").unwrap();
+
+        assert!(matches!(state.close_tab(0), Err(super::SessionError::UnsavedChanges)));
+        assert!(state.discard_tab(0).unwrap());
+        assert!(state.tabs().is_empty());
+        assert_eq!(fs::read_to_string(path).unwrap(), "saved");
     }
 
     #[test]

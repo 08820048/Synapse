@@ -8,6 +8,10 @@ All notable changes to Synapse are recorded here. The format follows [Keep a Cha
 
 - Editor undo and redo, with coalesced typing/backspace, per-tab history, and `Cmd/Ctrl+Z` / `Cmd/Ctrl+Shift+Z`
 - Native update checks against GitHub Releases, with a startup prompt, a sidebar “有更新” affordance, a top-level Settings page, and a command-palette entry that open the platform installer
+- Filename and full-text note search, plus in-note find, previous/next match, replace, and replace-all
+- Word-wise movement and selection, double-click word selection, and triple-click line selection
+- Drag-reorderable tabs with restored order, active tab, cursor, and pin state
+- One-second autosave, dirty-tab discard confirmation, external edit conflict protection, and crash recovery copies
 
 ## [0.1.2] - 2026-08-18
 

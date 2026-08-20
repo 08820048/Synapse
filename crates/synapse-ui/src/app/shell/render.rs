@@ -5,10 +5,9 @@ impl Render for SynapseApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let component_layers = render_component_root_layers(window, cx);
         let theme = cx.theme().clone();
-        // Deferred context menus retain their element identity while open. Include the active
-        // appearance in that identity so a settings-window theme change remounts their copied
-        // palette immediately instead of waiting for the next time the menu is opened.
-        let context_menu_theme_key = if theme.is_dark() { "dark" } else { "light" };
+        // Animated and deferred surfaces retain element identity while open. Key them by the
+        // active appearance so copied colors are remounted immediately after a theme change.
+        let surface_theme_key = if theme.is_dark() { "dark" } else { "light" };
         let app_entity = cx.entity();
         let command_kbd = Kbd::binding_for_action(&OpenCommandPalette, None, window);
         let todo_workspace_active = self.workspace_view == WorkspaceView::Todo;
@@ -689,6 +688,153 @@ impl Render for SynapseApp {
                     None
                 }
             });
+            let find_match_count = self.active_find_matches(cx).len();
+            let find_bar = self.find_bar_open.then(|| {
+                let find_app = app_entity.clone();
+                let previous_app = app_entity.clone();
+                let replace_app = app_entity.clone();
+                let replace_all_app = app_entity.clone();
+                let close_app = app_entity.clone();
+                div()
+                    .id("editor-find-bar")
+                    .absolute()
+                    .top(px(12.0))
+                    .right(px(24.0))
+                    .w(px(430.0))
+                    .p_2()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .rounded(px(8.0))
+                    .border_1()
+                    .border_color(theme.border)
+                    .bg(theme.popover)
+                    .text_color(theme.popover_foreground)
+                    .shadow_lg()
+                    .key_context("SynapseFind")
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                        if event.keystroke.key == "escape" {
+                            this.dismiss_find(window, cx);
+                            cx.stop_propagation();
+                        }
+                    }))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .child(
+                                Input::new(&self.find_input)
+                                    .appearance(false)
+                                    .focus_bordered(true)
+                                    .h(px(32.0))
+                                    .flex_1()
+                                    .text_size(px(13.0)),
+                            )
+                            .child(
+                                div()
+                                    .w(px(68.0))
+                                    .text_size(px(11.0))
+                                    .text_color(theme.muted_foreground)
+                                    .child(if find_match_count == 0 {
+                                        self.language.text("无匹配", "No matches").to_owned()
+                                    } else {
+                                        match self.language {
+                                            AppLanguage::SimplifiedChinese => {
+                                                format!("{find_match_count} 个匹配")
+                                            }
+                                            AppLanguage::English => {
+                                                format!("{find_match_count} matches")
+                                            }
+                                        }
+                                    }),
+                            )
+                            .child(
+                                Button::new("find-previous")
+                                    .ghost()
+                                    .size(px(28.0))
+                                    .p_0()
+                                    .tooltip(self.language.text("上一个", "Previous"))
+                                    .child(gpui_component::Icon::new(IconName::ChevronUp))
+                                    .on_click(move |_, window, cx| {
+                                        previous_app.update(cx, |this, cx| {
+                                            this.find_previous(window, cx);
+                                        });
+                                    }),
+                            )
+                            .child(
+                                Button::new("find-next")
+                                    .ghost()
+                                    .size(px(28.0))
+                                    .p_0()
+                                    .tooltip(self.language.text("下一个", "Next"))
+                                    .child(gpui_component::Icon::new(IconName::ChevronDown))
+                                    .on_click(move |_, window, cx| {
+                                        find_app.update(cx, |this, cx| {
+                                            this.find_next(window, cx);
+                                        });
+                                    }),
+                            )
+                            .child(
+                                Button::new("find-close")
+                                    .ghost()
+                                    .size(px(28.0))
+                                    .p_0()
+                                    .tooltip(self.language.text("关闭", "Close"))
+                                    .child(
+                                        Icon::Close
+                                            .render(14.0)
+                                            .text_color(theme.muted_foreground),
+                                    )
+                                    .on_click(move |_, window, cx| {
+                                        cx.stop_propagation();
+                                        close_app.update(cx, |this, cx| {
+                                            this.dismiss_find(window, cx);
+                                        });
+                                    }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .child(
+                                Input::new(&self.replace_input)
+                                    .appearance(false)
+                                    .focus_bordered(true)
+                                    .h(px(32.0))
+                                    .flex_1()
+                                    .text_size(px(13.0)),
+                            )
+                            .child(
+                                Button::new("replace-next")
+                                    .outline()
+                                    .h(px(30.0))
+                                    .px_2()
+                                    .label(self.language.text("替换", "Replace"))
+                                    .on_click(move |_, window, cx| {
+                                        replace_app.update(cx, |this, cx| {
+                                            this.replace_next(window, cx);
+                                        });
+                                    }),
+                            )
+                            .child(
+                                Button::new("replace-all")
+                                    .outline()
+                                    .h(px(30.0))
+                                    .px_2()
+                                    .label(self.language.text("全部替换", "Replace all"))
+                                    .on_click(move |_, window, cx| {
+                                        replace_all_app.update(cx, |this, cx| {
+                                            this.replace_all(window, cx);
+                                        });
+                                    }),
+                            ),
+                    )
+            });
+
             div()
                 .id("editor-content")
                 .relative()
@@ -703,12 +849,16 @@ impl Render for SynapseApp {
                 .on_action(cx.listener(Self::delete_forward))
                 .on_action(cx.listener(Self::move_left))
                 .on_action(cx.listener(Self::move_right))
+                .on_action(cx.listener(Self::move_previous_word))
+                .on_action(cx.listener(Self::move_next_word))
                 .on_action(cx.listener(Self::move_up))
                 .on_action(cx.listener(Self::move_down))
                 .on_action(cx.listener(Self::move_home))
                 .on_action(cx.listener(Self::move_end))
                 .on_action(cx.listener(Self::select_left))
                 .on_action(cx.listener(Self::select_right))
+                .on_action(cx.listener(Self::select_previous_word))
+                .on_action(cx.listener(Self::select_next_word))
                 .on_action(cx.listener(Self::select_up))
                 .on_action(cx.listener(Self::select_down))
                 .on_action(cx.listener(Self::select_home))
@@ -730,6 +880,12 @@ impl Render for SynapseApp {
                 .on_action(cx.listener(Self::trigger_code_completion))
                 .on_action(cx.listener(Self::accept_slash_command))
                 .on_action(cx.listener(Self::dismiss_slash_menu_action))
+                .on_action(cx.listener(Self::open_find_action))
+                .on_action(cx.listener(Self::find_next_action))
+                .on_action(cx.listener(Self::find_previous_action))
+                .on_action(cx.listener(Self::replace_next_action))
+                .on_action(cx.listener(Self::replace_all_action))
+                .on_action(cx.listener(Self::dismiss_find_action))
                 .on_mouse_down(MouseButton::Left, cx.listener(Self::editor_mouse_down))
                 .on_mouse_down(
                     MouseButton::Right,
@@ -761,6 +917,7 @@ impl Render for SynapseApp {
                     })
                     .size_full(),
                 )
+                .children(find_bar)
                 .when_some(outline_element, |editor, outline| editor.child(outline))
                 .when_some(slash_surface, |editor, (menu, commands, anchor, below)| {
                     let scroll_handle = self.slash_menu_scroll.clone();
@@ -1548,6 +1705,17 @@ impl Render for SynapseApp {
                                 .bg(tab_warning),
                         )
                     })
+                    .on_drag(TabDrag { index }, |drag, position, _, cx| {
+                        cx.new(|_| TabDragPreview {
+                            drag: drag.clone(),
+                            position,
+                        })
+                    })
+                    .can_drop(|value, _, _| value.is::<TabDrag>())
+                    .on_drop(cx.listener(move |this, drag: &TabDrag, _, cx| {
+                        cx.stop_propagation();
+                        this.reorder_tab(drag.index, index, cx);
+                    }))
                     .child(if pinned {
                         div()
                             .size(px(40.0))
@@ -1564,12 +1732,15 @@ impl Render for SynapseApp {
                             .size(px(40.0))
                             .tooltip(self.language.text("关闭页签", "Close tab"))
                             .child(Icon::Close.render(14.0).text_color(tab_muted))
-                            .on_click(move |event: &ClickEvent, _, cx| {
+                            .on_click(move |event: &ClickEvent, window, cx| {
                                 cx.stop_propagation();
                                 if !event.is_right_click() {
-                                    close_app.update(cx, |this, cx| {
-                                        this.close_tab(index, cx);
-                                    });
+                                    SynapseApp::request_close_tab(
+                                        index,
+                                        close_app.clone(),
+                                        window,
+                                        cx,
+                                    );
                                 }
                             })
                             .into_any_element()
@@ -2706,7 +2877,7 @@ impl Render for SynapseApp {
             let close_all_app = app_entity.clone();
             let panel = div()
                 .id(SharedString::from(format!(
-                    "tab-context-menu-{context_menu_theme_key}"
+                    "tab-context-menu-{surface_theme_key}"
                 )))
                 .w(px(TAB_CONTEXT_MENU_WIDTH))
                 .p_1()
@@ -2747,11 +2918,14 @@ impl Render for SynapseApp {
                             self.language.text("关闭", "Close"),
                             theme.muted_foreground,
                         ))
-                        .on_click(move |_, _, cx| {
+                        .on_click(move |_, window, cx| {
                             cx.stop_propagation();
-                            close_app.update(cx, |this, cx| {
-                                this.close_tab(index, cx);
-                            });
+                            SynapseApp::request_close_tab(
+                                index,
+                                close_app.clone(),
+                                window,
+                                cx,
+                            );
                         }),
                 )
                 .child(
@@ -2764,11 +2938,19 @@ impl Render for SynapseApp {
                             self.language.text("关闭左侧页签", "Close Left"),
                             theme.muted_foreground,
                         ))
-                        .on_click(move |_, _, cx| {
+                        .on_click(move |_, window, cx| {
                             cx.stop_propagation();
-                            close_left_app.update(cx, |this, cx| {
-                                this.close_tabs_left(index, cx);
-                            });
+                            let tabs = close_left_app.read(cx).state.tabs();
+                            let indices = (0..index)
+                                .filter(|&index| !tabs[index].is_pinned)
+                                .collect();
+                            SynapseApp::request_close_tabs(
+                                indices,
+                                Some(index),
+                                close_left_app.clone(),
+                                window,
+                                cx,
+                            );
                         }),
                 )
                 .child(
@@ -2781,11 +2963,19 @@ impl Render for SynapseApp {
                             self.language.text("关闭右侧页签", "Close Right"),
                             theme.muted_foreground,
                         ))
-                        .on_click(move |_, _, cx| {
+                        .on_click(move |_, window, cx| {
                             cx.stop_propagation();
-                            close_right_app.update(cx, |this, cx| {
-                                this.close_tabs_right(index, cx);
-                            });
+                            let tabs = close_right_app.read(cx).state.tabs();
+                            let indices = (index + 1..tabs.len())
+                                .filter(|&index| !tabs[index].is_pinned)
+                                .collect();
+                            SynapseApp::request_close_tabs(
+                                indices,
+                                Some(index),
+                                close_right_app.clone(),
+                                window,
+                                cx,
+                            );
                         }),
                 )
                 .child(
@@ -2798,16 +2988,27 @@ impl Render for SynapseApp {
                             self.language.text("关闭全部页签", "Close All"),
                             theme.muted_foreground,
                         ))
-                        .on_click(move |_, _, cx| {
+                        .on_click(move |_, window, cx| {
                             cx.stop_propagation();
-                            close_all_app.update(cx, |this, cx| {
-                                this.close_all_tabs(cx);
-                            });
+                            let tabs = close_all_app.read(cx).state.tabs();
+                            let remaining = tabs.iter().filter(|tab| tab.is_pinned).count();
+                            let indices = tabs
+                                .iter()
+                                .enumerate()
+                                .filter_map(|(index, tab)| (!tab.is_pinned).then_some(index))
+                                .collect();
+                            SynapseApp::request_close_tabs(
+                                indices,
+                                (remaining > 0).then_some(0),
+                                close_all_app.clone(),
+                                window,
+                                cx,
+                            );
                         }),
                 )
                 .opacity(0.0)
                 .with_transition(SharedString::from(format!(
-                    "tab-context-menu-transition-{index}-{context_menu_theme_key}"
+                    "tab-context-menu-transition-{index}-{surface_theme_key}"
                 )))
                 .transition_when_else(
                     !self.context_menu_closing,
@@ -2833,7 +3034,7 @@ impl Render for SynapseApp {
             let trash_target = target.clone();
             let base = div()
                 .id(SharedString::from(format!(
-                    "tree-context-menu-{context_menu_theme_key}"
+                    "tree-context-menu-{surface_theme_key}"
                 )))
                 .w(px(TREE_CONTEXT_MENU_WIDTH))
                 .p_1()
@@ -2845,7 +3046,7 @@ impl Render for SynapseApp {
                 .text_color(theme.popover_foreground)
                 .opacity(0.0)
                 .with_transition(SharedString::from(format!(
-                    "tree-context-menu-transition-{context_menu_theme_key}"
+                    "tree-context-menu-transition-{surface_theme_key}"
                 )))
                 .transition_when_else(
                     !self.context_menu_closing,
@@ -3050,7 +3251,7 @@ impl Render for SynapseApp {
             });
             let panel = div()
                 .id(SharedString::from(format!(
-                    "editor-context-menu-{context_menu_theme_key}"
+                    "editor-context-menu-{surface_theme_key}"
                 )))
                 .w(px(EDITOR_CONTEXT_MENU_WIDTH))
                 .p_1()
@@ -3119,7 +3320,7 @@ impl Render for SynapseApp {
                 )
                 .opacity(0.0)
                 .with_transition(SharedString::from(format!(
-                    "editor-context-menu-transition-{context_menu_theme_key}"
+                    "editor-context-menu-transition-{surface_theme_key}"
                 )))
                 .transition_when_else(
                     !self.context_menu_closing,
@@ -3241,6 +3442,62 @@ impl Render for SynapseApp {
                 .into_any_element()
         });
 
+        let command_query = self.command_search.read(cx).value().trim().to_owned();
+        let palette_search_count = if command_query.is_empty() {
+            0
+        } else {
+            self.command_search_results.len()
+        };
+        let search_rows = self
+            .command_search_results
+            .iter()
+            .enumerate()
+            .map(|(index, result)| {
+                let click_app = app_entity.clone();
+                let relative_path = result.relative_path.clone();
+                let selected = self.command_palette_selected == index;
+                Button::new(SharedString::from(format!("palette-note-{index}")))
+                    .ghost()
+                    .when(selected, |button| {
+                        button.bg(theme.secondary).text_color(theme.foreground)
+                    })
+                    .w_full()
+                    .h(px(48.0))
+                    .justify_start()
+                    .gap_2()
+                    .child(Icon::FileText.render(16.0))
+                    .child(
+                        div()
+                            .min_w(px(0.0))
+                            .flex_1()
+                            .text_left()
+                            .child(div().truncate().child(result.title.clone()))
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_size(px(11.0))
+                                    .text_color(theme.muted_foreground)
+                                    .child(result.preview.clone()),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .max_w(px(140.0))
+                            .truncate()
+                            .text_size(px(11.0))
+                            .text_color(theme.muted_foreground)
+                            .child(result.relative_path.to_string_lossy().into_owned()),
+                    )
+                    .on_click(move |_, window, cx| {
+                        cx.stop_propagation();
+                        click_app.update(cx, |this, cx| {
+                            this.open_search_result(relative_path.clone(), window, cx);
+                        });
+                    })
+                    .into_any_element()
+            })
+            .collect::<Vec<_>>();
+
         let command_palette = self.command_palette_open.then(|| {
             let new_note_app = app_entity.clone();
             let open_vault_app = app_entity.clone();
@@ -3249,7 +3506,9 @@ impl Render for SynapseApp {
             let settings_app = app_entity.clone();
             let update_app = app_entity.clone();
             div()
-                .id("command-palette-backdrop")
+                .id(SharedString::from(format!(
+                    "command-palette-backdrop-{surface_theme_key}"
+                )))
                 .absolute()
                 .top(px(0.0))
                 .right(px(0.0))
@@ -3260,15 +3519,20 @@ impl Render for SynapseApp {
                 .justify_center()
                 .pt(px(72.0))
                 .bg(hsla(0.0, 0.0, 0.0, 0.58))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.dismiss_command_palette(cx);
                 }))
                 .child(
                     div()
-                        .id("command-palette")
+                        .id(SharedString::from(format!(
+                            "command-palette-{surface_theme_key}"
+                        )))
                         .w(px(560.0))
                         .max_h(px(420.0))
                         .overflow_y_scroll()
+                        .track_scroll(&self.command_palette_scroll)
                         .p_2()
                         .rounded_lg()
                         .border_1()
@@ -3280,6 +3544,7 @@ impl Render for SynapseApp {
                         .on_click(cx.listener(|_, _, _, cx| {
                             cx.stop_propagation();
                         }))
+                        .on_key_down(cx.listener(Self::command_palette_key_down))
                         .child(
                             div()
                                 .h(px(48.0))
@@ -3296,9 +3561,41 @@ impl Render for SynapseApp {
                                         }),
                                 ),
                         )
+                        .when(!command_query.is_empty(), |palette| {
+                            palette
+                                .child(
+                                    div()
+                                        .px_2()
+                                        .pt_2()
+                                        .pb_1()
+                                        .text_size(px(11.0))
+                                        .text_color(theme.muted_foreground)
+                                        .child(self.language.text("笔记", "Notes")),
+                                )
+                                .children(search_rows)
+                                .when(self.command_search_results.is_empty(), |palette| {
+                                    palette.child(
+                                        div()
+                                            .px_2()
+                                            .py_3()
+                                            .text_size(px(12.0))
+                                            .text_color(theme.muted_foreground)
+                                            .child(self.language.text(
+                                                "没有匹配的笔记",
+                                                "No matching notes",
+                                            )),
+                                    )
+                                })
+                        })
                         .child(
                             Button::new("palette-new-note")
-                                .primary()
+                                .ghost()
+                                .when(
+                                    self.command_palette_selected == palette_search_count,
+                                    |button| {
+                                        button.bg(theme.secondary).text_color(theme.foreground)
+                                    },
+                                )
                                 .w_full()
                                 .h(px(38.0))
                                 .mt_2()
@@ -3321,6 +3618,12 @@ impl Render for SynapseApp {
                         .child(
                             Button::new("palette-open-vault")
                                 .ghost()
+                                .when(
+                                    self.command_palette_selected == palette_search_count + 1,
+                                    |button| {
+                                        button.bg(theme.secondary).text_color(theme.foreground)
+                                    },
+                                )
                                 .w_full()
                                 .h(px(38.0))
                                 .justify_start()
@@ -3341,6 +3644,12 @@ impl Render for SynapseApp {
                         .child(
                             Button::new("palette-todo")
                                 .ghost()
+                                .when(
+                                    self.command_palette_selected == palette_search_count + 2,
+                                    |button| {
+                                        button.bg(theme.secondary).text_color(theme.foreground)
+                                    },
+                                )
                                 .w_full()
                                 .h(px(38.0))
                                 .justify_start()
@@ -3360,6 +3669,12 @@ impl Render for SynapseApp {
                         .child(
                             Button::new("palette-bookmarks")
                                 .ghost()
+                                .when(
+                                    self.command_palette_selected == palette_search_count + 3,
+                                    |button| {
+                                        button.bg(theme.secondary).text_color(theme.foreground)
+                                    },
+                                )
                                 .w_full()
                                 .h(px(38.0))
                                 .justify_start()
@@ -3380,6 +3695,12 @@ impl Render for SynapseApp {
                         .child(
                             Button::new("palette-check-updates")
                                 .ghost()
+                                .when(
+                                    self.command_palette_selected == palette_search_count + 4,
+                                    |button| {
+                                        button.bg(theme.secondary).text_color(theme.foreground)
+                                    },
+                                )
                                 .w_full()
                                 .h(px(38.0))
                                 .justify_start()
@@ -3404,6 +3725,12 @@ impl Render for SynapseApp {
                         .child(
                             Button::new("palette-settings")
                                 .ghost()
+                                .when(
+                                    self.command_palette_selected == palette_search_count + 5,
+                                    |button| {
+                                        button.bg(theme.secondary).text_color(theme.foreground)
+                                    },
+                                )
                                 .w_full()
                                 .h(px(38.0))
                                 .justify_start()
@@ -3416,7 +3743,9 @@ impl Render for SynapseApp {
                                     });
                                 }),
                         )
-                        .with_transition("command-palette-transition")
+                        .with_transition(SharedString::from(format!(
+                            "command-palette-transition-{surface_theme_key}"
+                        )))
                         .transition_when_else(
                             !self.command_palette_closing,
                             PANEL_TRANSITION,
