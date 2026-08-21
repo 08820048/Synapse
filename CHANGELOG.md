@@ -4,6 +4,8 @@ All notable changes to Synapse are recorded here. The format follows [Keep a Cha
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-21
+
 ### Added
 
 - Editor undo and redo, with coalesced typing/backspace, per-tab history, and `Cmd/Ctrl+Z` / `Cmd/Ctrl+Shift+Z`
@@ -12,6 +14,21 @@ All notable changes to Synapse are recorded here. The format follows [Keep a Cha
 - Word-wise movement and selection, double-click word selection, and triple-click line selection
 - Drag-reorderable tabs with restored order, active tab, cursor, and pin state
 - One-second autosave, dirty-tab discard confirmation, external edit conflict protection, and crash recovery copies
+- Code completion, language-server integration, richer fenced-code editing, and list-to-todo conversion
+
+### Changed
+
+- Large notes use viewport-bounded progressive rendering, cached previews, and deferred syntax highlighting
+- Settings use consistent component buttons in a titlebar-free layout
+- The application icon now uses a restrained graphite folded-page design
+- Application, editor, platform, and workspace code is split into focused modules
+
+### Fixed
+
+- Unified editor cursor weight and table caret placement
+- Reduced excess blank-line spacing around Markdown blocks
+- Preserved collapsed file-tree state while excluding hidden directories
+- Hardened rename and overlay interactions and refreshed tab borders after theme changes
 
 ## [0.1.2] - 2026-08-18
 

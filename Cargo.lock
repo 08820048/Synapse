@@ -6550,7 +6550,7 @@ dependencies = [
 
 [[package]]
 name = "synapse"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "cocoa 0.26.0",
  "futures",
@@ -6575,7 +6575,7 @@ dependencies = [
 
 [[package]]
 name = "synapse-core"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "ropey 1.6.1",
  "tempfile",
