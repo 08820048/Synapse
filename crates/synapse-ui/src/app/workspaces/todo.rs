@@ -88,24 +88,6 @@ pub(in crate::app) struct TodoItem {
     tags: Vec<String>,
 }
 
-impl TodoItem {
-    pub(in crate::app) fn id(&self) -> u64 {
-        self.id
-    }
-
-    pub(in crate::app) fn text(&self) -> &str {
-        &self.text
-    }
-
-    pub(in crate::app) fn is_done(&self) -> bool {
-        self.done
-    }
-
-    pub(in crate::app) fn tags(&self) -> &[String] {
-        &self.tags
-    }
-}
-
 #[derive(Clone, Copy, Debug)]
 pub(in crate::app) struct TodoTagPicker {
     pub(in crate::app) todo_id: u64,
@@ -308,23 +290,11 @@ impl TodoWorkspace {
             .map(|todo| todo.text.clone())
     }
 
-    pub(in crate::app) fn todo(&self, todo_id: u64) -> Option<&TodoItem> {
-        self.todos.iter().find(|todo| todo.id == todo_id)
-    }
-
     pub(in crate::app) fn todo_is_done(&self, todo_id: u64) -> Option<bool> {
         self.todos
             .iter()
             .find(|todo| todo.id == todo_id)
             .map(|todo| todo.done)
-    }
-
-    pub(in crate::app) fn set_todo_done(&mut self, todo_id: u64, done: bool) -> bool {
-        let Some(todo) = self.todos.iter_mut().find(|todo| todo.id == todo_id) else {
-            return false;
-        };
-        todo.done = done;
-        true
     }
 
     #[cfg(test)]

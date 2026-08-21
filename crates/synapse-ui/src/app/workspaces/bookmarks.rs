@@ -63,10 +63,6 @@ impl BookmarkItem {
     pub(in crate::app) fn meta_fetched(&self) -> bool {
         self.meta_fetched
     }
-
-    pub(in crate::app) fn tags(&self) -> &[String] {
-        &self.tags
-    }
 }
 
 #[derive(Clone, Copy, Debug)]

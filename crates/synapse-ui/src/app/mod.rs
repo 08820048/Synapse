@@ -22,7 +22,7 @@ use cocoa::{
     base::{id, nil},
     foundation::NSData,
 };
-use futures::{FutureExt as _, StreamExt as _};
+use futures::StreamExt as _;
 use gpui::{
     AnyElement, AnyWindowHandle, App, Application, Bounds, ClickEvent, ClipboardEntry,
     ClipboardItem, Context, Corner, CursorStyle, ElementInputHandler, Entity, FocusHandle,
@@ -47,7 +47,6 @@ use gpui_component::{
     input::{Input, InputEvent, InputState},
     kbd::Kbd,
     notification::Notification,
-    resizable::{ResizableState, h_resizable, resizable_panel},
     setting::{SettingField, SettingGroup, SettingItem, SettingPage, Settings},
     switch::Switch,
 };
@@ -55,7 +54,6 @@ use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher as _};
 use synapse::{ShellState, smart_enter_edit, trailing_fenced_code_block_paragraph_edit};
 use synapse_core::{NoteDocument, NoteTextSnapshot, VaultEntry, VaultEntryKind};
 
-mod agent;
 mod commands;
 mod editor;
 mod platform;
@@ -63,11 +61,6 @@ mod shell;
 mod ui;
 mod workspaces;
 
-use self::agent::{
-    AgentSessionMetadata, AgentTranscriptItem, AgentWorkspaceBridge, AgentWorkspaceRequest,
-    AgentWorkspaceResponse, PiAcpEvent, PiAcpPermissionRequest, PiAcpPrompt, PiAcpRuntime,
-    PromptContext, apply_event, load_agent_sessions, save_agent_sessions,
-};
 use self::editor::blink::CursorBlinkState;
 use self::editor::code_block::{
     AutoPair, CodeEdit, CodeTextInput, adjust_auto_pairs, code_block_exit_requested,
@@ -116,12 +109,11 @@ use self::ui::settings::{
     SettingsSpring, settings_language_indicator_left, settings_theme_indicator_left,
 };
 use self::workspaces::bookmarks::{
-    BookmarkItem, BookmarkTagPicker, BookmarkWorkspace, BookmarkWorkspaceRenderState,
-    fetch_link_metadata, is_bookmark_url_candidate, render_bookmark_quick_picker,
-    render_bookmark_workspace,
+    BookmarkTagPicker, BookmarkWorkspace, BookmarkWorkspaceRenderState, fetch_link_metadata,
+    is_bookmark_url_candidate, render_bookmark_quick_picker, render_bookmark_workspace,
 };
 use self::workspaces::todo::{
-    TodoItem, TodoTagPicker, TodoToggleOutcome, TodoWorkspace, TodoWorkspaceRenderState,
+    TodoTagPicker, TodoToggleOutcome, TodoWorkspace, TodoWorkspaceRenderState,
     render_todo_quick_picker, render_todo_workspace,
 };
 #[cfg(test)]
@@ -609,7 +601,6 @@ fn apply_synapse_theme(preference: ThemePreference, window: Option<&mut Window>,
     theme.primary_foreground = palette.background;
     theme.primary_active = palette.muted;
     theme.primary_hover = palette.faint;
-    theme.ring = palette.muted;
     theme.secondary = palette.panel;
     theme.secondary_foreground = palette.foreground;
     theme.secondary_active = palette.active;
@@ -828,10 +819,6 @@ fn synapse_config_directory() -> Option<PathBuf> {
             })
             .map(|directory| directory.join("synapse"))
     }
-}
-
-fn agent_sessions_path() -> Option<PathBuf> {
-    synapse_config_directory().map(|directory| directory.join("agent-sessions.json"))
 }
 
 fn default_vault_path() -> Option<PathBuf> {
@@ -1517,7 +1504,6 @@ actions!(
         AcceptSlashCommand,
         DismissSlashMenu,
         OpenCommandPalette,
-        ToggleAgentPanel,
         OpenFind,
         FindNext,
         FindPrevious,
@@ -1642,7 +1628,7 @@ fn command_palette_scroll_item_index(
     query_nonempty: bool,
 ) -> usize {
     if !query_nonempty {
-        return 1 + selected + usize::from(selected >= 7);
+        return 1 + selected + usize::from(selected >= 4);
     }
     if search_count > 0 && selected < search_count {
         return 2 + selected;
@@ -1653,31 +1639,12 @@ fn command_palette_scroll_item_index(
     } else {
         2 + search_count
     };
-    menu_start + menu_index + usize::from(menu_index >= 7)
+    menu_start + menu_index + usize::from(menu_index >= 4)
 }
 
 struct SynapseApp {
     state: ShellState,
     editor_focus: FocusHandle,
-    agent_prompt_input: Entity<InputState>,
-    agent_session_name_input: Entity<InputState>,
-    agent_panel_layout: Entity<ResizableState>,
-    agent_panel_open: bool,
-    agent_panel_closing: bool,
-    agent_history_open: bool,
-    agent_running: bool,
-    agent_cancel: Option<futures::channel::oneshot::Sender<()>>,
-    agent_pending_permission: Option<PiAcpPermissionRequest>,
-    agent_sessions: Vec<AgentSessionMetadata>,
-    agent_active_metadata_id: Option<String>,
-    agent_session_id: Option<String>,
-    agent_renaming_session_id: Option<String>,
-    agent_status: Option<String>,
-    agent_transcript: Vec<AgentTranscriptItem>,
-    agent_selection_context: Option<PromptContext>,
-    agent_include_active_note: bool,
-    agent_attachments: Vec<PromptContext>,
-    agent_bridge: Option<AgentWorkspaceBridge>,
     command_search: Entity<InputState>,
     find_input: Entity<InputState>,
     replace_input: Entity<InputState>,
@@ -4424,42 +4391,6 @@ pub(crate) fn run() {
     let auto_clear_completed_todos = load_auto_clear_completed_todos_preference();
     let todo_workspace = TodoWorkspace::load_default();
     let bookmark_workspace = BookmarkWorkspace::load_default();
-    let (agent_sessions, mut agent_sessions_error) = agent_sessions_path().map_or_else(
-        || {
-            (
-                Vec::new(),
-                Some("Unable to locate the Agent session store".to_owned()),
-            )
-        },
-        |path| match load_agent_sessions(&path) {
-            Ok(sessions) => (sessions, None),
-            Err(error) => (
-                Vec::new(),
-                Some(format!("Unable to load Agent sessions: {error}")),
-            ),
-        },
-    );
-    let (agent_bridge, agent_bridge_receiver) = match synapse_config_directory()
-        .ok_or_else(|| io::Error::other("unable to locate the Synapse configuration directory"))
-        .and_then(|directory| AgentWorkspaceBridge::start(&directory))
-    {
-        Ok((bridge, receiver)) => (Some(bridge), Some(receiver)),
-        Err(error) => {
-            let message = format!("Unable to start the Agent workspace bridge: {error}");
-            agent_sessions_error = Some(match agent_sessions_error {
-                Some(existing) => format!("{existing}; {message}"),
-                None => message,
-            });
-            (None, None)
-        }
-    };
-    let startup_agent_session = state.vault_root().and_then(|root| {
-        agent_sessions
-            .iter()
-            .filter(|session| session.vault_path == root)
-            .max_by_key(|session| session.updated_at_ms)
-            .cloned()
-    });
     let http_client = SynapseHttpClient::new().expect("failed to initialize the HTTP client");
 
     Application::new()
@@ -4475,8 +4406,6 @@ pub(crate) fn run() {
             cx.bind_keys([
                 KeyBinding::new(macos_palette_key, OpenCommandPalette, None),
                 KeyBinding::new(cross_platform_palette_key, OpenCommandPalette, None),
-                KeyBinding::new("cmd-shift-a", ToggleAgentPanel, None),
-                KeyBinding::new("ctrl-shift-a", ToggleAgentPanel, None),
                 KeyBinding::new("cmd-f", OpenFind, Some("SynapseEditor")),
                 KeyBinding::new("ctrl-f", OpenFind, Some("SynapseEditor")),
                 KeyBinding::new("enter", FindNext, Some("SynapseFind")),
@@ -4568,17 +4497,6 @@ pub(crate) fn run() {
                             )
                             .clean_on_escape()
                     });
-                    let agent_prompt_input = cx.new(|cx| {
-                        InputState::new(window, cx)
-                            .placeholder(language.text("向 Pi 提问…", "Ask Pi…"))
-                            .auto_grow(1, 6)
-                    });
-                    let agent_session_name_input = cx.new(|cx| {
-                        InputState::new(window, cx)
-                            .placeholder(language.text("会话名称", "Session name"))
-                            .clean_on_escape()
-                    });
-                    let agent_panel_layout = cx.new(|_| ResizableState::default());
                     let find_input = cx.new(|cx| {
                         InputState::new(window, cx)
                             .placeholder(language.text("查找…", "Find…"))
@@ -4641,29 +4559,6 @@ pub(crate) fn run() {
                     let editor_list_state = ListState::new(0, ListAlignment::Top, px(320.0));
                     let app = cx.new(|cx| {
                         let input_subscriptions = vec![
-                            cx.subscribe_in(
-                                &agent_prompt_input,
-                                window,
-                                |this: &mut SynapseApp, _, event: &InputEvent, window, cx| {
-                                    match event {
-                                        InputEvent::Change => cx.notify(),
-                                        InputEvent::PressEnter { secondary: false } => {
-                                            this.send_agent_prompt(window, cx);
-                                        }
-                                        _ => {}
-                                    }
-                                },
-                            ),
-                            cx.subscribe_in(
-                                &agent_session_name_input,
-                                window,
-                                |this: &mut SynapseApp, _, event: &InputEvent, _, cx| match event {
-                                    InputEvent::Change => cx.notify(),
-                                    InputEvent::PressEnter { secondary: false }
-                                    | InputEvent::Blur => this.confirm_rename_agent_session(cx),
-                                    _ => {}
-                                },
-                            ),
                             cx.subscribe_in(
                                 &command_search,
                                 window,
@@ -4850,28 +4745,6 @@ pub(crate) fn run() {
                         SynapseApp {
                             state,
                             editor_focus: cx.focus_handle(),
-                            agent_prompt_input,
-                            agent_session_name_input,
-                            agent_panel_layout,
-                            agent_panel_open: false,
-                            agent_panel_closing: false,
-                            agent_history_open: false,
-                            agent_running: false,
-                            agent_cancel: None,
-                            agent_pending_permission: None,
-                            agent_sessions,
-                            agent_active_metadata_id: startup_agent_session
-                                .as_ref()
-                                .map(|session| session.id.clone()),
-                            agent_session_id: startup_agent_session
-                                .and_then(|session| session.acp_session_id),
-                            agent_renaming_session_id: None,
-                            agent_status: agent_sessions_error,
-                            agent_transcript: Vec::new(),
-                            agent_selection_context: None,
-                            agent_include_active_note: true,
-                            agent_attachments: Vec::new(),
-                            agent_bridge,
                             command_search,
                             find_input,
                             replace_input,
@@ -4965,23 +4838,6 @@ pub(crate) fn run() {
                             markdown_source_mode: false,
                         }
                     });
-                    if let Some(mut requests) = agent_bridge_receiver {
-                        app.update(cx, |_, cx| {
-                            cx.spawn(async move |this, cx| {
-                                while let Some(request) = requests.next().await {
-                                    let updated = this.update(cx, |this, cx| {
-                                        request.respond_with(|request| {
-                                            this.handle_agent_workspace_request(request, cx)
-                                        });
-                                    });
-                                    if updated.is_err() {
-                                        break;
-                                    }
-                                }
-                            })
-                            .detach();
-                        });
-                    }
                     editor_list_state.set_scroll_handler({
                         let editor_line_layouts = editor_line_layouts.clone();
                         let app = app.downgrade();
@@ -5000,7 +4856,7 @@ pub(crate) fn run() {
                     });
                     let close_app = app.clone();
                     window.on_window_should_close(cx, move |window, cx| {
-                        let result = close_app.update(cx, |this, cx| {
+                        let result = close_app.update(cx, |this, _| {
                             if this.state.active_is_dirty() {
                                 this.state
                                     .save_active()
@@ -5008,7 +4864,6 @@ pub(crate) fn run() {
                             }
                             let _ = clear_recovery_preference();
                             this.persist_session();
-                            this.stop_agent(cx);
                             Ok::<(), String>(())
                         });
                         if let Err(error) = result {
@@ -5988,8 +5843,7 @@ mod tests {
         assert_eq!(next_command_palette_selection(0, 0, 1), 0);
 
         assert_eq!(command_palette_scroll_item_index(0, 0, false), 1);
-        assert_eq!(command_palette_scroll_item_index(4, 0, false), 5);
-        assert_eq!(command_palette_scroll_item_index(7, 0, false), 9);
+        assert_eq!(command_palette_scroll_item_index(4, 0, false), 6);
         assert_eq!(command_palette_scroll_item_index(2, 5, true), 4);
         assert_eq!(command_palette_scroll_item_index(5, 5, true), 7);
         assert_eq!(command_palette_scroll_item_index(0, 0, true), 3);
