@@ -6,8 +6,9 @@ use gpui::{
     PaintQuad, Pixels, SharedString, StrikethroughStyle, Style, TextRun, UTF16Selection,
     UnderlineStyle, Window, WrappedLine, fill, point, px, relative, rgba, size,
 };
-use gpui_component::highlighter::{
-    HighlightTheme, SyntaxHighlightEdit, SyntaxHighlightPoint, SyntaxHighlighter,
+use gpui_component::{
+    ActiveTheme as _,
+    highlighter::{HighlightTheme, SyntaxHighlightEdit, SyntaxHighlightPoint, SyntaxHighlighter},
 };
 use ropey2::Rope as HighlightRope;
 use writ::{
@@ -27,6 +28,7 @@ const INLINE_CODE_HORIZONTAL_PADDING: f32 = 6.4;
 const INLINE_CODE_VERTICAL_PADDING: f32 = 2.4;
 const INLINE_CODE_RADIUS: f32 = 4.0;
 const INLINE_STRONG_WEIGHT: f32 = 700.0;
+const EDITOR_CURSOR_WIDTH: f32 = 2.0;
 
 fn markdown_italic_fallbacks(strong: bool) -> FontFallbacks {
     #[cfg(target_os = "macos")]
@@ -2979,9 +2981,11 @@ pub struct MarkdownLineElement {
     pub list_marker_color: gpui::Hsla,
     pub mono_font_family: SharedString,
     pub inline_code_background_color: gpui::Hsla,
-    pub cursor_color: gpui::Hsla,
-    pub cursor_width: Pixels,
     pub selection_color: gpui::Hsla,
+}
+
+fn align_to_device_pixel(value: Pixels, scale_factor: f32) -> Pixels {
+    px((f32::from(value) * scale_factor).round() / scale_factor)
 }
 
 #[derive(Clone, Default)]
@@ -3097,8 +3101,8 @@ impl Element for MarkdownLineElement {
         _: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
         layout_state: &mut Self::RequestLayoutState,
-        _window: &mut Window,
-        _: &mut App,
+        window: &mut Window,
+        cx: &mut App,
     ) -> Self::PrepaintState {
         let line = layout_state
             .line
@@ -3141,16 +3145,17 @@ impl Element for MarkdownLineElement {
             let cursor_position = line
                 .position_for_index(cursor_byte, line_height)
                 .unwrap_or_default();
+            let cursor_width = px(EDITOR_CURSOR_WIDTH);
+            let cursor_left = align_to_device_pixel(
+                bounds.left() + cursor_position.x - cursor_width / 2.0,
+                window.scale_factor(),
+            );
             fill(
                 Bounds::new(
-                    bounds.origin
-                        + point(
-                            cursor_position.x - self.cursor_width / 2.0,
-                            cursor_position.y,
-                        ),
-                    size(self.cursor_width, line_height),
+                    point(cursor_left, bounds.top() + cursor_position.y),
+                    size(cursor_width, line_height),
                 ),
-                self.cursor_color,
+                cx.theme().caret,
             )
         });
         let line_start = self.source_line.start_char;
@@ -3638,11 +3643,13 @@ fn utf16_offset_to_char(text: &str, offset: usize) -> usize {
 mod tests {
     use std::{hint::black_box, time::Instant};
 
+    use gpui::px;
+
     use super::{
-        Buffer, CodeSyntaxCache, CodeSyntaxEdit, EditorSelection, INLINE_STRONG_WEIGHT,
-        LIST_BULLET_DIAMETER, MarkdownBlockKind, char_byte_boundaries, char_to_byte,
-        code_block_language, footnote_preview_line, hidden_bullet_marker_range,
-        inline_code_byte_ranges, shift_source_lines, source_lines,
+        Buffer, CodeSyntaxCache, CodeSyntaxEdit, EDITOR_CURSOR_WIDTH, EditorSelection,
+        INLINE_STRONG_WEIGHT, LIST_BULLET_DIAMETER, MarkdownBlockKind, align_to_device_pixel,
+        char_byte_boundaries, char_to_byte, code_block_language, footnote_preview_line,
+        hidden_bullet_marker_range, inline_code_byte_ranges, shift_source_lines, source_lines,
         source_lines_from_buffer_with_syntax_cache, source_lines_with_mode, table_cell_editor_line,
         task_preview_line, text_run_from_markdown, visual_row_byte_ranges,
     };
@@ -3651,6 +3658,13 @@ mod tests {
         source_lines(&format!("cursor\n{source}"), 0, true)
             .remove(1)
             .presentation
+    }
+
+    #[test]
+    fn editor_cursor_is_bold_and_aligned_to_device_pixels() {
+        assert_eq!(EDITOR_CURSOR_WIDTH, 2.0);
+        assert_eq!(align_to_device_pixel(px(10.24), 2.0), px(10.0));
+        assert_eq!(align_to_device_pixel(px(10.26), 2.0), px(10.5));
     }
 
     #[test]

@@ -36,7 +36,6 @@ struct TaskPreviewStyle {
     checked_foreground: Hsla,
     mono_font_family: SharedString,
     inline_code_background: Hsla,
-    cursor: Hsla,
     selection: Hsla,
 }
 
@@ -56,7 +55,6 @@ struct TablePreviewStyle {
     border: Hsla,
     header_background: Hsla,
     foreground: Hsla,
-    cursor: Hsla,
     selection: Hsla,
 }
 
@@ -144,7 +142,6 @@ fn render_table_row(
     let border_color = style.border;
     let header_background = style.header_background;
     let foreground = style.foreground;
-    let cursor_color = style.cursor;
     let selection_color = style.selection;
     let cells = table.cells.clone();
     let cell_presentations = table.cell_presentations.clone();
@@ -215,8 +212,6 @@ fn render_table_row(
                                     list_marker_color: style.foreground,
                                     mono_font_family: "Inter".into(),
                                     inline_code_background_color: foreground.alpha(0.0),
-                                    cursor_color,
-                                    cursor_width: px(EDITOR_CURSOR_WIDTH),
                                     selection_color,
                                 })
                         }))
@@ -707,8 +702,6 @@ fn render_task_row(
                             list_marker_color: preview_style.muted,
                             mono_font_family: preview_style.mono_font_family,
                             inline_code_background_color: preview_style.inline_code_background,
-                            cursor_color: preview_style.cursor,
-                            cursor_width: px(EDITOR_CURSOR_WIDTH),
                             selection_color: preview_style.selection,
                         })),
                 ),
@@ -789,8 +782,6 @@ fn render_footnote_definition_row(
                                 list_marker_color: preview_style.muted,
                                 mono_font_family: preview_style.mono_font_family,
                                 inline_code_background_color: preview_style.inline_code_background,
-                                cursor_color: preview_style.foreground,
-                                cursor_width: px(EDITOR_CURSOR_WIDTH),
                                 selection_color: preview_style.selection,
                             }))
                         }),
@@ -1128,7 +1119,6 @@ pub(super) fn render_editor_row(
                 checked_foreground: theme.primary_foreground,
                 mono_font_family: theme.mono_font_family.clone(),
                 inline_code_background: theme.list_hover,
-                cursor: theme.caret,
                 selection: theme.selection,
             },
         );
@@ -1143,7 +1133,6 @@ pub(super) fn render_editor_row(
                 border: theme.border,
                 header_background: theme.sidebar,
                 foreground: theme.foreground,
-                cursor: theme.caret,
                 selection: theme.selection,
             },
         );
@@ -1409,8 +1398,6 @@ pub(super) fn render_editor_row(
                             list_marker_color,
                             mono_font_family: theme.mono_font_family.clone(),
                             inline_code_background_color: theme.list_hover,
-                            cursor_color: theme.caret,
-                            cursor_width: px(EDITOR_CURSOR_WIDTH),
                             selection_color: theme.selection,
                         }),
                 ),
