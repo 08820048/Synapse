@@ -203,9 +203,6 @@ const SELECTION_MENU_OFFSET: f32 = 8.0;
 const SELECTION_MENU_BUTTON_SIZE: f32 = 28.0;
 const SELECTION_MENU_WIDTH: f32 = 282.0;
 const SELECTION_LINK_MENU_WIDTH: f32 = 264.0;
-const SELECTION_ASK_PANEL_WIDTH: f32 = 340.0;
-const SELECTION_ASK_PANEL_HEIGHT: f32 = 56.0;
-const SELECTION_ASK_PANEL_GAP: f32 = 8.0;
 const SLASH_MENU_WIDTH: f32 = 208.0;
 const SLASH_MENU_MAX_HEIGHT: f32 = 264.0;
 const SLASH_MENU_ROW_HEIGHT: f32 = 32.0;
@@ -281,7 +278,6 @@ enum SelectionMenuMode {
     #[default]
     Formatting,
     Link,
-    AskAi,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1670,7 +1666,6 @@ struct SynapseApp {
     bookmark_tag_input: Entity<InputState>,
     bookmark_edit_input: Entity<InputState>,
     selection_link_input: Entity<InputState>,
-    selection_ask_input: Entity<InputState>,
     note_link_input: Entity<InputState>,
     bookmark_workspace: BookmarkWorkspace,
     bookmark_tag_editor_open: bool,
@@ -4543,14 +4538,6 @@ pub(crate) fn run() {
                             .placeholder(language.text("粘贴链接…", "Paste a link…"))
                             .clean_on_escape()
                     });
-                    let selection_ask_input = cx.new(|cx| {
-                        InputState::new(window, cx)
-                            .placeholder(language.text(
-                                "希望 AI 如何处理所选内容？",
-                                "What should AI do with this selection?",
-                            ))
-                            .clean_on_escape()
-                    });
                     let note_link_input = cx.new(|cx| {
                         InputState::new(window, cx)
                             .placeholder(language.text("链接到笔记…", "Link to note…"))
@@ -4705,19 +4692,6 @@ pub(crate) fn run() {
                                 },
                             ),
                             cx.subscribe_in(
-                                &selection_ask_input,
-                                window,
-                                |this: &mut SynapseApp, _, event: &InputEvent, window, cx| {
-                                    match event {
-                                        InputEvent::PressEnter { secondary: false } => {
-                                            this.submit_selection_ask_placeholder(window, cx);
-                                        }
-                                        InputEvent::Change => cx.notify(),
-                                        _ => {}
-                                    }
-                                },
-                            ),
-                            cx.subscribe_in(
                                 &note_link_input,
                                 window,
                                 |this: &mut SynapseApp, _, event: &InputEvent, window, cx| {
@@ -4770,7 +4744,6 @@ pub(crate) fn run() {
                             bookmark_tag_input,
                             bookmark_edit_input,
                             selection_link_input,
-                            selection_ask_input,
                             note_link_input,
                             bookmark_workspace,
                             bookmark_tag_editor_open: false,

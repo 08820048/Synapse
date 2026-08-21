@@ -33,13 +33,11 @@ pub enum Icon {
     Check,
     Tag,
     Globe,
-    Sparkles,
     Bold,
     Italic,
     Underline,
     Strikethrough,
     Link,
-    ArrowUp,
     Heading1,
     Heading2,
     Heading3,
@@ -52,7 +50,7 @@ pub enum Icon {
 }
 
 impl Icon {
-    const ALL: [Self; 44] = [
+    const ALL: [Self; 42] = [
         Self::Search,
         Self::Todo,
         Self::Bookmark,
@@ -81,13 +79,11 @@ impl Icon {
         Self::Check,
         Self::Tag,
         Self::Globe,
-        Self::Sparkles,
         Self::Bold,
         Self::Italic,
         Self::Underline,
         Self::Strikethrough,
         Self::Link,
-        Self::ArrowUp,
         Self::Heading1,
         Self::Heading2,
         Self::Heading3,
@@ -129,13 +125,11 @@ impl Icon {
             Self::Check => "lucide/check.svg",
             Self::Tag => "lucide/tag.svg",
             Self::Globe => "lucide/globe.svg",
-            Self::Sparkles => "lucide/sparkles.svg",
             Self::Bold => "lucide/bold.svg",
             Self::Italic => "lucide/italic.svg",
             Self::Underline => "lucide/underline.svg",
             Self::Strikethrough => "lucide/strikethrough.svg",
             Self::Link => "lucide/link.svg",
-            Self::ArrowUp => "lucide/arrow-up.svg",
             Self::Heading1 => "lucide/heading-1.svg",
             Self::Heading2 => "lucide/heading-2.svg",
             Self::Heading3 => "lucide/heading-3.svg",
@@ -238,9 +232,6 @@ impl AssetSource for SynapseAssets {
             "lucide/globe.svg" => Some(include_bytes!(
                 "../../../../../assets/icons/lucide/globe.svg"
             )),
-            "lucide/sparkles.svg" => Some(include_bytes!(
-                "../../../../../assets/icons/lucide/sparkles.svg"
-            )),
             "lucide/bold.svg" => Some(include_bytes!(
                 "../../../../../assets/icons/lucide/bold.svg"
             )),
@@ -255,9 +246,6 @@ impl AssetSource for SynapseAssets {
             )),
             "lucide/link.svg" => Some(include_bytes!(
                 "../../../../../assets/icons/lucide/link.svg"
-            )),
-            "lucide/arrow-up.svg" => Some(include_bytes!(
-                "../../../../../assets/icons/lucide/arrow-up.svg"
             )),
             "lucide/heading-1.svg" => Some(include_bytes!(
                 "../../../../../assets/icons/lucide/heading-1.svg"

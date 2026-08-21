@@ -1254,7 +1254,6 @@ impl Render for SynapseApp {
                     },
                 )
                 .when_some(self.selection_menu_anchor(), |editor, anchor| {
-                    let ask_app = app_entity.clone();
                     let bold_app = app_entity.clone();
                     let italic_app = app_entity.clone();
                     let underline_app = app_entity.clone();
@@ -1262,7 +1261,6 @@ impl Render for SynapseApp {
                     let code_app = app_entity.clone();
                     let link_app = app_entity.clone();
                     let link_confirm_app = app_entity.clone();
-                    let ask_submit_app = app_entity.clone();
                     let mode = self.selection_menu_mode;
                     let bold_active = self.selected_inline_format_active(InlineFormat::Bold);
                     let italic_active = self.selected_inline_format_active(InlineFormat::Italic);
@@ -1272,18 +1270,6 @@ impl Render for SynapseApp {
                         self.selected_inline_format_active(InlineFormat::Strikethrough);
                     let code_active = self.selected_inline_format_active(InlineFormat::Code);
                     let link_active = self.selection_link_active();
-                    let ask_value_empty =
-                        self.selection_ask_input.read(cx).value().trim().is_empty();
-                    let ask_submit_icon_color = if ask_value_empty {
-                        theme.muted_foreground
-                    } else {
-                        theme.background
-                    };
-                    let ask_button_style = ButtonCustomVariant::new(cx)
-                        .color(theme.foreground)
-                        .foreground(theme.background)
-                        .hover(theme.foreground.opacity(0.90))
-                        .active(theme.foreground.opacity(0.82));
                     let formatting_menu = div()
                         .h(px(SELECTION_MENU_HEIGHT))
                         .w(px(SELECTION_MENU_WIDTH))
@@ -1296,36 +1282,6 @@ impl Render for SynapseApp {
                         .bg(theme.popover)
                         .text_color(theme.popover_foreground)
                         .shadow_lg()
-                        .child(
-                            Button::new("selection-ask-ai")
-                                .custom(ask_button_style)
-                                .rounded(ButtonRounded::Size(px(6.0)))
-                                .h(px(28.0))
-                                .flex_none()
-                                .px(px(8.0))
-                                .gap_1()
-                                .text_size(px(12.5))
-                                .font_weight(FontWeight::MEDIUM)
-                                .child(
-                                    Icon::Sparkles
-                                        .render(13.0)
-                                        .flex_none()
-                                        .text_color(theme.background),
-                                )
-                                .child(
-                                    div()
-                                        .flex_none()
-                                        .whitespace_nowrap()
-                                        .text_color(theme.background)
-                                        .child(self.language.text("询问 AI", "Ask AI")),
-                                )
-                                .on_click(move |_, window, cx| {
-                                    ask_app.update(cx, |this, cx| {
-                                        this.toggle_selection_ask(window, cx)
-                                    });
-                                }),
-                        )
-                        .child(selection_menu_divider(&theme))
                         .child(
                             selection_menu_icon_button(
                                 "selection-bold",
@@ -1454,58 +1410,6 @@ impl Render for SynapseApp {
                                     });
                                 }),
                         );
-                    let ask_panel = (mode == SelectionMenuMode::AskAi).then(|| {
-                        div()
-                            .h(px(SELECTION_ASK_PANEL_HEIGHT))
-                            .w(px(SELECTION_ASK_PANEL_WIDTH))
-                            .flex()
-                            .items_center()
-                            .gap_1()
-                            .p_2()
-                            .rounded(px(16.0))
-                            .bg(theme.popover)
-                            .text_color(theme.popover_foreground)
-                            .shadow_xl()
-                            .child(
-                                div().ml_2().flex_none().child(
-                                    Icon::Sparkles
-                                        .render(14.0)
-                                        .text_color(theme.muted_foreground),
-                                ),
-                            )
-                            .child(
-                                Input::new(&self.selection_ask_input)
-                                    .appearance(false)
-                                    .focus_bordered(false)
-                                    .h(px(40.0))
-                                    .flex_1()
-                                    .text_size(px(13.0)),
-                            )
-                            .child(
-                                Button::new("selection-ask-submit")
-                                    .custom(
-                                        ButtonCustomVariant::new(cx)
-                                            .color(theme.foreground)
-                                            .foreground(theme.background)
-                                            .hover(theme.foreground.opacity(0.90))
-                                            .active(theme.foreground.opacity(0.82)),
-                                    )
-                                    .rounded(ButtonRounded::Size(px(20.0)))
-                                    .size(px(40.0))
-                                    .disabled(ask_value_empty)
-                                    .tooltip(self.language.text("发送给 AI", "Send to AI"))
-                                    .child(
-                                        Icon::ArrowUp
-                                            .render(13.5)
-                                            .text_color(ask_submit_icon_color),
-                                    )
-                                    .on_click(move |_, window, cx| {
-                                        ask_submit_app.update(cx, |this, cx| {
-                                            this.submit_selection_ask_placeholder(window, cx)
-                                        });
-                                    }),
-                            )
-                    });
                     let surface = div()
                         .id("editor-selection-menu")
                         .flex()
@@ -1515,7 +1419,6 @@ impl Render for SynapseApp {
                         .on_mouse_down(MouseButton::Left, move |_, _, cx| {
                             cx.stop_propagation();
                         })
-                        .when_some(ask_panel, |surface, panel| surface.child(panel))
                         .child(if mode == SelectionMenuMode::Link {
                             link_menu.into_any_element()
                         } else {
@@ -1527,9 +1430,7 @@ impl Render for SynapseApp {
                             .anchor(Corner::TopLeft)
                             .position(point(
                                 anchor.x
-                                    - px(if mode == SelectionMenuMode::AskAi {
-                                        SELECTION_ASK_PANEL_WIDTH
-                                    } else if mode == SelectionMenuMode::Link {
+                                    - px(if mode == SelectionMenuMode::Link {
                                         SELECTION_LINK_MENU_WIDTH
                                     } else {
                                         SELECTION_MENU_WIDTH

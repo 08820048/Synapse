@@ -16,9 +16,9 @@ without changing SVG attributes or paths. The sidebar Todo collection adds
 `minus` so its collapsed and expanded controls use matching Lucide artwork
 instead of locally drawn strokes.
 
-The editor selection toolbar adds `sparkles`, `bold`, `italic`, `underline`,
-`strikethrough`, `link`, and `arrow-up`. These files keep the Lucide 1.27.0
-artwork unchanged; only whitespace is compacted.
+The editor selection toolbar adds `bold`, `italic`, `underline`, `strikethrough`,
+and `link`. These files keep the Lucide 1.27.0 artwork unchanged; only
+whitespace is compacted.
 
 The native slash-command menu adds `heading-1`, `heading-2`, `heading-3`,
 `list`, `list-ordered`, `text-quote`, and `table`; the existing `link`,

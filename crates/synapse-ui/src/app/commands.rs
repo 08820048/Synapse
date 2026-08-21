@@ -1837,13 +1837,6 @@ impl SynapseApp {
                 language.text("粘贴链接…", "Paste a link…"),
             ),
             (
-                &self.selection_ask_input,
-                language.text(
-                    "希望 AI 如何处理所选内容？",
-                    "What should AI do with this selection?",
-                ),
-            ),
-            (
                 &self.note_link_input,
                 language.text("链接到笔记…", "Link to note…"),
             ),
@@ -3971,14 +3964,9 @@ impl SynapseApp {
             start_layout.bounds.right().max(end.x)
         };
         let center_x = selection_left + (selection_right - selection_left) / 2.0;
-        let panel_stack_height = if self.selection_menu_mode == SelectionMenuMode::AskAi {
-            SELECTION_ASK_PANEL_HEIGHT + SELECTION_ASK_PANEL_GAP
-        } else {
-            0.0
-        };
         Some(point(
             center_x,
-            start.y - px(SELECTION_MENU_OFFSET + SELECTION_MENU_HEIGHT + panel_stack_height),
+            start.y - px(SELECTION_MENU_OFFSET + SELECTION_MENU_HEIGHT),
         ))
     }
 
@@ -4215,23 +4203,6 @@ impl SynapseApp {
         self.close_selection_submenu(window, cx);
     }
 
-    pub(in crate::app) fn toggle_selection_ask(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.selection_menu_mode == SelectionMenuMode::AskAi {
-            self.close_selection_submenu(window, cx);
-            return;
-        }
-        self.selection_ask_input.update(cx, |input, cx| {
-            input.set_value("", window, cx);
-        });
-        self.selection_menu_mode = SelectionMenuMode::AskAi;
-        window.focus(&self.selection_ask_input.focus_handle(cx));
-        cx.notify();
-    }
-
     pub(in crate::app) fn close_selection_submenu(
         &mut self,
         window: &mut Window,
@@ -4240,17 +4211,6 @@ impl SynapseApp {
         self.selection_menu_mode = SelectionMenuMode::Formatting;
         window.focus(&self.editor_focus);
         cx.notify();
-    }
-
-    pub(in crate::app) fn submit_selection_ask_placeholder(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.selection_ask_input.read(cx).value().trim().is_empty() {
-            return;
-        }
-        self.close_selection_submenu(window, cx);
     }
 
     pub(in crate::app) fn editor_char_for_position(
