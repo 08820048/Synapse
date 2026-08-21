@@ -470,6 +470,39 @@ pub fn source_lines_from_buffer_with_syntax_cache(
     code_syntax_cache: &mut CodeSyntaxCache,
     code_syntax_edit: Option<&CodeSyntaxEdit>,
 ) -> Vec<SourceLine> {
+    source_lines_from_buffer_impl(
+        buffer,
+        cursor,
+        dark_mode,
+        code_syntax_cache,
+        code_syntax_edit,
+        true,
+    )
+}
+
+pub fn source_lines_from_buffer_without_code_syntax(
+    buffer: &mut Buffer,
+    cursor: usize,
+    dark_mode: bool,
+) -> Vec<SourceLine> {
+    source_lines_from_buffer_impl(
+        buffer,
+        cursor,
+        dark_mode,
+        &mut CodeSyntaxCache::default(),
+        None,
+        false,
+    )
+}
+
+fn source_lines_from_buffer_impl(
+    buffer: &mut Buffer,
+    cursor: usize,
+    dark_mode: bool,
+    code_syntax_cache: &mut CodeSyntaxCache,
+    code_syntax_edit: Option<&CodeSyntaxEdit>,
+    highlight_code_syntax: bool,
+) -> Vec<SourceLine> {
     let snapshot = buffer.render_snapshot();
     let styles_by_line = snapshot.inline_styles_by_line();
     // The default editor is a persistent rich presentation. Keep the render caret
@@ -587,6 +620,7 @@ pub fn source_lines_from_buffer_with_syntax_cache(
         dark_mode,
         code_syntax_cache,
         code_syntax_edit,
+        highlight_code_syntax,
     );
     reveal_incomplete_fence_input(&mut lines, &raw_lines, cursor);
     annotate_mermaid_blocks(&mut lines, &raw_lines);
@@ -1133,8 +1167,11 @@ fn annotate_code_lines(
     dark_mode: bool,
     code_syntax_cache: &mut CodeSyntaxCache,
     code_syntax_edit: Option<&CodeSyntaxEdit>,
+    highlight_syntax: bool,
 ) {
-    code_syntax_cache.begin_render();
+    if highlight_syntax {
+        code_syntax_cache.begin_render();
+    }
     let limit = lines.len().min(raw_lines.len());
     let mut start = 0;
     while start < limit {
@@ -1183,8 +1220,9 @@ fn annotate_code_lines(
                 content_end_char,
             });
         }
-        if let (Some(first_content), Some(last_content), Some(highlighter_language)) =
-            (first_content, last_content, language.highlighter)
+        if highlight_syntax
+            && let (Some(first_content), Some(last_content), Some(highlighter_language)) =
+                (first_content, last_content, language.highlighter)
         {
             code_syntax_cache.apply(
                 &mut lines[start + first_content..=start + last_content],
@@ -1204,7 +1242,9 @@ fn annotate_code_lines(
         }
         start = end;
     }
-    code_syntax_cache.finish_render();
+    if highlight_syntax {
+        code_syntax_cache.finish_render();
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -4106,6 +4146,18 @@ mod tests {
             cache.entries[0].source,
             "fn main() {\n    println!(\"fast\");\n}"
         );
+    }
+
+    #[test]
+    fn deferred_code_syntax_keeps_code_blocks_renderable_without_highlighting() {
+        let mut buffer: Buffer = "```rust\nfn main() {}\n```".parse().expect("Writ buffer");
+        let mut cache = CodeSyntaxCache::default();
+        let lines =
+            super::source_lines_from_buffer_impl(&mut buffer, 0, false, &mut cache, None, false);
+
+        assert!(lines[1].presentation.code_line.is_some());
+        assert!(cache.entries.is_empty());
+        assert!(cache.staged_entries.is_empty());
     }
 
     #[test]

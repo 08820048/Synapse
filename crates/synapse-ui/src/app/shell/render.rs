@@ -127,6 +127,7 @@ impl Render for SynapseApp {
                     source_mode,
                 )
             });
+            let mut deferred_syntax_snapshot = None;
             let (
                 editor_rows,
                 rich_lines,
@@ -447,6 +448,7 @@ impl Render for SynapseApp {
                             )
                         })
                         .unwrap_or_else(|| (None, CodeSyntaxCache::default(), None));
+                    let defer_code_syntax = !source_mode && cached_writ_buffer.is_none();
                     let text =
                         (source_mode || cached_writ_buffer.is_none()).then(|| document.text());
                     let mut writ_buffer = cached_writ_buffer.unwrap_or_else(|| {
@@ -463,6 +465,12 @@ impl Render for SynapseApp {
                             dark_mode,
                             true,
                         )
+                    } else if defer_code_syntax {
+                        source_lines_from_buffer_without_code_syntax(
+                            &mut writ_buffer,
+                            cursor,
+                            dark_mode,
+                        )
                     } else {
                         source_lines_from_buffer_with_syntax_cache(
                             &mut writ_buffer,
@@ -472,6 +480,16 @@ impl Render for SynapseApp {
                             code_syntax_edit.as_ref(),
                         )
                     };
+                    let syntax_highlight_pending = defer_code_syntax
+                        && parsed_lines.iter().any(|line| {
+                            line.presentation
+                                .code_line
+                                .as_ref()
+                                .is_some_and(|code| !code.is_fence)
+                        });
+                    if syntax_highlight_pending {
+                        deferred_syntax_snapshot = Some(document.text_snapshot());
+                    }
                     let parsed = Rc::new(parsed_lines.into_iter().map(Rc::new).collect::<Vec<_>>());
                     if let Some(previous_lines) = previous_lines {
                         if let Some((old_range, new_count)) =
@@ -542,6 +560,7 @@ impl Render for SynapseApp {
                         writ_buffer,
                         code_syntax_cache,
                         code_syntax_edit: None,
+                        syntax_highlight_pending,
                         lines: parsed.clone(),
                         outline: outline.clone(),
                         mermaid_previews: mermaid_previews.clone(),
@@ -565,6 +584,17 @@ impl Render for SynapseApp {
                     image_previews,
                 )
             };
+            if let Some(snapshot) = deferred_syntax_snapshot {
+                Self::schedule_editor_syntax_highlighting(
+                    snapshot,
+                    vault_root.clone(),
+                    relative_path.clone(),
+                    revision,
+                    dark_mode,
+                    cursor,
+                    cx,
+                );
+            }
             if let Some(lines) = rich_lines.as_ref().filter(|_| !source_mode) {
                 let preview_range =
                     editor_preview_range(self.editor_visible_range.clone(), lines.len());

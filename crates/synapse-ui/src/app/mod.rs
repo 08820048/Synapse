@@ -92,7 +92,8 @@ use self::editor::surface::{
     MarkdownCalloutKind, MarkdownImage, MarkdownInlineFootnote, MarkdownInlineMath,
     MarkdownLineElement, MarkdownTableRow, SourceLine, footnote_preview_line, offset_source_lines,
     plain_source_line, shift_source_lines, source_lines,
-    source_lines_from_buffer_with_syntax_cache, source_lines_with_mode, task_preview_line,
+    source_lines_from_buffer_with_syntax_cache, source_lines_from_buffer_without_code_syntax,
+    source_lines_with_mode, task_preview_line,
 };
 use self::platform::http_client::SynapseHttpClient;
 use self::platform::updater;
@@ -1952,6 +1953,50 @@ impl SynapseApp {
         .detach();
     }
 
+    fn schedule_editor_syntax_highlighting(
+        text_snapshot: NoteTextSnapshot,
+        vault_root: PathBuf,
+        relative_path: PathBuf,
+        revision: u64,
+        dark_mode: bool,
+        cursor: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let task = cx.background_executor().spawn(async move {
+            let text = text_snapshot.text();
+            let mut writ_buffer: writ::buffer::Buffer =
+                text.parse().expect("Writ buffer parsing is infallible");
+            let mut code_syntax_cache = CodeSyntaxCache::default();
+            let lines = source_lines_from_buffer_with_syntax_cache(
+                &mut writ_buffer,
+                cursor,
+                dark_mode,
+                &mut code_syntax_cache,
+                None,
+            );
+            (code_syntax_cache, lines)
+        });
+        cx.spawn(async move |this, cx| {
+            let (code_syntax_cache, lines) = task.await;
+            let _ = this.update(cx, |this, cx| {
+                let Some(cache) = this.editor_render_cache.as_mut() else {
+                    return;
+                };
+                if !cache.matches(&vault_root, &relative_path, revision, dark_mode, false)
+                    || cache.writ_revision != revision
+                    || !cache.syntax_highlight_pending
+                {
+                    return;
+                }
+                cache.code_syntax_cache = code_syntax_cache;
+                cache.lines = Rc::new(lines.into_iter().map(Rc::new).collect());
+                cache.syntax_highlight_pending = false;
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     /// Keeps a large-document viewport cache usable through ordinary single-line edits.
     ///
     /// Rebuilding the entire cache after every keystroke would turn rich Markdown back into a
@@ -2154,6 +2199,7 @@ struct EditorRenderCache {
     writ_buffer: writ::buffer::Buffer,
     code_syntax_cache: CodeSyntaxCache,
     code_syntax_edit: Option<CodeSyntaxEdit>,
+    syntax_highlight_pending: bool,
     lines: Rc<Vec<Rc<SourceLine>>>,
     outline: Rc<Vec<DocumentOutlineEntry>>,
     mermaid_previews: Rc<BTreeMap<usize, MermaidPreview>>,
@@ -6060,6 +6106,7 @@ mod tests {
             writ_buffer: "".parse().unwrap(),
             code_syntax_cache: super::CodeSyntaxCache::default(),
             code_syntax_edit: None,
+            syntax_highlight_pending: false,
             lines: Rc::new(Vec::new()),
             outline: Rc::new(Vec::new()),
             mermaid_previews: Rc::new(Default::default()),
