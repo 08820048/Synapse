@@ -38,7 +38,7 @@ use gpui_animation::{
     transition::{Transition, general::EaseInOutCubic, general::EaseOutQuad},
 };
 use gpui_component::{
-    ActiveTheme, Disableable as _, IconName, Root, Sizable as _, Theme, ThemeMode, TitleBar,
+    ActiveTheme, Disableable as _, IconName, Root, Sizable as _, Theme, ThemeMode,
     WindowExt as _,
     alert::Alert,
     button::{Button, ButtonCustomVariant, ButtonRounded, ButtonVariant, ButtonVariants as _},
@@ -3305,9 +3305,6 @@ impl Render for SettingsWindow {
             .flex()
             .flex_col()
             .bg(cx.theme().background)
-            .when(cfg!(target_os = "macos"), |this| {
-                this.child(render_settings_titlebar())
-            })
             .child(
                 div()
                     .flex_1()
@@ -3324,10 +3321,6 @@ impl Render for SettingsWindow {
             )
             .children(component_layers)
     }
-}
-
-fn render_settings_titlebar() -> impl IntoElement {
-    TitleBar::new()
 }
 
 fn render_settings_content(

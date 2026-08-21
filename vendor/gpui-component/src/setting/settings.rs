@@ -1,5 +1,5 @@
 use crate::{
-    IconName, Sizable, Size, StyledExt,
+    IconName, Sizable, Size, StyledExt, TITLE_BAR_HEIGHT,
     group_box::GroupBoxVariant,
     input::{Input, InputState},
     resizable::{h_resizable, resizable_panel},
@@ -7,8 +7,9 @@ use crate::{
     sidebar::{Sidebar, SidebarMenu, SidebarMenuItem},
 };
 use gpui::{
-    App, AppContext as _, Axis, ElementId, Entity, IntoElement, ParentElement as _, Pixels,
-    RenderOnce, StyleRefinement, Styled, Window, div, prelude::FluentBuilder as _, px, relative,
+    App, AppContext as _, Axis, ElementId, Entity, InteractiveElement as _, IntoElement,
+    ParentElement as _, Pixels, RenderOnce, StyleRefinement, Styled, Window, WindowControlArea, div,
+    prelude::FluentBuilder as _, px, relative,
 };
 use rust_i18n::t;
 
@@ -154,6 +155,18 @@ impl Settings {
                 div()
                     .w(search_input_width)
                     .flex_none()
+                    .flex()
+                    .flex_col()
+                    .when(cfg!(target_os = "macos"), |this| {
+                        this.child(
+                            div()
+                                .id("settings-sidebar-traffic-light-inset")
+                                .w_full()
+                                .h(TITLE_BAR_HEIGHT)
+                                .flex_none()
+                                .window_control_area(WindowControlArea::Drag),
+                        )
+                    })
                     .child(
                         Input::new(&search_input)
                             .w(search_input_width)
