@@ -959,12 +959,16 @@ fn prune_collapsed_directories(
     collapsed_directories: &mut BTreeSet<PathBuf>,
     entries: &[VaultEntry],
 ) {
-    let existing_directories = entries
+    let existing_directories = collapsed_directories_from_entries(entries);
+    collapsed_directories.retain(|path| existing_directories.contains(path));
+}
+
+fn collapsed_directories_from_entries(entries: &[VaultEntry]) -> BTreeSet<PathBuf> {
+    entries
         .iter()
         .filter(|entry| entry.kind == VaultEntryKind::Directory)
         .map(|entry| entry.relative_path.clone())
-        .collect::<BTreeSet<_>>();
-    collapsed_directories.retain(|path| existing_directories.contains(path));
+        .collect()
 }
 
 fn build_file_tree_rows(
@@ -4406,6 +4410,7 @@ pub(crate) fn run() {
             state.set_error_message(error.to_string());
         }
     }
+    let collapsed_directories = collapsed_directories_from_entries(&state.entries);
     let theme_preference = load_theme_preference();
     let language = load_language_preference();
     let auto_clear_completed_todos = load_auto_clear_completed_todos_preference();
@@ -4807,7 +4812,7 @@ pub(crate) fn run() {
                             context_menu_closing: false,
                             context_menu_generation: 0,
                             inline_rename: None,
-                            collapsed_directories: BTreeSet::new(),
+                            collapsed_directories,
                             editor_marked_range: None,
                             editor_selection: EditorSelection::collapsed(0),
                             code_auto_pair_document: None,
@@ -6350,6 +6355,49 @@ mod tests {
                 name: "folder".to_owned(),
                 depth: 0,
             }]
+        );
+    }
+
+    #[test]
+    fn folders_start_collapsed_and_expanding_parent_keeps_children_collapsed() {
+        let entries = [
+            VaultEntry {
+                relative_path: PathBuf::from("parent"),
+                name: "parent".to_owned(),
+                kind: VaultEntryKind::Directory,
+            },
+            VaultEntry {
+                relative_path: PathBuf::from("parent/child"),
+                name: "child".to_owned(),
+                kind: VaultEntryKind::Directory,
+            },
+            VaultEntry {
+                relative_path: PathBuf::from("parent/child/note.md"),
+                name: "note".to_owned(),
+                kind: VaultEntryKind::Note,
+            },
+        ];
+        let mut collapsed = super::collapsed_directories_from_entries(&entries);
+
+        assert_eq!(
+            collapsed,
+            BTreeSet::from([PathBuf::from("parent"), PathBuf::from("parent/child"),])
+        );
+        collapsed.remove(Path::new("parent"));
+        assert_eq!(
+            build_file_tree_rows(&entries, &collapsed),
+            vec![
+                FileTreeRow::Directory {
+                    relative_path: PathBuf::from("parent"),
+                    name: "parent".to_owned(),
+                    depth: 0,
+                },
+                FileTreeRow::Directory {
+                    relative_path: PathBuf::from("parent/child"),
+                    name: "child".to_owned(),
+                    depth: 1,
+                },
+            ]
         );
     }
 

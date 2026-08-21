@@ -507,6 +507,7 @@ impl ShellState {
         if self.active_tab.is_none() && !self.tabs.is_empty() {
             self.active_tab = Some(0);
         }
+        self.group_pinned_tabs();
         self.refresh_active_status();
         Ok(restored)
     }
@@ -530,6 +531,7 @@ impl ShellState {
                 active
             }
         });
+        self.group_pinned_tabs();
         Ok(())
     }
 
@@ -895,9 +897,13 @@ impl ShellState {
 
     pub fn toggle_tab_pin(&mut self, index: usize) -> Result<bool, SessionError> {
         self.ensure_valid_tab(index)?;
-        let tab = &mut self.tabs[index];
-        tab.pinned = !tab.pinned;
-        Ok(tab.pinned)
+        let pinned = {
+            let tab = &mut self.tabs[index];
+            tab.pinned = !tab.pinned;
+            tab.pinned
+        };
+        self.group_pinned_tabs();
+        Ok(pinned)
     }
 
     pub fn close_tab(&mut self, index: usize) -> Result<bool, SessionError> {
@@ -1037,6 +1043,19 @@ impl ShellState {
 
     fn unpinned_indices_in(&self, range: std::ops::Range<usize>) -> Vec<usize> {
         range.filter(|&index| !self.tabs[index].pinned).collect()
+    }
+
+    fn group_pinned_tabs(&mut self) {
+        let active_path = self
+            .active_tab
+            .and_then(|index| self.tabs.get(index))
+            .map(|tab| tab.document.relative_path().to_path_buf());
+        self.tabs.sort_by_key(|tab| !tab.pinned);
+        self.active_tab = active_path.and_then(|path| {
+            self.tabs
+                .iter()
+                .position(|tab| tab.document.relative_path() == path)
+        });
     }
 
     fn close_tabs_at_indices(
@@ -1870,10 +1889,21 @@ mod tests {
         }
 
         assert!(state.toggle_tab_pin(1).unwrap());
-        assert!(state.tabs()[1].is_pinned);
-        assert!(!state.toggle_tab_pin(1).unwrap());
-        assert!(!state.tabs()[1].is_pinned);
-        assert!(state.toggle_tab_pin(1).unwrap());
+        assert_eq!(
+            state
+                .tabs()
+                .into_iter()
+                .map(|tab| (tab.relative_path, tab.is_pinned))
+                .collect::<Vec<_>>(),
+            vec![
+                (PathBuf::from("b.md"), true),
+                (PathBuf::from("a.md"), false),
+                (PathBuf::from("c.md"), false),
+            ]
+        );
+        assert_eq!(state.active_tab_index(), Some(2));
+        assert!(!state.toggle_tab_pin(0).unwrap());
+        assert!(state.toggle_tab_pin(0).unwrap());
 
         assert_eq!(state.close_all_tabs().unwrap(), 2);
         assert_eq!(state.tabs().len(), 1);
@@ -2338,8 +2368,8 @@ mod tests {
                 Some(1),
             )
             .unwrap();
-        assert_eq!(state.active_tab_index(), Some(1));
-        state.reorder_tab(1, 0).unwrap();
+        assert_eq!(state.active_tab_index(), Some(0));
+        state.reorder_tab(2, 0).unwrap();
         assert_eq!(state.tabs()[0].relative_path, PathBuf::from("two.md"));
         assert_eq!(state.active_tab_index(), Some(0));
         let (paths, active) = state.session_snapshot();
@@ -2347,8 +2377,8 @@ mod tests {
             paths,
             [
                 (PathBuf::from("two.md"), 1, true),
-                (PathBuf::from("one.md"), 0, false),
                 (PathBuf::from("three.md"), 0, false),
+                (PathBuf::from("one.md"), 0, false),
             ]
         );
         assert_eq!(active, Some(0));

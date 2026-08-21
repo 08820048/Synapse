@@ -1890,7 +1890,8 @@ impl SynapseApp {
                                                 "Workspace preference could not be saved: {error}"
                                             )
                                         });
-                                    this.collapsed_directories.clear();
+                                    this.collapsed_directories =
+                                        collapsed_directories_from_entries(&this.state.entries);
                                     this.editor_selection.collapse(0);
                                     this.editor_marked_range = None;
                                     this.restart_vault_watcher(cx);
