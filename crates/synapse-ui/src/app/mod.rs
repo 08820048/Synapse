@@ -3507,6 +3507,7 @@ fn render_settings_content(
             .items_center()
             .justify_end()
             .gap_3()
+            .pr_1()
             .child(
                 div()
                     .max_w(px(360.0))
@@ -3560,6 +3561,7 @@ fn render_settings_content(
             .items_center()
             .justify_end()
             .gap_3()
+            .pr_1()
             .child(
                 div()
                     .max_w(px(280.0))
