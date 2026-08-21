@@ -3306,7 +3306,7 @@ impl Render for SettingsWindow {
             .flex_col()
             .bg(cx.theme().background)
             .when(cfg!(target_os = "macos"), |this| {
-                this.child(render_settings_titlebar(language, cx))
+                this.child(render_settings_titlebar())
             })
             .child(
                 div()
@@ -3326,20 +3326,8 @@ impl Render for SettingsWindow {
     }
 }
 
-fn render_settings_titlebar(language: AppLanguage, cx: &mut App) -> impl IntoElement {
-    TitleBar::new().child(
-        div()
-            .flex()
-            .flex_1()
-            .h_full()
-            .items_center()
-            .justify_center()
-            .pr(px(80.0))
-            .text_size(px(13.0))
-            .font_weight(FontWeight::MEDIUM)
-            .text_color(cx.theme().muted_foreground)
-            .child(language.text("Synapse 设置", "Synapse Settings")),
-    )
+fn render_settings_titlebar() -> impl IntoElement {
+    TitleBar::new()
 }
 
 fn render_settings_content(
@@ -3608,7 +3596,7 @@ fn render_settings_content(
         language.as_str()
     )))
         .sidebar_width(px(SETTINGS_SIDEBAR_WIDTH))
-        .with_group_variant(GroupBoxVariant::Outline)
+        .with_group_variant(GroupBoxVariant::Normal)
         .page(
             SettingPage::new(language.text("常规", "General"))
                 .default_open(true)
