@@ -38,8 +38,7 @@ use gpui_animation::{
     transition::{Transition, general::EaseInOutCubic, general::EaseOutQuad},
 };
 use gpui_component::{
-    ActiveTheme, Disableable as _, IconName, Root, Sizable as _, Theme, ThemeMode,
-    WindowExt as _,
+    ActiveTheme, Disableable as _, IconName, Root, Sizable as _, Theme, ThemeMode, WindowExt as _,
     alert::Alert,
     button::{Button, ButtonCustomVariant, ButtonRounded, ButtonVariant, ButtonVariants as _},
     dialog::DialogButtonProps,
