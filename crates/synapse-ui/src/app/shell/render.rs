@@ -3493,6 +3493,9 @@ impl Render for SynapseApp {
             let open_vault_app = app_entity.clone();
             let todo_app = app_entity.clone();
             let bookmarks_app = app_entity.clone();
+            let toggle_agent_app = app_entity.clone();
+            let new_agent_session_app = app_entity.clone();
+            let focus_agent_app = app_entity.clone();
             let settings_app = app_entity.clone();
             let update_app = app_entity.clone();
             div()
@@ -3680,12 +3683,89 @@ impl Render for SynapseApp {
                                     });
                                 }),
                         )
+                        .child(
+                            Button::new("palette-toggle-agent")
+                                .ghost()
+                                .when(
+                                    self.command_palette_selected == palette_search_count + 4,
+                                    |button| {
+                                        button.bg(theme.secondary).text_color(theme.foreground)
+                                    },
+                                )
+                                .w_full()
+                                .h(px(38.0))
+                                .justify_start()
+                                .child(Icon::Sparkles.render(17.0))
+                                .child(div().flex_1().child(
+                                    self.language.text("切换 Agent 面板", "Toggle Agent Panel"),
+                                ))
+                                .on_click(move |_, window, cx| {
+                                    cx.stop_propagation();
+                                    toggle_agent_app.update(cx, |this, cx| {
+                                        this.dismiss_command_palette(cx);
+                                        this.toggle_agent_panel(window, cx);
+                                    });
+                                }),
+                        )
+                        .child(
+                            Button::new("palette-new-agent-session")
+                                .ghost()
+                                .when(
+                                    self.command_palette_selected == palette_search_count + 5,
+                                    |button| {
+                                        button.bg(theme.secondary).text_color(theme.foreground)
+                                    },
+                                )
+                                .w_full()
+                                .h(px(38.0))
+                                .justify_start()
+                                .child(Icon::Plus.render(17.0))
+                                .child(div().flex_1().child(
+                                    self.language.text("新建 Agent 会话", "New Agent Session"),
+                                ))
+                                .on_click(move |_, window, cx| {
+                                    cx.stop_propagation();
+                                    new_agent_session_app.update(cx, |this, cx| {
+                                        this.dismiss_command_palette(cx);
+                                        this.agent_panel_open = true;
+                                        this.agent_panel_closing = false;
+                                        this.new_agent_session(window, cx);
+                                    });
+                                }),
+                        )
+                        .child(
+                            Button::new("palette-focus-agent-prompt")
+                                .ghost()
+                                .when(
+                                    self.command_palette_selected == palette_search_count + 6,
+                                    |button| {
+                                        button.bg(theme.secondary).text_color(theme.foreground)
+                                    },
+                                )
+                                .w_full()
+                                .h(px(38.0))
+                                .justify_start()
+                                .child(Icon::ArrowUp.render(17.0))
+                                .child(div().flex_1().child(
+                                    self.language.text("聚焦 Agent 输入", "Focus Agent Prompt"),
+                                ))
+                                .on_click(move |_, window, cx| {
+                                    cx.stop_propagation();
+                                    focus_agent_app.update(cx, |this, cx| {
+                                        this.dismiss_command_palette(cx);
+                                        this.agent_panel_open = true;
+                                        this.agent_panel_closing = false;
+                                        window.focus(&this.agent_prompt_input.focus_handle(cx));
+                                        cx.notify();
+                                    });
+                                }),
+                        )
                         .child(div().h(px(1.0)).mx_2().my_2().bg(theme.border))
                         .child(
                             Button::new("palette-check-updates")
                                 .ghost()
                                 .when(
-                                    self.command_palette_selected == palette_search_count + 4,
+                                    self.command_palette_selected == palette_search_count + 7,
                                     |button| {
                                         button.bg(theme.secondary).text_color(theme.foreground)
                                     },
@@ -3715,7 +3795,7 @@ impl Render for SynapseApp {
                             Button::new("palette-settings")
                                 .ghost()
                                 .when(
-                                    self.command_palette_selected == palette_search_count + 5,
+                                    self.command_palette_selected == palette_search_count + 8,
                                     |button| {
                                         button.bg(theme.secondary).text_color(theme.foreground)
                                     },
@@ -3746,6 +3826,824 @@ impl Render for SynapseApp {
                 .into_any_element()
         });
 
+        if self.agent_panel_open && self.agent_panel_layout.read(cx).sizes().len() != 2 {
+            self.agent_panel_layout = cx.new(|_| ResizableState::default());
+        }
+        let agent_panel_width = (viewport_width * 0.44)
+            .clamp(408.0, 640.0)
+            .min((viewport_width - 24.0).max(320.0));
+        let agent_panel = (self.agent_panel_open || self.agent_panel_closing).then(|| {
+            let close_app = app_entity.clone();
+            let new_session_app = app_entity.clone();
+            let send_app = app_entity.clone();
+            let agent_running = self.agent_running;
+            let active_session_id = self.agent_active_metadata_id.clone();
+            let renaming_session_id = self.agent_renaming_session_id.clone();
+            let sessions = self
+                .state
+                .vault_root()
+                .map(|root| {
+                    self.agent_sessions
+                        .iter()
+                        .filter(|session| session.vault_path == root)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let history_open = self.agent_history_open;
+            let history_app = app_entity.clone();
+            let attachments = self.agent_attachments.clone();
+            let include_active_note = self.agent_include_active_note;
+            let pending_permission = self
+                .agent_pending_permission
+                .as_ref()
+                .map(|permission| (permission.tool_title.clone(), permission.options.clone()));
+            let transcript = self.agent_transcript.clone();
+            let transcript_empty = transcript.is_empty();
+            let status = self.agent_status.clone();
+            let agent_suggestions = [
+                self.language
+                    .text(
+                        "总结我最近修改的笔记",
+                        "Summarize my recently changed notes",
+                    )
+                    .to_owned(),
+                self.language
+                    .text(
+                        "找出笔记中尚未完成的想法",
+                        "Find unfinished ideas in my notes",
+                    )
+                    .to_owned(),
+                self.language
+                    .text("哪些笔记之间可能有关联？", "Which notes might be related?")
+                    .to_owned(),
+            ];
+            div()
+                .id("agent-panel")
+                .flex()
+                .flex_col()
+                .size_full()
+                .overflow_hidden()
+                .border_l_1()
+                .border_color(theme.sidebar_border)
+                .bg(theme.background)
+                .text_color(theme.foreground)
+                .opacity(1.0)
+                .when(
+                    self.agent_panel_open && !self.agent_panel_closing,
+                    |panel| panel.occlude(),
+                )
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
+                .child(
+                    div()
+                        .relative()
+                        .h(px(56.0))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .px_3()
+                        .child(
+                            div()
+                                .w(px(80.0))
+                                .flex()
+                                .items_center()
+                                .child(
+                                    Button::new("toggle-agent-history")
+                                        .ghost()
+                                        .size(px(40.0))
+                                        .tooltip(self.language.text(
+                                            "会话记录",
+                                            "Conversation history",
+                                        ))
+                                        .child(
+                                            Icon::List
+                                                .render(16.0)
+                                                .text_color(theme.muted_foreground),
+                                        )
+                                        .on_click(move |_, _window, cx| {
+                                            history_app.update(cx, |this, cx| {
+                                                this.toggle_agent_history(cx);
+                                            });
+                                        }),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .min_w(px(0.0))
+                                .flex_1()
+                                .flex()
+                                .justify_center()
+                                .child(
+                                    Button::new("new-agent-session")
+                                        .outline()
+                                        .rounded(ButtonRounded::Size(px(18.0)))
+                                        .h(px(34.0))
+                                        .px(px(14.0))
+                                        .disabled(agent_running)
+                                        .tooltip(self.language.text("新建会话", "New session"))
+                                        .label(self.language.text("新建会话", "New Chat"))
+                                        .on_click(move |_, window, cx| {
+                                            new_session_app.update(cx, |this, cx| {
+                                                this.new_agent_session(window, cx);
+                                            });
+                                        }),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .w(px(80.0))
+                                .flex()
+                                .items_center()
+                                .justify_end()
+                                .child(
+                                    Button::new("close-agent-panel")
+                                        .ghost()
+                                        .size(px(40.0))
+                                        .tooltip(
+                                            self.language
+                                                .text("关闭 Agent 面板", "Close Agent panel"),
+                                        )
+                                        .child(
+                                            Icon::Close
+                                                .render(16.0)
+                                                .text_color(theme.muted_foreground),
+                                        )
+                                        .on_click(move |_, window, cx| {
+                                            close_app.update(cx, |this, cx| {
+                                                this.toggle_agent_panel(window, cx);
+                                            });
+                                        }),
+                                ),
+                        ),
+                )
+                .when(history_open, |panel| {
+                    panel.child(
+                        div()
+                            .id("agent-history-popover")
+                            .absolute()
+                            .top(px(50.0))
+                            .left(px(8.0))
+                            .w(px(304.0))
+                            .max_h(px(420.0))
+                            .overflow_y_scroll()
+                            .p_2()
+                            .rounded(px(14.0))
+                            .border_1()
+                            .border_color(theme.border)
+                            .bg(theme.popover)
+                            .text_color(theme.popover_foreground)
+                            .shadow_lg()
+                            .occlude()
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                cx.stop_propagation()
+                            })
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .px_2()
+                                    .pb_2()
+                                    .text_size(px(11.0))
+                                    .text_color(theme.muted_foreground)
+                                    .child(self.language.text(
+                                        "会话记录",
+                                        "Conversation History",
+                                    )),
+                            )
+                            .children(sessions.into_iter().rev().map(|session| {
+                                let select_app = app_entity.clone();
+                                let rename_app = app_entity.clone();
+                                let delete_app = app_entity.clone();
+                                let select_id = session.id.clone();
+                                let rename_id = session.id.clone();
+                                let delete_id = session.id.clone();
+                                let selected = active_session_id.as_deref()
+                                    == Some(session.id.as_str());
+                                let renaming = renaming_session_id.as_deref()
+                                    == Some(session.id.as_str());
+                                div()
+                                    .id(SharedString::from(format!(
+                                        "agent-history-session-{}",
+                                        session.id
+                                    )))
+                                    .h(px(42.0))
+                                    .w_full()
+                                    .flex_none()
+                                    .flex()
+                                    .items_center()
+                                    .rounded(px(10.0))
+                                    .when(selected, |row| row.bg(theme.secondary))
+                                    .child(if renaming {
+                                        div()
+                                            .flex_1()
+                                            .min_w(px(0.0))
+                                            .h_full()
+                                            .child(
+                                                Input::new(&self.agent_session_name_input)
+                                                    .appearance(false)
+                                                    .focus_bordered(true),
+                                            )
+                                            .into_any_element()
+                                    } else {
+                                        Button::new(SharedString::from(format!(
+                                            "select-agent-history-session-{}",
+                                            session.id
+                                        )))
+                                        .text()
+                                        .flex_1()
+                                        .h_full()
+                                        .justify_start()
+                                        .label(session.title)
+                                        .on_click(move |_, window, cx| {
+                                            select_app.update(cx, |this, cx| {
+                                                this.select_agent_session(
+                                                    &select_id,
+                                                    window,
+                                                    cx,
+                                                );
+                                            });
+                                        })
+                                        .into_any_element()
+                                    })
+                                    .when(!renaming, |row| {
+                                        row.child(
+                                            Button::new(SharedString::from(format!(
+                                                "rename-agent-session-{}",
+                                                session.id
+                                            )))
+                                            .ghost()
+                                            .size(px(32.0))
+                                            .disabled(agent_running)
+                                            .text_color(theme.muted_foreground)
+                                            .tooltip(
+                                                self.language.text("重命名会话", "Rename session"),
+                                            )
+                                            .child(
+                                                Icon::Rename
+                                                    .render(13.0)
+                                                    .text_color(theme.muted_foreground),
+                                            )
+                                            .on_click(move |_, window, cx| {
+                                                rename_app.update(cx, |this, cx| {
+                                                    this.begin_rename_agent_session(
+                                                        &rename_id,
+                                                        window,
+                                                        cx,
+                                                    );
+                                                });
+                                            }),
+                                        )
+                                    })
+                                    .child(
+                                        Button::new(SharedString::from(format!(
+                                            "delete-agent-session-{}",
+                                            session.id
+                                        )))
+                                        .ghost()
+                                        .size(px(32.0))
+                                        .disabled(agent_running)
+                                        .text_color(theme.muted_foreground)
+                                        .tooltip(
+                                            self.language.text("删除会话", "Delete session"),
+                                        )
+                                        .child(
+                                            Icon::Trash
+                                                .render(13.0)
+                                                .text_color(theme.muted_foreground),
+                                        )
+                                        .on_click(move |_, _, cx| {
+                                            delete_app.update(cx, |this, cx| {
+                                                this.delete_agent_session(&delete_id, cx);
+                                            });
+                                        }),
+                                    )
+                            })),
+                    )
+                })
+                .child(
+                    div()
+                        .id("agent-transcript")
+                        .flex_1()
+                        .min_h(px(0.0))
+                        .overflow_y_scroll()
+                        .px(px(20.0))
+                        .py(px(24.0))
+                        .flex()
+                        .flex_col()
+                        .when(transcript_empty, |view| {
+                            view.items_center().justify_center().child(
+                                div()
+                                    .w_full()
+                                    .max_w(px(336.0))
+                                    .flex()
+                                    .flex_col()
+                                    .child(
+                                        div()
+                                            .size(px(32.0))
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .rounded(px(16.0))
+                                            .bg(theme.muted)
+                                            .text_color(theme.muted_foreground)
+                                            .child(Icon::Sparkles.render(14.0)),
+                                    )
+                                    .child(
+                                        div()
+                                            .mt_4()
+                                            .text_size(px(20.0))
+                                            .line_height(px(28.0))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .child(self.language.text(
+                                                "询问你的笔记库",
+                                                "Ask about your vault",
+                                            )),
+                                    )
+                                    .child(
+                                        div()
+                                            .mt_2()
+                                            .text_size(px(12.5))
+                                            .line_height(px(20.0))
+                                            .text_color(theme.muted_foreground)
+                                            .child(self.language.text(
+                                                "Pi 可以阅读笔记、运行命令并协助你整理当前工作。",
+                                                "Pi can read notes, run commands, and help organize your current work.",
+                                            )),
+                                    )
+                                    .child(
+                                        div()
+                                            .mt_5()
+                                            .pt_3()
+                                            .border_t_1()
+                                            .border_color(theme.border)
+                                            .flex()
+                                            .flex_col()
+                                            .gap_1()
+                                            .children(agent_suggestions.into_iter().enumerate().map(
+                                                |(index, suggestion)| {
+                                                    let prompt_input =
+                                                        self.agent_prompt_input.clone();
+                                                    Button::new(SharedString::from(format!(
+                                                        "agent-suggestion-{index}"
+                                                    )))
+                                                    .text()
+                                                    .w_full()
+                                                    .h(px(40.0))
+                                                    .justify_start()
+                                                    .label(suggestion.clone())
+                                                    .on_click(move |_, window, cx| {
+                                                        prompt_input.update(cx, |input, cx| {
+                                                            input.set_value(
+                                                                suggestion.clone(),
+                                                                window,
+                                                                cx,
+                                                            );
+                                                        });
+                                                        window.focus(&prompt_input.focus_handle(cx));
+                                                    })
+                                                },
+                                            )),
+                                    ),
+                            )
+                        })
+                        .children(transcript.into_iter().enumerate().map(|(index, item)| {
+                            let section = div()
+                                .flex()
+                                .flex_col()
+                                .pb(px(20.0))
+                                .when(index > 0, |section| {
+                                    section
+                                        .pt(px(20.0))
+                                        .border_t_1()
+                                        .border_color(theme.border)
+                                });
+                            match item {
+                                AgentTranscriptItem::User(text) => section
+                                    .child(
+                                        div()
+                                            .mb_2()
+                                            .font_family(".SystemUIFontMonospaced")
+                                            .text_size(px(10.0))
+                                            .text_color(theme.muted_foreground)
+                                            .child(self.language.text("你", "YOU")),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(13.0))
+                                            .line_height(px(22.0))
+                                            .child(text),
+                                    )
+                                    .into_any_element(),
+                                AgentTranscriptItem::Assistant(text) => section
+                                    .child(
+                                        div()
+                                            .mb_2()
+                                            .flex()
+                                            .items_center()
+                                            .gap_2()
+                                            .font_family(".SystemUIFontMonospaced")
+                                            .text_size(px(10.0))
+                                            .text_color(theme.muted_foreground)
+                                            .child(Icon::Sparkles.render(13.0))
+                                            .child("PI"),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(13.0))
+                                            .line_height(px(22.0))
+                                            .child(text),
+                                    )
+                                    .into_any_element(),
+                                AgentTranscriptItem::Tool(tool) => section
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_start()
+                                            .gap_2()
+                                            .text_size(px(11.5))
+                                            .line_height(px(18.0))
+                                            .text_color(theme.muted_foreground)
+                                            .child(Icon::Code.render(13.0))
+                                            .child(tool.display_text()),
+                                    )
+                                    .into_any_element(),
+                                AgentTranscriptItem::System(text) => section
+                                    .child(
+                                        div()
+                                            .text_size(px(11.5))
+                                            .line_height(px(18.0))
+                                            .text_color(theme.muted_foreground)
+                                            .child(text),
+                                    )
+                                    .into_any_element(),
+                            }
+                        })),
+                )
+                .when_some(status, |panel, status| {
+                    panel.child(
+                        div()
+                            .px(px(20.0))
+                            .pb_2()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(
+                                div()
+                                    .size(px(6.0))
+                                    .rounded(px(3.0))
+                                    .bg(theme.muted_foreground),
+                            )
+                            .child(status),
+                    )
+                })
+                .when_some(pending_permission, |panel, (tool_title, options)| {
+                    panel.child(
+                        div()
+                            .mx(px(20.0))
+                            .mb_2()
+                            .p_3()
+                            .flex_none()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .rounded(px(16.0))
+                            .border_1()
+                            .border_color(theme.warning)
+                            .bg(theme.warning.opacity(0.08))
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(self.language.text(
+                                        "Pi 请求执行工具",
+                                        "Pi requests permission",
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(theme.muted_foreground)
+                                    .child(tool_title),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_wrap()
+                                    .gap_2()
+                                    .children(options.into_iter().map(|option| {
+                                        let permission_app = app_entity.clone();
+                                        let option_id = option.id.clone();
+                                        Button::new(SharedString::from(format!(
+                                            "agent-permission-{option_id}"
+                                        )))
+                                        .when(option.allows(), |button| button.primary())
+                                        .when(!option.allows(), |button| button.outline())
+                                        .small()
+                                        .label(option.name)
+                                        .on_click(move |_, _, cx| {
+                                            permission_app.update(cx, |this, cx| {
+                                                this.respond_agent_permission(
+                                                    Some(option_id.clone()),
+                                                    cx,
+                                                );
+                                            });
+                                        })
+                                    }))
+                                    .child({
+                                        let cancel_permission_app = app_entity.clone();
+                                        Button::new("cancel-agent-permission")
+                                            .ghost()
+                                            .small()
+                                            .label(self.language.text("取消", "Cancel"))
+                                            .on_click(move |_, _, cx| {
+                                                cancel_permission_app.update(cx, |this, cx| {
+                                                    this.respond_agent_permission(None, cx);
+                                                });
+                                            })
+                                    }),
+                            ),
+                    )
+                })
+                .child({
+                    let toggle_context_app = app_entity.clone();
+                    let attach_note_app = app_entity.clone();
+                    let attach_vault_app = app_entity.clone();
+                    let prompt_empty = self
+                        .agent_prompt_input
+                        .read(cx)
+                        .value()
+                        .trim()
+                        .is_empty();
+                    div()
+                        .flex_none()
+                        .px(px(20.0))
+                        .pt_2()
+                        .pb_4()
+                        .child(
+                            div()
+                                .p_2()
+                                .rounded(px(16.0))
+                                .border_1()
+                                .border_color(theme.border)
+                                .bg(theme.background)
+                                .children((!attachments.is_empty()).then(|| {
+                                    div().mb_1().flex().flex_wrap().gap_1().children(
+                                        attachments.into_iter().enumerate().map(
+                                            |(index, attachment)| {
+                                                let remove_app = app_entity.clone();
+                                                let label = Path::new(
+                                                    attachment
+                                                        .uri
+                                                        .strip_prefix("file://")
+                                                        .unwrap_or(&attachment.uri),
+                                                )
+                                                .file_name()
+                                                .map(|name| name.to_string_lossy().into_owned())
+                                                .unwrap_or(attachment.uri);
+                                                Button::new(SharedString::from(format!(
+                                                    "remove-agent-attachment-{index}"
+                                                )))
+                                                .outline()
+                                                .xsmall()
+                                                .label(label)
+                                                .child(Icon::Close.render(11.0))
+                                                .on_click(move |_, _, cx| {
+                                                    remove_app.update(cx, |this, cx| {
+                                                        this.remove_agent_attachment(index, cx);
+                                                    });
+                                                })
+                                            },
+                                        ),
+                                    )
+                                }))
+                                .child(
+                                    Input::new(&self.agent_prompt_input)
+                                        .appearance(false)
+                                        .focus_bordered(false),
+                                )
+                                .child(
+                                    div()
+                                        .h(px(40.0))
+                                        .flex()
+                                        .items_center()
+                                        .justify_between()
+                                        .pl_1()
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .items_center()
+                                                .gap_1()
+                                                .child(
+                                                    Button::new("toggle-active-note-context")
+                                                        .custom(
+                                                            ButtonCustomVariant::new(cx)
+                                                                .color(theme.transparent)
+                                                                .foreground(theme.muted_foreground)
+                                                                .hover(theme.muted)
+                                                                .active(theme.secondary),
+                                                        )
+                                                        .size(px(32.0))
+                                                        .when(include_active_note, |button| {
+                                                            button.bg(theme.muted)
+                                                        })
+                                                        .tooltip(if include_active_note {
+                                                            self.language.text(
+                                                                "不再自动附加当前笔记",
+                                                                "Stop attaching the current note",
+                                                            )
+                                                        } else {
+                                                            self.language.text(
+                                                                "自动附加当前笔记",
+                                                                "Attach the current note",
+                                                            )
+                                                        })
+                                                        .child(
+                                                            if include_active_note {
+                                                                Icon::Pin
+                                                                    .render(14.0)
+                                                                    .text_color(theme.foreground)
+                                                            } else {
+                                                                Icon::PinOff
+                                                                    .render(14.0)
+                                                                    .text_color(theme.muted_foreground)
+                                                            },
+                                                        )
+                                                        .on_click(move |_, _, cx| {
+                                                            toggle_context_app.update(
+                                                                cx,
+                                                                |this, cx| {
+                                                                    this.toggle_agent_active_note_context(cx);
+                                                                },
+                                                            );
+                                                        }),
+                                                )
+                                                .child(
+                                                    Button::new("attach-active-note")
+                                                        .custom(
+                                                            ButtonCustomVariant::new(cx)
+                                                                .color(theme.transparent)
+                                                                .foreground(theme.muted_foreground)
+                                                                .hover(theme.muted)
+                                                                .active(theme.secondary),
+                                                        )
+                                                        .size(px(32.0))
+                                                        .tooltip(self.language.text(
+                                                            "保留当前笔记",
+                                                            "Keep current note",
+                                                        ))
+                                                        .child(
+                                                            Icon::FileText
+                                                                .render(14.0)
+                                                                .text_color(theme.muted_foreground),
+                                                        )
+                                                        .on_click(move |_, _, cx| {
+                                                            attach_note_app.update(
+                                                                cx,
+                                                                |this, cx| {
+                                                                    this.attach_active_note_to_agent(cx);
+                                                                },
+                                                            );
+                                                        }),
+                                                )
+                                                .child(
+                                                    Button::new("attach-vault-notes")
+                                                        .custom(
+                                                            ButtonCustomVariant::new(cx)
+                                                                .color(theme.transparent)
+                                                                .foreground(theme.muted_foreground)
+                                                                .hover(theme.muted)
+                                                                .active(theme.secondary),
+                                                        )
+                                                        .size(px(32.0))
+                                                        .tooltip(self.language.text(
+                                                            "附加 Vault 笔记",
+                                                            "Attach Vault notes",
+                                                        ))
+                                                        .child(
+                                                            Icon::FolderPlus
+                                                                .render(14.0)
+                                                                .text_color(theme.muted_foreground),
+                                                        )
+                                                        .on_click(move |_, window, cx| {
+                                                            attach_vault_app.update(
+                                                                cx,
+                                                                |this, cx| {
+                                                                    this.attach_vault_notes_to_agent(
+                                                                        window, cx,
+                                                                    );
+                                                                },
+                                                            );
+                                                        }),
+                                                ),
+                                        )
+                                        .child(
+                                            Button::new("send-agent-prompt")
+                                                .custom(
+                                                    ButtonCustomVariant::new(cx)
+                                                        .color(theme.foreground)
+                                                        .foreground(theme.background)
+                                                        .hover(theme.foreground.opacity(0.90))
+                                                        .active(theme.foreground.opacity(0.82)),
+                                                )
+                                                .rounded(ButtonRounded::Size(px(16.0)))
+                                                .size(px(32.0))
+                                                .disabled(!agent_running && prompt_empty)
+                                                .when(!agent_running && prompt_empty, |button| {
+                                                    button.invisible()
+                                                })
+                                                .tooltip(if agent_running {
+                                                    self.language.text("停止", "Stop")
+                                                } else {
+                                                    self.language.text("发送", "Send")
+                                                })
+                                                .icon(if agent_running {
+                                                    IconName::Close
+                                                } else {
+                                                    IconName::ArrowUp
+                                                })
+                                                .on_click(move |_, window, cx| {
+                                                    send_app.update(cx, |this, cx| {
+                                                        if agent_running {
+                                                            this.stop_agent(cx);
+                                                        } else {
+                                                            this.send_agent_prompt(window, cx);
+                                                        }
+                                                    });
+                                                }),
+                                        ),
+                                ),
+                        )
+                })
+                .with_transition("agent-panel-width-transition")
+                .transition_when_else(
+                    self.agent_panel_open && !self.agent_panel_closing,
+                    PANEL_TRANSITION,
+                    MarkdPanelSpring,
+                    |style| style.w_full(),
+                    |style| style.w(px(0.0)),
+                )
+                .into_any_element()
+        });
+        let agent_launcher = (!self.agent_panel_open && !self.agent_panel_closing).then(|| {
+            let launcher_app = app_entity.clone();
+            Button::new("toggle-agent-panel")
+                .absolute()
+                .right(px(20.0))
+                .bottom(px(20.0))
+                .custom(
+                    ButtonCustomVariant::new(cx)
+                        .color(theme.foreground)
+                        .foreground(theme.background)
+                        .hover(theme.foreground.opacity(0.90))
+                        .active(theme.foreground.opacity(0.82)),
+                )
+                .rounded(ButtonRounded::Size(px(24.0)))
+                .size(px(48.0))
+                .child(Icon::Sparkles.render(18.0).text_color(theme.background))
+                .tooltip(self.language.text("打开 Agent", "Open Agent"))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(move |_, window, cx| {
+                    launcher_app.update(cx, |this, cx| {
+                        this.toggle_agent_panel(window, cx);
+                    });
+                })
+                .into_any_element()
+        });
+
+        let editor_panel = resizable_panel().child(
+            div()
+                .id("editor-workspace")
+                .h_full()
+                .flex_1()
+                .min_h(px(0.0))
+                .min_w(px(0.0))
+                .overflow_hidden()
+                .flex()
+                .flex_col()
+                .bg(theme.background)
+                .children(editor_toolbar)
+                .child(editor_body),
+        );
+        let agent_layout = if self.agent_panel_open || self.agent_panel_closing {
+            h_resizable("agent-layout")
+                .with_state(&self.agent_panel_layout)
+                .child(editor_panel)
+                .child(
+                    resizable_panel()
+                        .size(px(agent_panel_width))
+                        .size_range(px(360.0)..px(720.0))
+                        .child(agent_panel.unwrap_or_else(|| div().into_any_element())),
+                )
+        } else {
+            h_resizable("agent-layout")
+                .with_state(&self.agent_panel_layout)
+                .child(editor_panel)
+        };
+
         div()
             .size_full()
             .relative()
@@ -3754,25 +4652,23 @@ impl Render for SynapseApp {
             .bg(theme.background)
             .text_color(theme.foreground)
             .on_action(cx.listener(Self::open_command_palette_action))
+            .on_action(cx.listener(Self::toggle_agent_panel_action))
             .capture_any_mouse_down(cx.listener(|this, _, _, cx| {
                 this.dismiss_context_menus(cx);
             }))
             .child(left_sidebar)
             .child(
                 div()
-                    .id("editor-workspace")
                     .h_full()
                     .flex_1()
                     .min_h(px(0.0))
                     .min_w(px(0.0))
-                    .overflow_hidden()
                     .flex()
                     .flex_col()
-                    .bg(theme.background)
                     .child(tab_bar)
-                    .children(editor_toolbar)
-                    .child(editor_body),
+                    .child(div().flex_1().min_h(px(0.0)).child(agent_layout)),
             )
+            .children(agent_launcher)
             .children(context_menu)
             .children(tree_context_menu)
             .children(editor_context_menu)

@@ -48,9 +48,9 @@ MACOS_DIR="$CONTENTS/MacOS"
 RESOURCES_DIR="$CONTENTS/Resources"
 ICON_SOURCE="$PROJECT_ROOT/assets/branding/synapse-app-icon.icns"
 VERSION="$(awk -F '"' '/^version = "/ { print $2; exit }' Cargo.toml)"
-CARGO_PROFILE_FLAG=()
+CARGO_PROFILE_FLAG=""
 if [[ "$PROFILE" == "release" ]]; then
-    CARGO_PROFILE_FLAG=(--release)
+    CARGO_PROFILE_FLAG="--release"
 fi
 
 if [[ -z "$VERSION" ]]; then
@@ -78,8 +78,8 @@ build_binary() {
 
     if [[ "$UNIVERSAL" == true ]]; then
         rustup target add aarch64-apple-darwin x86_64-apple-darwin
-        cargo build -p synapse "${CARGO_PROFILE_FLAG[@]}" --target aarch64-apple-darwin
-        cargo build -p synapse "${CARGO_PROFILE_FLAG[@]}" --target x86_64-apple-darwin
+        cargo build -p synapse ${CARGO_PROFILE_FLAG:+"$CARGO_PROFILE_FLAG"} --target aarch64-apple-darwin
+        cargo build -p synapse ${CARGO_PROFILE_FLAG:+"$CARGO_PROFILE_FLAG"} --target x86_64-apple-darwin
         lipo -create \
             "$PROJECT_ROOT/target/aarch64-apple-darwin/$PROFILE/synapse" \
             "$PROJECT_ROOT/target/x86_64-apple-darwin/$PROFILE/synapse" \
@@ -87,7 +87,7 @@ build_binary() {
         return
     fi
 
-    cargo build -p synapse "${CARGO_PROFILE_FLAG[@]}" --target "$native_target"
+    cargo build -p synapse ${CARGO_PROFILE_FLAG:+"$CARGO_PROFILE_FLAG"} --target "$native_target"
     install -m 755 \
         "$PROJECT_ROOT/target/$native_target/$PROFILE/synapse" \
         "$destination"

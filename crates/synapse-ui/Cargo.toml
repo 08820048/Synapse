@@ -10,7 +10,9 @@ homepage.workspace = true
 description.workspace = true
 
 [dependencies]
+agent-client-protocol.workspace = true
 futures.workspace = true
+getrandom.workspace = true
 notify.workspace = true
 gpui.workspace = true
 gpui-animation.workspace = true
@@ -22,6 +24,7 @@ ratex-svg.workspace = true
 ratex-types.workspace = true
 rusty-mermaid.workspace = true
 reqwest.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 synapse-core.workspace = true
 tokio.workspace = true

@@ -14,11 +14,13 @@ homepage = "https://github.com/08820048/Synapse"
 description = "A fast, native, local-first Markdown editor built with Rust and GPUI"
 
 [workspace.dependencies]
+agent-client-protocol = "=2.0.0"
 gpui = { version = "=0.2.2", features = ["runtime_shaders"] }
 gpui-animation = "=0.2.63"
 gpui-component = { path = "vendor/gpui-component" }
 gpui-component-assets = "=0.5.1"
 futures = "=0.3.33"
+getrandom = "=0.3.4"
 notify = "=7.0.0"
 reqwest = { package = "zed-reqwest", version = "=0.12.15-zed", default-features = false, features = ["charset", "http2", "macos-system-configuration", "rustls-tls-native-roots", "stream"] }
 ropey = "=1.6.1"
@@ -28,6 +30,7 @@ ratex-svg = { version = "=0.1.14", features = ["embed-fonts"] }
 ratex-types = "=0.1.14"
 rusty-mermaid = { version = "=0.2.0", features = ["svg"] }
 serde_json = "=1.0.151"
+serde = { version = "=1.0.229", features = ["derive"] }
 synapse-core = { path = "crates/synapse-core" }
 tokio = { version = "=1.53.1", features = ["rt-multi-thread", "time"] }
 trash = "=5.2.6"

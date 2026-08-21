@@ -131,10 +131,8 @@ impl ShellState {
             return Err(SessionError::NoVault);
         };
         let mut changed = false;
+        let mut conflicts = Vec::new();
         for index in 0..self.tabs.len() {
-            if self.tabs[index].history.is_dirty() {
-                continue;
-            }
             let path = self.tabs[index].document.relative_path().to_path_buf();
             let document = match vault.open_note(&path) {
                 Ok(document) => document,
@@ -142,13 +140,40 @@ impl ShellState {
                 Err(error) => return Err(SessionError::Vault(error)),
             };
             let text = document.text();
+            if self.tabs[index].history.is_dirty() {
+                if text != self.tabs[index].saved_text {
+                    conflicts.push(path);
+                }
+                continue;
+            }
             if text == self.tabs[index].saved_text {
                 continue;
             }
-            self.tabs[index].cursor = self.tabs[index].cursor.min(document.len_chars());
-            self.tabs[index].document = document;
-            self.tabs[index].saved_text = text;
+            let tab = &mut self.tabs[index];
+            let previous_text = std::mem::replace(&mut tab.saved_text, text.clone());
+            let previous_cursor = tab.cursor;
+            tab.cursor = tab.cursor.min(document.len_chars());
+            tab.history.break_coalesce();
+            tab.history.push(HistoryEntry {
+                start: 0,
+                deleted: previous_text,
+                inserted: text,
+                cursor_before: previous_cursor,
+                cursor_after: tab.cursor,
+            });
+            tab.history.mark_saved();
+            tab.document = document;
             changed = true;
+        }
+        if !conflicts.is_empty() {
+            self.set_error_message(format!(
+                "External changes were preserved alongside dirty editor buffers: {}",
+                conflicts
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
         }
         Ok(changed)
     }
@@ -891,6 +916,32 @@ impl ShellState {
                 Err(error)
             }
         }
+    }
+
+    /// Saves every dirty tab before an external agent is allowed to mutate files.
+    /// The originally active tab is restored even when a save fails.
+    pub fn save_all_dirty(&mut self) -> Result<usize, SessionError> {
+        let original_active = self.active_tab;
+        let dirty_tabs: Vec<_> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .filter_map(|(index, tab)| tab.history.is_dirty().then_some(index))
+            .collect();
+        let mut saved = 0;
+        for index in dirty_tabs {
+            self.active_tab = Some(index);
+            match self.save_active() {
+                Ok(true) => saved += 1,
+                Ok(false) => {}
+                Err(error) => {
+                    self.active_tab = original_active;
+                    return Err(error);
+                }
+            }
+        }
+        self.active_tab = original_active;
+        Ok(saved)
     }
 
     pub fn toggle_tab_pin(&mut self, index: usize) -> Result<bool, SessionError> {
@@ -2380,14 +2431,51 @@ mod tests {
         fs::write(&path, "external").unwrap();
         assert!(state.refresh_external_documents().unwrap());
         assert_eq!(state.active_document().unwrap().text(), "external");
+        assert!(state.undo().unwrap().is_some());
+        assert_eq!(state.active_document().unwrap().text(), "original");
+        assert!(state.redo().unwrap().is_some());
+        assert_eq!(state.active_document().unwrap().text(), "external");
 
         state.insert_text("local ").unwrap();
         fs::write(&path, "new external").unwrap();
+        assert!(!state.refresh_external_documents().unwrap());
+        assert_eq!(state.active_document().unwrap().text(), "local external");
+        assert!(state.status_message().contains("note.md"));
         assert!(matches!(
             state.save_active(),
             Err(super::SessionError::ExternalConflict(_))
         ));
         assert_eq!(fs::read_to_string(path).unwrap(), "new external");
+    }
+
+    #[test]
+    fn save_all_dirty_persists_every_tab_and_restores_the_active_tab() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("first.md"), "one").unwrap();
+        fs::write(directory.path().join("second.md"), "two").unwrap();
+        let mut state =
+            ShellState::from_vault_argument(Some(OsString::from(directory.path().as_os_str())));
+
+        state.select_note(Path::new("first.md")).unwrap();
+        state.select_note(Path::new("second.md")).unwrap();
+        state.active_tab = Some(0);
+        state.move_end();
+        state.insert_text("!").unwrap();
+        state.active_tab = Some(1);
+        state.move_end();
+        state.insert_text("!").unwrap();
+
+        assert_eq!(state.save_all_dirty().unwrap(), 2);
+        assert_eq!(state.active_tab_index(), Some(1));
+        assert!(state.tabs().iter().all(|tab| !tab.is_dirty));
+        assert_eq!(
+            fs::read_to_string(directory.path().join("first.md")).unwrap(),
+            "one!"
+        );
+        assert_eq!(
+            fs::read_to_string(directory.path().join("second.md")).unwrap(),
+            "two!"
+        );
     }
 
     #[test]
