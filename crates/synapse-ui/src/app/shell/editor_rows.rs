@@ -1,5 +1,7 @@
 use super::super::*;
 
+const EDITOR_COMPACT_BLANK_LINE_HEIGHT: f32 = 8.0;
+
 #[derive(Clone)]
 pub(super) struct EditorRowContext {
     pub(super) line_count: usize,
@@ -1027,6 +1029,12 @@ pub(in crate::app) fn code_block_edges(
     )
 }
 
+fn editor_line_is_compact_blank(line: &SourceLine, active: bool) -> bool {
+    !active
+        && line.presentation.kind == MarkdownBlockKind::Paragraph
+        && line.presentation.display.is_empty()
+}
+
 pub(super) fn render_editor_row(
     index: usize,
     line: Rc<SourceLine>,
@@ -1175,6 +1183,7 @@ pub(super) fn render_editor_row(
     if code_line.is_some_and(|code| code.is_fence) {
         return div().h(px(0.0)).overflow_hidden().into_any_element();
     }
+    let compact_blank = editor_line_is_compact_blank(&line, active);
     let (code_first, code_last) = code_block_edges(code_line);
     let code_header = code_line.filter(|code| code.is_first_content).map(|code| {
         (
@@ -1208,16 +1217,20 @@ pub(super) fn render_editor_row(
                         .w_full()
                         .min_w(px(0.0))
                         .items_start()
-                        .min_h(match kind {
-                            MarkdownBlockKind::Heading(1) => px(56.8),
-                            MarkdownBlockKind::Heading(2) => px(49.2),
-                            MarkdownBlockKind::Heading(3) => px(44.4),
-                            MarkdownBlockKind::Heading(4) => px(40.0),
-                            MarkdownBlockKind::Heading(_) => px(EDITOR_BODY_LINE_HEIGHT),
-                            MarkdownBlockKind::ThematicBreak => px(24.0),
-                            MarkdownBlockKind::Code => px(CODE_BLOCK_LINE_HEIGHT),
-                            MarkdownBlockKind::Source => px(24.0),
-                            _ => px(EDITOR_BODY_LINE_HEIGHT),
+                        .min_h(if compact_blank {
+                            px(EDITOR_COMPACT_BLANK_LINE_HEIGHT)
+                        } else {
+                            match kind {
+                                MarkdownBlockKind::Heading(1) => px(56.8),
+                                MarkdownBlockKind::Heading(2) => px(49.2),
+                                MarkdownBlockKind::Heading(3) => px(44.4),
+                                MarkdownBlockKind::Heading(4) => px(40.0),
+                                MarkdownBlockKind::Heading(_) => px(EDITOR_BODY_LINE_HEIGHT),
+                                MarkdownBlockKind::ThematicBreak => px(24.0),
+                                MarkdownBlockKind::Code => px(CODE_BLOCK_LINE_HEIGHT),
+                                MarkdownBlockKind::Source => px(24.0),
+                                _ => px(EDITOR_BODY_LINE_HEIGHT),
+                            }
                         })
                         .cursor(CursorStyle::IBeam)
                         .font_family("Inter")
@@ -1270,18 +1283,25 @@ pub(super) fn render_editor_row(
                                 .font_weight(FontWeight::NORMAL)
                         })
                         .when(
-                            !matches!(
-                                kind,
-                                MarkdownBlockKind::Heading(_)
-                                    | MarkdownBlockKind::Code
-                                    | MarkdownBlockKind::Source
-                            ),
+                            !compact_blank
+                                && !matches!(
+                                    kind,
+                                    MarkdownBlockKind::Heading(_)
+                                        | MarkdownBlockKind::Code
+                                        | MarkdownBlockKind::Source
+                                ),
                             move |style| {
                                 style
                                     .text_size(px(EDITOR_BODY_FONT_SIZE))
                                     .line_height(px(EDITOR_BODY_LINE_HEIGHT))
                             },
                         )
+                        .when(compact_blank, |style| {
+                            style
+                                .h(px(EDITOR_COMPACT_BLANK_LINE_HEIGHT))
+                                .line_height(px(EDITOR_COMPACT_BLANK_LINE_HEIGHT))
+                                .overflow_hidden()
+                        })
                         .when(matches!(kind, MarkdownBlockKind::Code), |style| {
                             style
                                 .flex_col()
@@ -1396,4 +1416,24 @@ pub(super) fn render_editor_row(
                 ),
         )
         .into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inactive_markdown_separator_lines_are_compact_but_active_lines_remain_editable() {
+        let lines = editor_surface::source_lines(
+            "# Heading\n\n| Column |\n| --- |\n| Value |\n\n```rust\nlet value = 1;\n```",
+            0,
+            false,
+        );
+
+        assert!(editor_line_is_compact_blank(&lines[1], false));
+        assert!(editor_line_is_compact_blank(&lines[5], false));
+        assert!(!editor_line_is_compact_blank(&lines[1], true));
+        assert!(!editor_line_is_compact_blank(&lines[0], false));
+        assert_eq!(EDITOR_COMPACT_BLANK_LINE_HEIGHT, 8.0);
+    }
 }
