@@ -3518,7 +3518,6 @@ fn render_settings_content(
             .child(
                 Button::new("change-vault-from-settings")
                     .outline()
-                    .h(px(40.0))
                     .with_size(options.size)
                     .icon(IconName::FolderOpen)
                     .label(language.text("更换", "Change"))
@@ -3571,12 +3570,11 @@ fn render_settings_content(
             )
             .child(
                 Button::new("check-for-updates")
-                    .outline()
-                    .h(px(40.0))
+                    .primary()
                     .with_size(options.size)
                     .icon(IconName::ArrowDown)
                     .label(language.text("检查", "Check"))
-                    .disabled(checking)
+                    .loading(checking)
                     .on_click(move |_, window, cx| {
                         app.update(cx, |this, cx| {
                             this.check_for_updates(UpdateCheckOrigin::Manual, window, cx);

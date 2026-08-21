@@ -165,7 +165,6 @@ impl SettingItem {
                     field,
                 } => div()
                     .w_full()
-                    .overflow_hidden()
                     .map(|this| {
                         if layout.is_horizontal() {
                             this.h_flex().justify_between().items_start()
