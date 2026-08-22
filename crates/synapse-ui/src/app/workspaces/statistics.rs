@@ -25,7 +25,7 @@ pub(in crate::app) enum StatisticsState {
     #[default]
     Empty,
     Loading,
-    Ready(StatisticsSnapshot),
+    Ready(Box<StatisticsSnapshot>),
     Failed(String),
 }
 
@@ -260,41 +260,37 @@ pub(in crate::app) fn render_statistics_workspace(
     cx: &mut Context<SynapseApp>,
 ) -> AnyElement {
     match state {
-        StatisticsState::Empty => return render_empty(theme, language),
-        StatisticsState::Loading => {
-            return div()
-                .id("statistics-loading")
-                .size_full()
-                .flex()
-                .flex_col()
-                .items_center()
-                .justify_center()
-                .gap_3()
-                .bg(theme.background)
-                .text_color(theme.muted)
-                .child(Spinner::new().color(theme.muted))
-                .child(language.text("正在统计笔记…", "Calculating note statistics…"))
-                .into_any_element();
-        }
-        StatisticsState::Failed(error) => {
-            return div()
-                .id("statistics-failed")
-                .size_full()
-                .flex()
-                .flex_col()
-                .items_center()
-                .justify_center()
-                .gap_3()
-                .bg(theme.background)
-                .child(ComponentIcon::new(IconName::TriangleAlert).size(px(28.0)))
-                .child(
-                    div()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .child(language.text("无法读取统计数据", "Unable to read statistics")),
-                )
-                .child(div().text_sm().text_color(theme.muted).child(error.clone()))
-                .into_any_element();
-        }
+        StatisticsState::Empty => render_empty(theme, language),
+        StatisticsState::Loading => div()
+            .id("statistics-loading")
+            .size_full()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap_3()
+            .bg(theme.background)
+            .text_color(theme.muted)
+            .child(Spinner::new().color(theme.muted))
+            .child(language.text("正在统计笔记…", "Calculating note statistics…"))
+            .into_any_element(),
+        StatisticsState::Failed(error) => div()
+            .id("statistics-failed")
+            .size_full()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap_3()
+            .bg(theme.background)
+            .child(ComponentIcon::new(IconName::TriangleAlert).size(px(28.0)))
+            .child(
+                div()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(language.text("无法读取统计数据", "Unable to read statistics")),
+            )
+            .child(div().text_sm().text_color(theme.muted).child(error.clone()))
+            .into_any_element(),
         StatisticsState::Ready(snapshot) => render_snapshot(snapshot, theme, language, cx),
     }
 }
@@ -841,13 +837,12 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        StatisticsSnapshot, StatisticsState, collect_statistics, format_bytes, freshness_bucket,
-        length_bucket,
+        StatisticsState, collect_statistics, format_bytes, freshness_bucket, length_bucket,
     };
 
     #[test]
     fn ready_statistics_are_reused_until_the_vault_changes() {
-        let state = StatisticsState::Ready(StatisticsSnapshot::default());
+        let state = StatisticsState::Ready(Box::default());
 
         assert!(!state.needs_refresh(false, false));
         assert!(state.needs_refresh(true, false));

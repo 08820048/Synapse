@@ -1743,7 +1743,7 @@ impl SynapseApp {
                 this.statistics_refreshing = false;
                 match result {
                     Ok(snapshot) => {
-                        this.statistics = StatisticsState::Ready(snapshot);
+                        this.statistics = StatisticsState::Ready(Box::new(snapshot));
                         this.statistics_stale = false;
                     }
                     Err(error) => {
