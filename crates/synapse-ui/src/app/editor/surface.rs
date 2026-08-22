@@ -622,7 +622,7 @@ fn source_lines_from_buffer_impl(
         code_syntax_edit,
         highlight_code_syntax,
     );
-    reveal_incomplete_fence_input(&mut lines, &raw_lines, cursor);
+    reveal_incomplete_block_input(&mut lines, &raw_lines, cursor);
     annotate_mermaid_blocks(&mut lines, &raw_lines);
     annotate_math(&mut lines, &raw_lines);
     annotate_task_items(&mut lines, &raw_lines);
@@ -631,7 +631,7 @@ fn source_lines_from_buffer_impl(
     lines
 }
 
-fn reveal_incomplete_fence_input(lines: &mut [SourceLine], raw_lines: &[&str], cursor: usize) {
+fn reveal_incomplete_block_input(lines: &mut [SourceLine], raw_lines: &[&str], cursor: usize) {
     for index in 0..lines.len().min(raw_lines.len()) {
         let line_start = lines[index].start_char;
         let line_end = line_start + lines[index].source_len_chars;
@@ -647,6 +647,11 @@ fn reveal_incomplete_fence_input(lines: &mut [SourceLine], raw_lines: &[&str], c
             continue;
         }
         let rest = &source[indentation..];
+        let input_len = rest.chars().count();
+        if (1..=6).contains(&input_len) && rest.chars().all(|character| character == '#') {
+            lines[index].presentation = raw_source_presentation(source);
+            continue;
+        }
         let Some(marker) = rest.chars().next() else {
             continue;
         };
@@ -3715,6 +3720,24 @@ mod tests {
         assert_eq!(line.display_char_for_source(3), 0);
         assert_eq!(line.source_char_for_display(0), 0);
         assert!(line.runs.iter().all(|run| !run.bold));
+    }
+
+    #[test]
+    fn incomplete_heading_markers_stay_visible_until_the_required_space_is_typed() {
+        for source in ["#", "##", "###", "######"] {
+            let line = source_lines(source, source.chars().count(), false);
+            assert_eq!(line[0].presentation.display, source);
+            assert_eq!(line[0].presentation.kind, MarkdownBlockKind::Source);
+        }
+
+        assert_eq!(
+            present_markdown_line("## 标题").kind,
+            MarkdownBlockKind::Heading(2)
+        );
+        assert_eq!(
+            present_markdown_line("##标题").kind,
+            MarkdownBlockKind::Paragraph
+        );
     }
 
     #[test]
