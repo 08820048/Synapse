@@ -27,6 +27,13 @@ struct MermaidPreviewStyle {
     danger: Hsla,
 }
 
+#[derive(Clone, Copy)]
+struct ImagePreviewStyle {
+    muted: Hsla,
+    border: Hsla,
+    selection_border: Hsla,
+}
+
 #[derive(Clone)]
 struct TaskPreviewStyle {
     foreground: Hsla,
@@ -494,9 +501,7 @@ fn render_markdown_image_block(
     row_context: &EditorRowContext,
     image: &MarkdownImage,
     preview: Option<&MarkdownImagePreview>,
-    muted: Hsla,
-    border: Hsla,
-    selection_border: Hsla,
+    style: ImagePreviewStyle,
 ) -> AnyElement {
     let active =
         (line.start_char..=line.start_char + line.source_len_chars).contains(&row_context.cursor);
@@ -515,24 +520,29 @@ fn render_markdown_image_block(
                     markdown_image_placeholder(
                         loading_alt.clone(),
                         "Loading image…".into(),
-                        muted,
-                        border,
+                        style.muted,
+                        style.border,
                     )
                 })
                 .with_fallback(move || {
                     markdown_image_placeholder(
                         fallback_alt.clone(),
                         "Unable to load image".into(),
-                        muted,
-                        border,
+                        style.muted,
+                        style.border,
                     )
                 })
                 .into_any_element()
         }
         Some(MarkdownImagePreview::Error(error)) => {
-            markdown_image_placeholder(alt, error.clone(), muted, border)
+            markdown_image_placeholder(alt, error.clone(), style.muted, style.border)
         }
-        _ => markdown_image_placeholder(alt, "Image preview unavailable".into(), muted, border),
+        _ => markdown_image_placeholder(
+            alt,
+            "Image preview unavailable".into(),
+            style.muted,
+            style.border,
+        ),
     };
 
     div()
@@ -564,7 +574,11 @@ fn render_markdown_image_block(
                             div()
                                 .max_w_full()
                                 .border_2()
-                                .border_color(selection_border.alpha(if active { 1.0 } else { 0.0 }))
+                                .border_color(style.selection_border.alpha(if active {
+                                    1.0
+                                } else {
+                                    0.0
+                                }))
                                 .child(content),
                         )
                         .child(editor_block_layout_canvas(index, line, row_context, active)),
@@ -1091,9 +1105,11 @@ pub(super) fn render_editor_row(
             row_context,
             image,
             row_context.image_previews.get(&image.source_start_char),
-            theme.muted_foreground,
-            theme.border,
-            theme.ring,
+            ImagePreviewStyle {
+                muted: theme.muted_foreground,
+                border: theme.border,
+                selection_border: theme.ring,
+            },
         );
     }
     if line.presentation.footnote_definition.is_some() {

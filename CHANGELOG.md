@@ -4,6 +4,14 @@ All notable changes to Synapse are recorded here. The format follows [Keep a Cha
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-08-22
+
+### Fixed
+
+- Inline-format shortcuts now provide a predictable exit path while preserving native macOS double-space punctuation
+- Clicking rendered images no longer places the caret inside image Markdown, and clicking below a trailing image creates an editable paragraph
+- CI checks now handle Git line endings consistently and pass cross-platform formatting and clippy validation
+
 ## [0.3.0] - 2026-08-22
 
 ### Added
