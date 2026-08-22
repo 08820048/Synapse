@@ -453,10 +453,12 @@ impl SynapseApp {
         let Some(root) = self.state.vault_root().map(Path::to_path_buf) else {
             return;
         };
+        let watched_root = root.clone();
         let (sender, mut receiver) = futures::channel::mpsc::unbounded();
         let watcher =
             notify::recommended_watcher(
                 move |result: notify::Result<notify::Event>| match result {
+                    Ok(event) if paths_only_touch_git_metadata(&watched_root, &event.paths) => {}
                     Ok(event) if !matches!(event.kind, EventKind::Access(_)) => {
                         let _ = sender.unbounded_send(Ok(()));
                     }
@@ -544,6 +546,7 @@ impl SynapseApp {
                     (Ok(_), Ok(_)) => {}
                     _ => cx.notify(),
                 }
+                this.schedule_git_status_refresh(cx);
             });
         })
         .detach();
@@ -1560,6 +1563,335 @@ impl SynapseApp {
         cx.notify();
     }
 
+    pub(in crate::app) fn refresh_git_status(&mut self, cx: &mut Context<Self>) {
+        self.git_generation = self.git_generation.wrapping_add(1);
+        let generation = self.git_generation;
+        let Some(root) = self.state.vault_root().map(Path::to_path_buf) else {
+            self.git_integration = GitIntegrationState::NotRepository;
+            cx.notify();
+            return;
+        };
+        if self.git_integration.status().is_none() {
+            self.git_integration = GitIntegrationState::Checking;
+            cx.notify();
+        }
+        let previous_status = self.git_integration.status().cloned();
+        let task = cx
+            .background_executor()
+            .spawn(async move { inspect_repository(&root) });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |this, cx| {
+                if this.git_generation != generation {
+                    return;
+                }
+                this.git_integration = match result {
+                    Ok(status) => GitIntegrationState::Ready(status),
+                    Err(GitError::GitUnavailable) => GitIntegrationState::Unavailable,
+                    Err(GitError::NotRepository) => GitIntegrationState::NotRepository,
+                    Err(error) => GitIntegrationState::Failed {
+                        status: previous_status,
+                        error,
+                    },
+                };
+                if let Some(path) = this.git_diff.path().map(Path::to_path_buf) {
+                    let still_changed = this.git_integration.status().is_some_and(|status| {
+                        status.changes.iter().any(|change| change.path == path)
+                    });
+                    if still_changed && this.workspace_view == WorkspaceView::Git {
+                        this.select_git_change(path, cx);
+                    } else if !still_changed {
+                        this.git_diff = GitDiffState::Empty;
+                    }
+                }
+                this.select_default_git_change(cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn schedule_git_status_refresh(&mut self, cx: &mut Context<Self>) {
+        if self.git_integration.status().is_none() || self.git_integration.is_busy() {
+            return;
+        }
+        self.git_refresh_generation = self.git_refresh_generation.wrapping_add(1);
+        let generation = self.git_refresh_generation;
+        let timer = cx.background_executor().timer(GIT_STATUS_REFRESH_DEBOUNCE);
+        cx.spawn(async move |this, cx| {
+            timer.await;
+            let _ = this.update(cx, |this, cx| {
+                if this.git_refresh_generation == generation && !this.git_integration.is_busy() {
+                    this.refresh_git_status(cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    pub(in crate::app) fn toggle_git_quick_picker(&mut self, cx: &mut Context<Self>) {
+        self.git_quick_open = !self.git_quick_open;
+        if self.git_quick_open {
+            self.dismiss_command_palette(cx);
+            self.dismiss_context_menus(cx);
+            if self.git_integration.status().is_none() {
+                self.refresh_git_status(cx);
+            }
+        }
+        cx.notify();
+    }
+
+    pub(in crate::app) fn open_git_workspace(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.state.active_is_dirty() {
+            if let Err(error) = self.state.save_active() {
+                push_alert_notification(
+                    window,
+                    cx,
+                    AppNotificationVariant::Error,
+                    self.language
+                        .text("无法打开 Git 工作区", "Unable to open Git workspace"),
+                    error.to_string(),
+                );
+                return;
+            }
+            let _ = clear_recovery_preference();
+            self.persist_session();
+            self.refresh_git_status(cx);
+        }
+        self.workspace_view = WorkspaceView::Git;
+        self.selection_menu_mode = SelectionMenuMode::Formatting;
+        self.clear_slash_surfaces_immediately();
+        self.dismiss_command_palette(cx);
+        self.dismiss_context_menus(cx);
+        if self.git_integration.status().is_none() {
+            self.refresh_git_status(cx);
+        }
+        self.select_default_git_change(cx);
+        window.focus(&self.git_commit_input.focus_handle(cx));
+        cx.notify();
+    }
+
+    fn select_default_git_change(&mut self, cx: &mut Context<Self>) {
+        if self.workspace_view != WorkspaceView::Git {
+            return;
+        }
+        if let Some(path) = default_git_change(self.git_integration.status(), self.git_diff.path())
+        {
+            self.select_git_change(path, cx);
+        }
+    }
+
+    pub(in crate::app) fn select_git_change(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if !self
+            .git_integration
+            .status()
+            .is_some_and(|status| status.changes.iter().any(|change| change.path == path))
+        {
+            return;
+        }
+        let Some(root) = self.state.vault_root().map(Path::to_path_buf) else {
+            return;
+        };
+        self.git_diff_generation = self.git_diff_generation.wrapping_add(1);
+        let generation = self.git_diff_generation;
+        self.git_diff = GitDiffState::Loading(path.clone());
+        cx.notify();
+        let task = cx.background_executor().spawn({
+            let path = path.clone();
+            async move { read_file_diff(&root, &path).map(|content| build_diff_lines(&content)) }
+        });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |this, cx| {
+                if this.git_diff_generation != generation {
+                    return;
+                }
+                this.git_diff = match result {
+                    Ok(lines) => GitDiffState::Ready { path, lines },
+                    Err(error) => GitDiffState::Failed { path, error },
+                };
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub(in crate::app) fn open_selected_git_file(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(path) = self.git_diff.path().map(Path::to_path_buf) {
+            self.select_note(path, window, cx);
+        }
+    }
+
+    pub(in crate::app) fn run_git_operation(
+        &mut self,
+        operation: GitOperation,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.git_integration.is_busy() {
+            return;
+        }
+        let Some(previous_status) = self.git_integration.status().cloned() else {
+            self.refresh_git_status(cx);
+            return;
+        };
+        let message = self.git_commit_input.read(cx).value().trim().to_owned();
+        let message_required = operation == GitOperation::Commit
+            || (operation == GitOperation::Sync
+                && (previous_status.changed_files > 0 || self.state.active_is_dirty()));
+        if message_required && message.is_empty() {
+            self.git_commit_error = Some(git_error_message(
+                &GitError::EmptyCommitMessage,
+                self.language,
+            ));
+            window.focus(&self.git_commit_input.focus_handle(cx));
+            cx.notify();
+            return;
+        }
+        if self.state.active_is_dirty()
+            && let Err(error) = self.state.save_active()
+        {
+            push_alert_notification(
+                window,
+                cx,
+                AppNotificationVariant::Error,
+                self.language
+                    .text("无法开始 Git 操作", "Unable to start Git operation"),
+                error.to_string(),
+            );
+            return;
+        }
+        let Some(root) = self.state.vault_root().map(Path::to_path_buf) else {
+            return;
+        };
+        let _ = clear_recovery_preference();
+        self.persist_session();
+        self.git_generation = self.git_generation.wrapping_add(1);
+        let generation = self.git_generation;
+        self.git_integration = GitIntegrationState::Working {
+            status: previous_status.clone(),
+            operation,
+        };
+        cx.notify();
+        let task = cx.background_executor().spawn(async move {
+            match operation {
+                GitOperation::Commit => {
+                    commit_repository(&root, &message).map(|status| GitSyncResult {
+                        committed: true,
+                        status,
+                    })
+                }
+                GitOperation::Pull => pull_repository(&root).map(|status| GitSyncResult {
+                    committed: false,
+                    status,
+                }),
+                GitOperation::Push => push_repository(&root).map(|status| GitSyncResult {
+                    committed: false,
+                    status,
+                }),
+                GitOperation::Sync => {
+                    sync_repository(&root, (!message.is_empty()).then_some(message.as_str()))
+                }
+            }
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = task.await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                if this.git_generation != generation {
+                    return;
+                }
+                this.apply_git_operation_result(operation, previous_status, result, window, cx);
+            });
+        })
+        .detach();
+    }
+
+    fn apply_git_operation_result(
+        &mut self,
+        operation: GitOperation,
+        previous_status: GitRepositoryStatus,
+        result: Result<GitSyncResult, GitError>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match result {
+            Ok(result) => {
+                self.git_integration = GitIntegrationState::Ready(result.status);
+                self.git_commit_error = None;
+                if result.committed {
+                    self.git_commit_input.update(cx, |input, cx| {
+                        input.set_value("", window, cx);
+                    });
+                }
+                if self.state.refresh_vault_entries().unwrap_or(false) {
+                    prune_collapsed_directories(
+                        &mut self.collapsed_directories,
+                        &self.state.entries,
+                    );
+                }
+                if self.state.refresh_external_documents().unwrap_or(false) {
+                    self.editor_render_cache = None;
+                    self.large_document_render_cache = None;
+                    self.editor_selection.collapse(self.state.cursor());
+                }
+                push_alert_notification(
+                    window,
+                    cx,
+                    AppNotificationVariant::Success,
+                    match self.language {
+                        AppLanguage::SimplifiedChinese => {
+                            format!("Git {}完成", operation.label(self.language))
+                        }
+                        AppLanguage::English => {
+                            format!("Git {} complete", operation.label(self.language))
+                        }
+                    },
+                    self.language
+                        .text("仓库状态已更新。", "The repository status is up to date."),
+                );
+                if let Some(path) = self.git_diff.path().map(Path::to_path_buf) {
+                    if self.git_integration.status().is_some_and(|status| {
+                        status.changes.iter().any(|change| change.path == path)
+                    }) {
+                        self.select_git_change(path, cx);
+                    } else {
+                        self.git_diff = GitDiffState::Empty;
+                    }
+                }
+            }
+            Err(error) => {
+                let message = git_error_message(&error, self.language);
+                self.git_integration = GitIntegrationState::Failed {
+                    status: Some(previous_status),
+                    error,
+                };
+                push_alert_notification(
+                    window,
+                    cx,
+                    AppNotificationVariant::Error,
+                    match self.language {
+                        AppLanguage::SimplifiedChinese => {
+                            format!("Git {}失败", operation.label(self.language))
+                        }
+                        AppLanguage::English => {
+                            format!("Git {} failed", operation.label(self.language))
+                        }
+                    },
+                    message,
+                );
+            }
+        }
+        cx.notify();
+    }
+
     pub(in crate::app) fn check_for_updates(
         &mut self,
         origin: UpdateCheckOrigin,
@@ -1833,6 +2165,10 @@ impl SynapseApp {
                 language.text("编辑书签标题…", "Edit bookmark title…"),
             ),
             (
+                &self.git_commit_input,
+                language.text("提交信息…", "Commit message…"),
+            ),
+            (
                 &self.selection_link_input,
                 language.text("粘贴链接…", "Paste a link…"),
             ),
@@ -1894,7 +2230,15 @@ impl SynapseApp {
                                         collapsed_directories_from_entries(&this.state.entries);
                                     this.editor_selection.collapse(0);
                                     this.editor_marked_range = None;
+                                    this.git_diff_generation =
+                                        this.git_diff_generation.wrapping_add(1);
+                                    this.git_diff = GitDiffState::Empty;
+                                    this.git_commit_error = None;
+                                    this.git_commit_input.update(cx, |input, cx| {
+                                        input.set_value("", window, cx);
+                                    });
                                     this.restart_vault_watcher(cx);
+                                    this.refresh_git_status(cx);
                                     this.persist_session();
                                     push_alert_notification(
                                         window,
@@ -2059,7 +2403,7 @@ impl SynapseApp {
         } else {
             self.command_search_results.len()
         };
-        search_count + 6
+        search_count + 7
     }
 
     fn move_command_palette_selection(&mut self, direction: i32, cx: &mut Context<Self>) {
@@ -2124,11 +2468,12 @@ impl SynapseApp {
             }
             2 => self.open_todo_workspace(window, cx),
             3 => self.open_bookmark_workspace(window, cx),
-            4 => {
+            4 => self.open_git_workspace(window, cx),
+            5 => {
                 self.dismiss_command_palette(cx);
                 self.check_for_updates(UpdateCheckOrigin::Manual, window, cx);
             }
-            5 => self.open_settings_window(cx),
+            6 => self.open_settings_window(cx),
             _ => {}
         }
     }

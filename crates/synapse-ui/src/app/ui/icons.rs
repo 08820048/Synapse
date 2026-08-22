@@ -33,6 +33,7 @@ pub enum Icon {
     Check,
     Tag,
     Globe,
+    GitBranch,
     Bold,
     Italic,
     Underline,
@@ -50,7 +51,7 @@ pub enum Icon {
 }
 
 impl Icon {
-    const ALL: [Self; 42] = [
+    const ALL: [Self; 43] = [
         Self::Search,
         Self::Todo,
         Self::Bookmark,
@@ -79,6 +80,7 @@ impl Icon {
         Self::Check,
         Self::Tag,
         Self::Globe,
+        Self::GitBranch,
         Self::Bold,
         Self::Italic,
         Self::Underline,
@@ -125,6 +127,7 @@ impl Icon {
             Self::Check => "lucide/check.svg",
             Self::Tag => "lucide/tag.svg",
             Self::Globe => "lucide/globe.svg",
+            Self::GitBranch => "lucide/git-branch.svg",
             Self::Bold => "lucide/bold.svg",
             Self::Italic => "lucide/italic.svg",
             Self::Underline => "lucide/underline.svg",
@@ -231,6 +234,9 @@ impl AssetSource for SynapseAssets {
             "lucide/tag.svg" => Some(include_bytes!("../../../../../assets/icons/lucide/tag.svg")),
             "lucide/globe.svg" => Some(include_bytes!(
                 "../../../../../assets/icons/lucide/globe.svg"
+            )),
+            "lucide/git-branch.svg" => Some(include_bytes!(
+                "../../../../../assets/icons/lucide/git-branch.svg"
             )),
             "lucide/bold.svg" => Some(include_bytes!(
                 "../../../../../assets/icons/lucide/bold.svg"

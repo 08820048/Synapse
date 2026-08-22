@@ -28,6 +28,7 @@ ratex-svg = { version = "=0.1.14", features = ["embed-fonts"] }
 ratex-types = "=0.1.14"
 rusty-mermaid = { version = "=0.2.0", features = ["svg"] }
 serde_json = "=1.0.151"
+similar = { version = "=3.2.0", features = ["inline"] }
 synapse-core = { path = "crates/synapse-core" }
 tokio = { version = "=1.53.1", features = ["rt-multi-thread", "time"] }
 trash = "=5.2.6"

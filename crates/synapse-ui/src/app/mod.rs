@@ -94,6 +94,10 @@ use self::editor::surface::{
     source_lines_from_buffer_with_syntax_cache, source_lines_from_buffer_without_code_syntax,
     source_lines_with_mode, task_preview_line,
 };
+use self::platform::git::{
+    GitError, GitRepositoryStatus, GitSyncResult, commit_repository, inspect_repository,
+    pull_repository, push_repository, read_file_diff, sync_repository,
+};
 use self::platform::http_client::SynapseHttpClient;
 use self::platform::updater;
 use self::platform::updater::{
@@ -111,6 +115,10 @@ use self::ui::settings::{
 use self::workspaces::bookmarks::{
     BookmarkTagPicker, BookmarkWorkspace, BookmarkWorkspaceRenderState, fetch_link_metadata,
     is_bookmark_url_candidate, render_bookmark_quick_picker, render_bookmark_workspace,
+};
+use self::workspaces::git::{
+    DiffDisplayLine, GitWorkspaceRenderState, build_diff_lines, render_git_quick_picker,
+    render_git_workspace,
 };
 use self::workspaces::todo::{
     TodoTagPicker, TodoToggleOutcome, TodoWorkspace, TodoWorkspaceRenderState,
@@ -146,6 +154,7 @@ const SETTINGS_WINDOW_HEIGHT: f32 = 700.0;
 const SETTINGS_WINDOW_MIN_WIDTH: f32 = 760.0;
 const SETTINGS_WINDOW_MIN_HEIGHT: f32 = 520.0;
 const VAULT_REFRESH_DEBOUNCE: Duration = Duration::from_millis(180);
+const GIT_STATUS_REFRESH_DEBOUNCE: Duration = Duration::from_secs(2);
 const AUTOSAVE_INTERVAL: Duration = Duration::from_secs(1);
 const PANEL_TRANSITION: Duration = Duration::from_millis(180);
 const MARKD_PANEL_SPRING_STIFFNESS: f32 = 420.0;
@@ -971,6 +980,16 @@ fn collapsed_directories_from_entries(entries: &[VaultEntry]) -> BTreeSet<PathBu
         .collect()
 }
 
+fn paths_only_touch_git_metadata(root: &Path, paths: &[PathBuf]) -> bool {
+    !paths.is_empty()
+        && paths.iter().all(|path| {
+            path.strip_prefix(root)
+                .ok()
+                .and_then(|relative| relative.components().next())
+                .is_some_and(|component| component.as_os_str() == ".git")
+        })
+}
+
 fn build_file_tree_rows(
     entries: &[VaultEntry],
     collapsed_directories: &BTreeSet<PathBuf>,
@@ -1518,6 +1537,7 @@ enum WorkspaceView {
     Note,
     Todo,
     Bookmark,
+    Git,
 }
 
 #[derive(Clone, Debug)]
@@ -1627,7 +1647,7 @@ fn command_palette_scroll_item_index(
     query_nonempty: bool,
 ) -> usize {
     if !query_nonempty {
-        return 1 + selected + usize::from(selected >= 4);
+        return 1 + selected + usize::from(selected >= 5);
     }
     if search_count > 0 && selected < search_count {
         return 2 + selected;
@@ -1638,7 +1658,153 @@ fn command_palette_scroll_item_index(
     } else {
         2 + search_count
     };
-    menu_start + menu_index + usize::from(menu_index >= 4)
+    menu_start + menu_index + usize::from(menu_index >= 5)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GitOperation {
+    Commit,
+    Pull,
+    Push,
+    Sync,
+}
+
+impl GitOperation {
+    fn label(self, language: AppLanguage) -> &'static str {
+        match self {
+            Self::Commit => language.text("提交", "Commit"),
+            Self::Pull => language.text("拉取", "Pull"),
+            Self::Push => language.text("推送", "Push"),
+            Self::Sync => language.text("同步", "Sync"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+enum GitIntegrationState {
+    #[default]
+    Checking,
+    NotRepository,
+    Unavailable,
+    Ready(GitRepositoryStatus),
+    Working {
+        status: GitRepositoryStatus,
+        operation: GitOperation,
+    },
+    Failed {
+        status: Option<GitRepositoryStatus>,
+        error: GitError,
+    },
+}
+
+impl GitIntegrationState {
+    fn status(&self) -> Option<&GitRepositoryStatus> {
+        match self {
+            Self::Ready(status) | Self::Working { status, .. } => Some(status),
+            Self::Failed { status, .. } => status.as_ref(),
+            Self::Checking | Self::NotRepository | Self::Unavailable => None,
+        }
+    }
+
+    fn is_busy(&self) -> bool {
+        matches!(self, Self::Working { .. })
+    }
+
+    fn operation(&self) -> Option<GitOperation> {
+        match self {
+            Self::Working { operation, .. } => Some(*operation),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+enum GitDiffState {
+    #[default]
+    Empty,
+    Loading(PathBuf),
+    Ready {
+        path: PathBuf,
+        lines: Vec<DiffDisplayLine>,
+    },
+    Failed {
+        path: PathBuf,
+        error: GitError,
+    },
+}
+
+impl GitDiffState {
+    fn path(&self) -> Option<&Path> {
+        match self {
+            Self::Loading(path) | Self::Ready { path, .. } | Self::Failed { path, .. } => {
+                Some(path)
+            }
+            Self::Empty => None,
+        }
+    }
+}
+
+fn default_git_change(
+    status: Option<&GitRepositoryStatus>,
+    selected: Option<&Path>,
+) -> Option<PathBuf> {
+    if selected.is_some() {
+        return None;
+    }
+    status?.changes.first().map(|change| change.path.clone())
+}
+
+fn git_status_summary(status: &GitRepositoryStatus, language: AppLanguage) -> String {
+    let mut parts = vec![status.branch.clone()];
+    if status.changed_files > 0 {
+        parts.push(match language {
+            AppLanguage::SimplifiedChinese => format!("{} 个更改", status.changed_files),
+            AppLanguage::English => format!("{} changed", status.changed_files),
+        });
+    }
+    if status.ahead > 0 {
+        parts.push(match language {
+            AppLanguage::SimplifiedChinese => format!("领先 {}", status.ahead),
+            AppLanguage::English => format!("{} ahead", status.ahead),
+        });
+    }
+    if status.behind > 0 {
+        parts.push(match language {
+            AppLanguage::SimplifiedChinese => format!("落后 {}", status.behind),
+            AppLanguage::English => format!("{} behind", status.behind),
+        });
+    }
+    if status.upstream.is_none() {
+        parts.push(language.text("未配置上游", "no upstream").to_owned());
+    }
+    parts.join(" · ")
+}
+
+fn git_error_message(error: &GitError, language: AppLanguage) -> String {
+    if language == AppLanguage::English {
+        return error.to_string();
+    }
+    match error {
+        GitError::GitUnavailable => "未安装 Git，或 Git 不在系统 PATH 中。".to_owned(),
+        GitError::NotRepository => "当前 Vault 不是 Git 仓库。".to_owned(),
+        GitError::VaultIsNotRepositoryRoot(root) => {
+            format!("Vault 必须是仓库根目录。当前仓库：{}", root.display())
+        }
+        GitError::DetachedHead => "仓库当前处于 detached HEAD 状态。".to_owned(),
+        GitError::NoUpstream => "当前分支尚未配置上游分支。".to_owned(),
+        GitError::ConflictsPresent => "请先解决仓库中已有的 Git 冲突。".to_owned(),
+        GitError::DirtyWorkingTree => "请先提交本地更改，再拉取远端更改。".to_owned(),
+        GitError::EmptyCommitMessage => "提交信息不能为空。".to_owned(),
+        GitError::NoChanges => "当前没有可提交的本地更改。".to_owned(),
+        GitError::InvalidPath => "所选文件不在当前 Vault 中。".to_owned(),
+        GitError::CommandFailed(operation) => format!("Git 操作失败：{operation}。"),
+        GitError::RebaseFailed { aborted: true } => {
+            "远端改动与本地笔记冲突；同步已中止并恢复到操作前状态。".to_owned()
+        }
+        GitError::RebaseFailed { aborted: false } => {
+            "远端改动与本地笔记冲突，并且 Git 无法自动中止 rebase。".to_owned()
+        }
+    }
 }
 
 struct SynapseApp {
@@ -1679,6 +1845,11 @@ struct SynapseApp {
     bookmark_tag_picker: Option<BookmarkTagPicker>,
     bookmark_quick_open: bool,
     bookmark_fetching_ids: BTreeSet<u64>,
+    git_commit_input: Entity<InputState>,
+    git_commit_error: Option<String>,
+    git_diff: GitDiffState,
+    git_diff_generation: u64,
+    git_quick_open: bool,
     vault_watcher: Option<RecommendedWatcher>,
     vault_watcher_generation: u64,
     vault_refresh_generation: u64,
@@ -1694,6 +1865,9 @@ struct SynapseApp {
     settings_window_opening: bool,
     update_check: UpdateCheckState,
     update_check_generation: u64,
+    git_integration: GitIntegrationState,
+    git_generation: u64,
+    git_refresh_generation: u64,
     left_sidebar_open: bool,
     command_palette_open: bool,
     command_palette_closing: bool,
@@ -3577,6 +3751,64 @@ fn render_settings_content(
                     }),
             )
     });
+    let git_field_app = app_entity.clone();
+    let git_field = SettingField::render(move |options, _window, cx| {
+        let app_state = git_field_app.read(cx);
+        let language = app_state.language;
+        let busy = app_state.git_integration.is_busy();
+        let checking = matches!(app_state.git_integration, GitIntegrationState::Checking);
+        let status = match &app_state.git_integration {
+            GitIntegrationState::Checking => {
+                language.text("正在检测 Git…", "Checking Git…").to_owned()
+            }
+            GitIntegrationState::NotRepository => language
+                .text(
+                    "当前 Vault 不是 Git 仓库",
+                    "The current Vault is not a Git repository",
+                )
+                .to_owned(),
+            GitIntegrationState::Unavailable => language
+                .text("未检测到系统 Git", "System Git was not found")
+                .to_owned(),
+            GitIntegrationState::Ready(status) => git_status_summary(status, language),
+            GitIntegrationState::Working { status, operation } => match language {
+                AppLanguage::SimplifiedChinese => {
+                    format!("正在{} {}…", operation.label(language), status.branch)
+                }
+                AppLanguage::English => {
+                    format!("{} {}…", operation.label(language), status.branch)
+                }
+            },
+            GitIntegrationState::Failed { error, .. } => git_error_message(error, language),
+        };
+        let app = git_field_app.clone();
+        div()
+            .flex()
+            .items_center()
+            .justify_end()
+            .gap_3()
+            .pr_1()
+            .child(
+                div()
+                    .max_w(px(320.0))
+                    .truncate()
+                    .text_size(px(11.0))
+                    .text_color(cx.theme().muted_foreground)
+                    .child(status),
+            )
+            .child(
+                Button::new("refresh-git-repository")
+                    .outline()
+                    .with_size(options.size)
+                    .icon(IconName::GitHub)
+                    .label(language.text("重新检测", "Check again"))
+                    .loading(checking)
+                    .disabled(busy || checking)
+                    .on_click(move |_, _, cx| {
+                        app.update(cx, |this, cx| this.refresh_git_status(cx));
+                    }),
+            )
+    });
     let version_field = SettingField::render(move |_options, _window, _cx| {
         div()
             .font_family(".SystemUIFontMonospaced")
@@ -3679,6 +3911,20 @@ fn render_settings_content(
                             ),
                         )),
                 ]),
+        )
+        .page(
+            SettingPage::new("Git")
+                .default_open(false)
+                .resettable(false)
+                .show_header(false)
+                .groups([SettingGroup::new().items([SettingItem::new(
+                    language.text("仓库同步", "Repository sync"),
+                    git_field,
+                )
+                .description(language.text(
+                    "Git 工作区使用系统 Git 和现有凭据；仅支持 Vault 本身为仓库根目录。",
+                    "The Git workspace uses system Git and existing credentials; the Vault itself must be the repository root.",
+                ))])]),
         )
         .page(
             SettingPage::new(language.text("更新", "Updates"))
@@ -4563,6 +4809,11 @@ pub(crate) fn run() {
                             .placeholder(language.text("编辑书签标题…", "Edit bookmark title…"))
                             .clean_on_escape()
                     });
+                    let git_commit_input = cx.new(|cx| {
+                        InputState::new(window, cx)
+                            .placeholder(language.text("提交信息…", "Commit message…"))
+                            .clean_on_escape()
+                    });
                     let selection_link_input = cx.new(|cx| {
                         InputState::new(window, cx)
                             .placeholder(language.text("粘贴链接…", "Paste a link…"))
@@ -4709,6 +4960,27 @@ pub(crate) fn run() {
                                 },
                             ),
                             cx.subscribe_in(
+                                &git_commit_input,
+                                window,
+                                |this: &mut SynapseApp, _, event: &InputEvent, window, cx| {
+                                    match event {
+                                        InputEvent::Change => {
+                                            if this.git_commit_error.take().is_some() {
+                                                cx.notify();
+                                            }
+                                        }
+                                        InputEvent::PressEnter { secondary: false } => {
+                                            this.run_git_operation(
+                                                GitOperation::Commit,
+                                                window,
+                                                cx,
+                                            );
+                                        }
+                                        _ => {}
+                                    }
+                                },
+                            ),
+                            cx.subscribe_in(
                                 &selection_link_input,
                                 window,
                                 |this: &mut SynapseApp, _, event: &InputEvent, window, cx| {
@@ -4784,6 +5056,11 @@ pub(crate) fn run() {
                             bookmark_tag_picker: None,
                             bookmark_quick_open: false,
                             bookmark_fetching_ids: BTreeSet::new(),
+                            git_commit_input,
+                            git_commit_error: None,
+                            git_diff: GitDiffState::Empty,
+                            git_diff_generation: 0,
+                            git_quick_open: false,
                             vault_watcher: None,
                             vault_watcher_generation: 0,
                             vault_refresh_generation: 0,
@@ -4799,6 +5076,9 @@ pub(crate) fn run() {
                             settings_window_opening: false,
                             update_check: UpdateCheckState::Idle,
                             update_check_generation: 0,
+                            git_integration: GitIntegrationState::Checking,
+                            git_generation: 0,
+                            git_refresh_generation: 0,
                             left_sidebar_open: true,
                             command_palette_open: false,
                             command_palette_closing: false,
@@ -4885,6 +5165,7 @@ pub(crate) fn run() {
                         app.restart_editor_cursor_blink(cx);
                         app.start_autosave(cx);
                         app.restart_vault_watcher(cx);
+                        app.refresh_git_status(cx);
                         app.check_for_updates(UpdateCheckOrigin::Startup, window, cx);
                         cx.observe_window_appearance(window, |app, window, cx| {
                             if app.theme_preference == ThemePreference::System {
@@ -4922,6 +5203,7 @@ mod tests {
     use super::document_outline::{css_cubic_bezier_0201, document_outline_tick_style};
 
     use super::editor_surface::{MarkdownBlockKind, source_lines};
+    use super::platform::git::{GitFileChange, GitFileStatus, GitRepositoryStatus};
     use super::{
         AppLanguage, DangerousAction, EDITOR_BODY_FONT_SIZE, EDITOR_BODY_LINE_HEIGHT,
         EDITOR_COMPACT_GUTTER, EDITOR_PAGE_MAX_WIDTH, EDITOR_REGULAR_GUTTER,
@@ -4940,25 +5222,25 @@ mod tests {
         ThemePreference, TreeTarget, active_document_outline_index, build_document_outline,
         build_file_tree_rows, build_image_previews, build_math_previews, build_mermaid_previews,
         changed_line_span, clipboard_image_extension, code_block_edges,
-        command_palette_key_bindings, command_palette_scroll_item_index, default_window_size,
-        document_outline_horizontal_layout, document_outline_is_visible, document_outline_layout,
-        editor_backtick_key_bindings, editor_horizontal_gutter, editor_page_content_width,
-        editor_preview_range, embedded_app_icon_png_metadata, fenced_code_block_edit,
-        file_manager_reveal_command, filtered_slash_commands, inline_format_edit,
-        inline_format_is_active, is_tab_context_trigger, large_document_cache_range,
-        large_document_line_range, large_document_rich_render_request, linked_vault_note,
-        markd_panel_spring_progress, markdown_link_context, markdown_list_items_in_selection,
-        materialize_large_document_lines, materialize_large_document_rich_lines,
-        next_command_palette_selection, normalize_clipboard_text,
-        normalize_markdown_link_destination, note_breadcrumb_parts, note_link_candidates,
-        parse_boolean_preference, parse_recovery_preference, parse_session_preference,
-        path_is_inside_macos_app_bundle, persist_clipboard_image, prune_collapsed_directories,
-        resolve_markdown_image, scan_markdown_fence_ranges, scan_markdown_structure,
-        search_vault_entries, select_startup_vault_path, settings_language_indicator_left,
-        settings_spring_progress, settings_theme_indicator_left, settings_titlebar_options,
-        settings_window_options, source_lines_from_buffer, strip_markdown_inline_formatting,
-        synapse_mermaid_theme, synapse_theme_palette, synapse_titlebar_options,
-        titlebar_left_inset,
+        command_palette_key_bindings, command_palette_scroll_item_index, default_git_change,
+        default_window_size, document_outline_horizontal_layout, document_outline_is_visible,
+        document_outline_layout, editor_backtick_key_bindings, editor_horizontal_gutter,
+        editor_page_content_width, editor_preview_range, embedded_app_icon_png_metadata,
+        fenced_code_block_edit, file_manager_reveal_command, filtered_slash_commands,
+        inline_format_edit, inline_format_is_active, is_tab_context_trigger,
+        large_document_cache_range, large_document_line_range, large_document_rich_render_request,
+        linked_vault_note, markd_panel_spring_progress, markdown_link_context,
+        markdown_list_items_in_selection, materialize_large_document_lines,
+        materialize_large_document_rich_lines, next_command_palette_selection,
+        normalize_clipboard_text, normalize_markdown_link_destination, note_breadcrumb_parts,
+        note_link_candidates, parse_boolean_preference, parse_recovery_preference,
+        parse_session_preference, path_is_inside_macos_app_bundle, persist_clipboard_image,
+        prune_collapsed_directories, resolve_markdown_image, scan_markdown_fence_ranges,
+        scan_markdown_structure, search_vault_entries, select_startup_vault_path,
+        settings_language_indicator_left, settings_spring_progress, settings_theme_indicator_left,
+        settings_titlebar_options, settings_window_options, source_lines_from_buffer,
+        strip_markdown_inline_formatting, synapse_mermaid_theme, synapse_theme_palette,
+        synapse_titlebar_options, titlebar_left_inset,
     };
     fn sfnt_table<'a>(font: &'a [u8], tag: &[u8; 4]) -> Option<&'a [u8]> {
         let table_count = usize::from(u16::from_be_bytes(font.get(4..6)?.try_into().ok()?));
@@ -5846,7 +6128,8 @@ mod tests {
         assert_eq!(next_command_palette_selection(0, 0, 1), 0);
 
         assert_eq!(command_palette_scroll_item_index(0, 0, false), 1);
-        assert_eq!(command_palette_scroll_item_index(4, 0, false), 6);
+        assert_eq!(command_palette_scroll_item_index(4, 0, false), 5);
+        assert_eq!(command_palette_scroll_item_index(5, 0, false), 7);
         assert_eq!(command_palette_scroll_item_index(2, 5, true), 4);
         assert_eq!(command_palette_scroll_item_index(5, 5, true), 7);
         assert_eq!(command_palette_scroll_item_index(0, 0, true), 3);
@@ -6398,6 +6681,55 @@ mod tests {
                     depth: 1,
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn vault_watcher_ignores_only_git_metadata_events() {
+        let root = Path::new("/vault");
+
+        assert!(super::paths_only_touch_git_metadata(
+            root,
+            &[
+                PathBuf::from("/vault/.git/index"),
+                PathBuf::from("/vault/.git/refs/heads/main"),
+            ]
+        ));
+        assert!(!super::paths_only_touch_git_metadata(
+            root,
+            &[
+                PathBuf::from("/vault/.git/index"),
+                PathBuf::from("/vault/note.md"),
+            ]
+        ));
+        assert!(!super::paths_only_touch_git_metadata(root, &[]));
+    }
+
+    #[test]
+    fn git_workspace_defaults_to_the_first_change_only_without_a_selection() {
+        let status = GitRepositoryStatus {
+            branch: "main".to_owned(),
+            upstream: None,
+            changed_files: 1,
+            ahead: 0,
+            behind: 0,
+            conflicted: false,
+            detached: false,
+            changes: vec![GitFileChange {
+                path: PathBuf::from("first.md"),
+                status: GitFileStatus::Modified,
+                staged: false,
+            }],
+            recent_commits: Vec::new(),
+        };
+
+        assert_eq!(
+            default_git_change(Some(&status), None),
+            Some(PathBuf::from("first.md"))
+        );
+        assert_eq!(
+            default_git_change(Some(&status), Some(Path::new("first.md"))),
+            None
         );
     }
 

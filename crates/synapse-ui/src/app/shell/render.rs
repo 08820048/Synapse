@@ -12,6 +12,7 @@ impl Render for SynapseApp {
         let command_kbd = Kbd::binding_for_action(&OpenCommandPalette, None, window);
         let todo_workspace_active = self.workspace_view == WorkspaceView::Todo;
         let bookmark_workspace_active = self.workspace_view == WorkspaceView::Bookmark;
+        let git_workspace_active = self.workspace_view == WorkspaceView::Git;
         let note_workspace_active = self.workspace_view == WorkspaceView::Note;
         let selected_path = note_workspace_active
             .then(|| {
@@ -74,6 +75,18 @@ impl Render for SynapseApp {
                     editing_id: self.bookmark_editing_id,
                     edit_error: self.bookmark_edit_error.as_deref(),
                     fetching_ids: &self.bookmark_fetching_ids,
+                    theme: synapse_theme_palette(theme.is_dark()),
+                    language: self.language,
+                },
+                cx,
+            )
+        } else if git_workspace_active {
+            render_git_workspace(
+                GitWorkspaceRenderState {
+                    integration: &self.git_integration,
+                    commit_input: &self.git_commit_input,
+                    commit_error: self.git_commit_error.as_deref(),
+                    diff: &self.git_diff,
                     theme: synapse_theme_palette(theme.is_dark()),
                     language: self.language,
                 },
@@ -2011,6 +2024,117 @@ impl Render for SynapseApp {
                     .child(new_tag_button)
                     .into_any_element(),
             )
+        } else if git_workspace_active {
+            let status = self.git_integration.status();
+            let operation = self.git_integration.operation();
+            let busy = self.git_integration.is_busy();
+            let no_upstream = status.is_none_or(|status| status.upstream.is_none());
+            let conflicts = status.is_some_and(|status| status.conflicted);
+            let dirty = status.is_some_and(|status| status.changed_files > 0);
+            let commit_message_empty = self.git_commit_input.read(cx).value().trim().is_empty();
+            let pull_app = app_entity.clone();
+            let push_app = app_entity.clone();
+            let sync_app = app_entity.clone();
+            let refresh_app = app_entity.clone();
+            Some(
+                div()
+                    .id("git-toolbar")
+                    .h(px(EDITOR_TOOLBAR_HEIGHT))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .px_3()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .truncate()
+                            .text_size(px(13.5))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(
+                                status
+                                    .map(|status| git_status_summary(status, self.language))
+                                    .unwrap_or_else(|| "Git".to_owned()),
+                            ),
+                    )
+                    .child(
+                        Button::new("git-toolbar-pull")
+                            .ghost()
+                            .h_full()
+                            .px_3()
+                            .icon(IconName::ArrowDown)
+                            .label(self.language.text("拉取", "Pull"))
+                            .loading(operation == Some(GitOperation::Pull))
+                            .disabled(busy || no_upstream || conflicts || dirty)
+                            .tooltip(if dirty {
+                                self.language.text(
+                                    "提交本地更改后再拉取",
+                                    "Commit local changes before pulling",
+                                )
+                            } else {
+                                self.language.text("拉取远端更改", "Pull remote changes")
+                            })
+                            .on_click(move |_, window, cx| {
+                                pull_app.update(cx, |this, cx| {
+                                    this.run_git_operation(GitOperation::Pull, window, cx);
+                                });
+                            }),
+                    )
+                    .child(
+                        Button::new("git-toolbar-push")
+                            .ghost()
+                            .h_full()
+                            .px_3()
+                            .icon(IconName::ArrowUp)
+                            .label(self.language.text("推送", "Push"))
+                            .loading(operation == Some(GitOperation::Push))
+                            .disabled(busy || no_upstream || conflicts)
+                            .tooltip(self.language.text("推送本地提交", "Push local commits"))
+                            .on_click(move |_, window, cx| {
+                                push_app.update(cx, |this, cx| {
+                                    this.run_git_operation(GitOperation::Push, window, cx);
+                                });
+                            }),
+                    )
+                    .child(
+                        Button::new("git-toolbar-sync")
+                            .primary()
+                            .h(px(30.0))
+                            .px_3()
+                            .icon(IconName::Redo2)
+                            .label(self.language.text("同步", "Sync"))
+                            .loading(operation == Some(GitOperation::Sync))
+                            .disabled(
+                                busy || no_upstream || conflicts || (dirty && commit_message_empty),
+                            )
+                            .tooltip(if dirty && commit_message_empty {
+                                self.language.text(
+                                    "填写提交信息后同步",
+                                    "Enter a commit message before syncing",
+                                )
+                            } else {
+                                self.language.text("拉取并推送", "Pull and push")
+                            })
+                            .on_click(move |_, window, cx| {
+                                sync_app.update(cx, |this, cx| {
+                                    this.run_git_operation(GitOperation::Sync, window, cx);
+                                });
+                            }),
+                    )
+                    .child(
+                        Button::new("git-toolbar-refresh")
+                            .ghost()
+                            .size(px(EDITOR_TOOLBAR_HEIGHT))
+                            .p_0()
+                            .icon(IconName::Redo)
+                            .tooltip(self.language.text("刷新状态", "Refresh status"))
+                            .disabled(busy)
+                            .on_click(move |_, _, cx| {
+                                refresh_app.update(cx, |this, cx| this.refresh_git_status(cx));
+                            }),
+                    )
+                    .into_any_element(),
+            )
         } else {
             active_note_path.map(|path| {
                 let parts = note_breadcrumb_parts(&path);
@@ -2236,7 +2360,15 @@ impl Render for SynapseApp {
                                     .gap(px(10.0))
                                     .pl(px(SIDEBAR_TREE_ROOT_INSET))
                                     .cursor_pointer()
-                                    .child(Icon::Todo.render(15.0).flex_none().text_color(row_ink))
+                                    .child(
+                                        div()
+                                            .size(px(16.0))
+                                            .flex_none()
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .child(Icon::Todo.render(15.0).text_color(row_ink)),
+                                    )
                                     .child(
                                         div()
                                             .flex_1()
@@ -2336,7 +2468,13 @@ impl Render for SynapseApp {
                                     .pl(px(SIDEBAR_TREE_ROOT_INSET))
                                     .cursor_pointer()
                                     .child(
-                                        Icon::Bookmark.render(15.0).flex_none().text_color(row_ink),
+                                        div()
+                                            .size(px(16.0))
+                                            .flex_none()
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .child(Icon::Bookmark.render(15.0).text_color(row_ink)),
                                     )
                                     .child(
                                         div()
@@ -2389,6 +2527,145 @@ impl Render for SynapseApp {
                     .child(render_bookmark_quick_picker(
                         &self.bookmark_workspace,
                         bookmark_quick_open,
+                        palette,
+                        self.language,
+                        cx,
+                    ))
+            })
+            .child({
+                let shortcut_app = app_entity.clone();
+                let quick_app = app_entity.clone();
+                let git_quick_open = self.git_quick_open;
+                let palette = synapse_theme_palette(theme.is_dark());
+                let active = self.workspace_view == WorkspaceView::Git;
+                let status = self.git_integration.status();
+                let row_ink = if active {
+                    palette.foreground
+                } else {
+                    palette.muted
+                };
+                let badge = status.and_then(|status| {
+                    if status.conflicted {
+                        Some("!".to_owned())
+                    } else if status.changed_files > 0 {
+                        Some(status.changed_files.to_string())
+                    } else if status.ahead > 0 || status.behind > 0 {
+                        Some(format!("↑{} ↓{}", status.ahead, status.behind))
+                    } else {
+                        None
+                    }
+                });
+                div()
+                    .w_full()
+                    .flex_none()
+                    .child(
+                        div()
+                            .id("git-collection")
+                            .w_full()
+                            .h(px(30.0))
+                            .flex()
+                            .items_center()
+                            .rounded_md()
+                            .when(active, |row| {
+                                row.bg(palette.active).text_color(palette.foreground)
+                            })
+                            .when(!active, |row| {
+                                row.text_color(palette.muted).hover(move |style| {
+                                    style.bg(palette.hover).text_color(palette.foreground)
+                                })
+                            })
+                            .child(
+                                div()
+                                    .id("git-collection-nav")
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .h_full()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(10.0))
+                                    .pl(px(SIDEBAR_TREE_ROOT_INSET))
+                                    .cursor_pointer()
+                                    .child(
+                                        div()
+                                            .size(px(16.0))
+                                            .flex_none()
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .text_color(row_ink)
+                                            .child(
+                                                Icon::GitBranch.render(15.0).text_color(row_ink),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w(px(0.0))
+                                            .overflow_hidden()
+                                            .whitespace_nowrap()
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_size(px(13.0))
+                                            .child("Git"),
+                                    )
+                                    .when_some(badge, |nav, badge| {
+                                        nav.child(
+                                            div()
+                                                .flex_none()
+                                                .font_family(".SystemUIFontMonospaced")
+                                                .text_size(px(10.5))
+                                                .text_color(
+                                                    if status
+                                                        .is_some_and(|status| status.conflicted)
+                                                    {
+                                                        theme.danger
+                                                    } else {
+                                                        palette.muted
+                                                    },
+                                                )
+                                                .child(badge),
+                                        )
+                                    })
+                                    .on_click(move |_, window, cx| {
+                                        shortcut_app.update(cx, |this, cx| {
+                                            this.open_git_workspace(window, cx)
+                                        });
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .id("git-collection-toggle")
+                                    .w(px(SIDEBAR_SHORTCUT_ACTION_WIDTH))
+                                    .h_full()
+                                    .flex_none()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded_md()
+                                    .cursor_pointer()
+                                    .hover(move |style| {
+                                        style.bg(palette.active).text_color(palette.foreground)
+                                    })
+                                    .child(
+                                        if git_quick_open {
+                                            Icon::Minus
+                                        } else {
+                                            Icon::Plus
+                                        }
+                                        .render(14.0)
+                                        .flex_none()
+                                        .text_color(row_ink),
+                                    )
+                                    .on_click(move |_, _, cx| {
+                                        cx.stop_propagation();
+                                        quick_app.update(cx, |this, cx| {
+                                            this.toggle_git_quick_picker(cx)
+                                        });
+                                    }),
+                            ),
+                    )
+                    .child(render_git_quick_picker(
+                        status,
+                        git_quick_open,
                         palette,
                         self.language,
                         cx,
@@ -3424,6 +3701,7 @@ impl Render for SynapseApp {
             let open_vault_app = app_entity.clone();
             let todo_app = app_entity.clone();
             let bookmarks_app = app_entity.clone();
+            let git_app = app_entity.clone();
             let settings_app = app_entity.clone();
             let update_app = app_entity.clone();
             div()
@@ -3611,12 +3889,33 @@ impl Render for SynapseApp {
                                     });
                                 }),
                         )
+                        .child(
+                            Button::new("palette-git")
+                                .ghost()
+                                .when(
+                                    self.command_palette_selected == palette_search_count + 4,
+                                    |button| {
+                                        button.bg(theme.secondary).text_color(theme.foreground)
+                                    },
+                                )
+                                .w_full()
+                                .h(px(38.0))
+                                .justify_start()
+                                .icon(IconName::GitHub)
+                                .label(self.language.text("打开 Git", "Open Git"))
+                                .on_click(move |_, window, cx| {
+                                    cx.stop_propagation();
+                                    git_app.update(cx, |this, cx| {
+                                        this.open_git_workspace(window, cx);
+                                    });
+                                }),
+                        )
                         .child(div().h(px(1.0)).mx_2().my_2().bg(theme.border))
                         .child(
                             Button::new("palette-check-updates")
                                 .ghost()
                                 .when(
-                                    self.command_palette_selected == palette_search_count + 4,
+                                    self.command_palette_selected == palette_search_count + 5,
                                     |button| {
                                         button.bg(theme.secondary).text_color(theme.foreground)
                                     },
@@ -3646,7 +3945,7 @@ impl Render for SynapseApp {
                             Button::new("palette-settings")
                                 .ghost()
                                 .when(
-                                    self.command_palette_selected == palette_search_count + 5,
+                                    self.command_palette_selected == palette_search_count + 6,
                                     |button| {
                                         button.bg(theme.secondary).text_color(theme.foreground)
                                     },

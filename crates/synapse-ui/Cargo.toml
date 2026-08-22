@@ -23,6 +23,7 @@ ratex-types.workspace = true
 rusty-mermaid.workspace = true
 reqwest.workspace = true
 serde_json.workspace = true
+similar.workspace = true
 synapse-core.workspace = true
 tokio.workspace = true
 writ.workspace = true

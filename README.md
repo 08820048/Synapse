@@ -37,6 +37,7 @@ This is an early public preview (`0.1.0`). Daily Markdown editing works on macOS
 - External filesystem changes refresh the sidebar without touching unsaved buffers
 - Filename/full-text search, in-note find/replace, and native word/line selection
 - Restored and drag-reorderable tabs, one-second autosave, conflict detection, and crash recovery
+- A dedicated Git workspace for wrapped, inline-highlighted diff inspection, commit history, and manual commit/pull/push/sync actions
 
 ## Requirements
 
@@ -44,6 +45,7 @@ This is an early public preview (`0.1.0`). Daily Markdown editing works on macOS
 - macOS is the primary development platform
 - Xcode command-line tools for a local macOS build
 - Windows 10+ for the setup EXE; Inno Setup 6 is only needed to package locally
+- Git is optional and only required for repository synchronization
 
 ## Install
 
@@ -187,6 +189,7 @@ Synapse 是一款使用 Rust 与 GPUI 构建的高性能、本地优先 Markdown
 - 外部文件变化会刷新侧栏，不会覆盖未保存缓冲区
 - 文件名/全文搜索、笔记内查找替换，以及按词和按行选择
 - 页签会话恢复与拖拽排序、秒级自动保存、外部冲突检测和崩溃恢复
+- 独立的 Git 工作区，可查看支持换行与行内高亮的差异、文件变更和提交历史，并手动提交、拉取、推送或同步
 
 ## 安装
 

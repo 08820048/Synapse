@@ -4,6 +4,10 @@ All notable changes to Synapse are recorded here. The format follows [Keep a Cha
 
 ## [Unreleased]
 
+### Added
+
+- A dedicated Git workspace and sidebar change panel with wrapped, scrollable, inline-highlighted diffs, commit history, explicit commit/pull/push/sync actions, conflict visibility, and system-Git credential reuse
+
 ## [0.2.0] - 2026-08-21
 
 ### Added
