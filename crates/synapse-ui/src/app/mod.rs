@@ -38,7 +38,8 @@ use gpui_animation::{
     transition::{Transition, general::EaseInOutCubic, general::EaseOutQuad},
 };
 use gpui_component::{
-    ActiveTheme, Disableable as _, IconName, Root, Sizable as _, Theme, ThemeMode, WindowExt as _,
+    ActiveTheme, Disableable as _, Icon as ComponentIcon, IconName, Root, Sizable as _, Theme,
+    ThemeMode, WindowExt as _,
     alert::Alert,
     button::{Button, ButtonCustomVariant, ButtonRounded, ButtonVariant, ButtonVariants as _},
     dialog::DialogButtonProps,
@@ -119,6 +120,9 @@ use self::workspaces::bookmarks::{
 use self::workspaces::git::{
     DiffDisplayLine, GitWorkspaceRenderState, build_diff_lines, render_git_quick_picker,
     render_git_workspace,
+};
+use self::workspaces::statistics::{
+    StatisticsState, collect_statistics, render_statistics_workspace,
 };
 use self::workspaces::todo::{
     TodoTagPicker, TodoToggleOutcome, TodoWorkspace, TodoWorkspaceRenderState,
@@ -1538,6 +1542,7 @@ enum WorkspaceView {
     Todo,
     Bookmark,
     Git,
+    Statistics,
 }
 
 #[derive(Clone, Debug)]
@@ -1850,6 +1855,10 @@ struct SynapseApp {
     git_diff: GitDiffState,
     git_diff_generation: u64,
     git_quick_open: bool,
+    statistics: StatisticsState,
+    statistics_generation: u64,
+    statistics_refreshing: bool,
+    statistics_stale: bool,
     vault_watcher: Option<RecommendedWatcher>,
     vault_watcher_generation: u64,
     vault_refresh_generation: u64,
@@ -5061,6 +5070,10 @@ pub(crate) fn run() {
                             git_diff: GitDiffState::Empty,
                             git_diff_generation: 0,
                             git_quick_open: false,
+                            statistics: StatisticsState::Empty,
+                            statistics_generation: 0,
+                            statistics_refreshing: false,
+                            statistics_stale: true,
                             vault_watcher: None,
                             vault_watcher_generation: 0,
                             vault_refresh_generation: 0,

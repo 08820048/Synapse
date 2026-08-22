@@ -13,6 +13,7 @@ impl Render for SynapseApp {
         let todo_workspace_active = self.workspace_view == WorkspaceView::Todo;
         let bookmark_workspace_active = self.workspace_view == WorkspaceView::Bookmark;
         let git_workspace_active = self.workspace_view == WorkspaceView::Git;
+        let statistics_workspace_active = self.workspace_view == WorkspaceView::Statistics;
         let note_workspace_active = self.workspace_view == WorkspaceView::Note;
         let selected_path = note_workspace_active
             .then(|| {
@@ -90,6 +91,13 @@ impl Render for SynapseApp {
                     theme: synapse_theme_palette(theme.is_dark()),
                     language: self.language,
                 },
+                cx,
+            )
+        } else if statistics_workspace_active {
+            render_statistics_workspace(
+                &self.statistics,
+                synapse_theme_palette(theme.is_dark()),
+                self.language,
                 cx,
             )
         } else if self.state.active_document().is_some() {
@@ -2135,6 +2143,37 @@ impl Render for SynapseApp {
                     )
                     .into_any_element(),
             )
+        } else if statistics_workspace_active {
+            let refresh_app = app_entity.clone();
+            Some(
+                div()
+                    .id("statistics-toolbar")
+                    .h(px(EDITOR_TOOLBAR_HEIGHT))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .px_3()
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_size(px(13.5))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(self.language.text("统计", "Statistics")),
+                    )
+                    .child(
+                        Button::new("statistics-toolbar-refresh")
+                            .ghost()
+                            .size(px(EDITOR_TOOLBAR_HEIGHT))
+                            .p_0()
+                            .icon(IconName::Redo)
+                            .loading(self.statistics_refreshing)
+                            .tooltip(self.language.text("刷新统计", "Refresh statistics"))
+                            .on_click(move |_, _, cx| {
+                                refresh_app.update(cx, |this, cx| this.refresh_statistics(cx));
+                            }),
+                    )
+                    .into_any_element(),
+            )
         } else {
             active_note_path.map(|path| {
                 let parts = note_breadcrumb_parts(&path);
@@ -2670,6 +2709,63 @@ impl Render for SynapseApp {
                         self.language,
                         cx,
                     ))
+            })
+            .child({
+                let shortcut_app = app_entity.clone();
+                let palette = synapse_theme_palette(theme.is_dark());
+                let active = self.workspace_view == WorkspaceView::Statistics;
+                let row_ink = if active {
+                    palette.foreground
+                } else {
+                    palette.muted
+                };
+                div()
+                    .id("statistics-collection")
+                    .w_full()
+                    .h(px(30.0))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap(px(10.0))
+                    .pl(px(SIDEBAR_TREE_ROOT_INSET))
+                    .pr_3()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .when(active, |row| {
+                        row.bg(palette.active).text_color(palette.foreground)
+                    })
+                    .when(!active, |row| {
+                        row.text_color(palette.muted).hover(move |style| {
+                            style.bg(palette.hover).text_color(palette.foreground)
+                        })
+                    })
+                    .child(
+                        div()
+                            .size(px(16.0))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(
+                                ComponentIcon::new(IconName::ChartPie)
+                                    .size(px(15.0))
+                                    .text_color(row_ink),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_size(px(13.0))
+                            .child(self.language.text("统计", "Statistics")),
+                    )
+                    .on_click(move |_, window, cx| {
+                        shortcut_app
+                            .update(cx, |this, cx| this.open_statistics_workspace(window, cx));
+                    })
             })
             .child(
                 div()

@@ -227,6 +227,7 @@ impl SynapseApp {
                         if this.state.save_active().is_ok() {
                             let _ = clear_recovery_preference();
                             this.persist_session();
+                            this.statistics_stale = true;
                         }
                         cx.notify();
                         true
@@ -528,6 +529,7 @@ impl SynapseApp {
                 }
                 let entries_changed = this.state.refresh_vault_entries();
                 let documents_changed = this.state.refresh_external_documents();
+                this.statistics_stale = true;
                 match (entries_changed, documents_changed) {
                     (Ok(entries_changed), Ok(documents_changed))
                         if entries_changed || documents_changed =>
@@ -545,6 +547,9 @@ impl SynapseApp {
                     }
                     (Ok(_), Ok(_)) => {}
                     _ => cx.notify(),
+                }
+                if this.workspace_view == WorkspaceView::Statistics {
+                    this.refresh_statistics(cx);
                 }
                 this.schedule_git_status_refresh(cx);
             });
@@ -1660,6 +1665,7 @@ impl SynapseApp {
             }
             let _ = clear_recovery_preference();
             self.persist_session();
+            self.statistics_stale = true;
             self.refresh_git_status(cx);
         }
         self.workspace_view = WorkspaceView::Git;
@@ -1673,6 +1679,84 @@ impl SynapseApp {
         self.select_default_git_change(cx);
         window.focus(&self.git_commit_input.focus_handle(cx));
         cx.notify();
+    }
+
+    pub(in crate::app) fn open_statistics_workspace(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.state.active_is_dirty() {
+            if let Err(error) = self.state.save_active() {
+                push_alert_notification(
+                    window,
+                    cx,
+                    AppNotificationVariant::Error,
+                    self.language
+                        .text("无法打开统计", "Unable to open statistics"),
+                    error.to_string(),
+                );
+                return;
+            }
+            let _ = clear_recovery_preference();
+            self.persist_session();
+            self.statistics_stale = true;
+        }
+        self.workspace_view = WorkspaceView::Statistics;
+        self.selection_menu_mode = SelectionMenuMode::Formatting;
+        self.clear_slash_surfaces_immediately();
+        self.dismiss_command_palette(cx);
+        self.dismiss_context_menus(cx);
+        if self
+            .statistics
+            .needs_refresh(self.statistics_stale, self.statistics_refreshing)
+        {
+            self.refresh_statistics(cx);
+        }
+        cx.notify();
+    }
+
+    pub(in crate::app) fn refresh_statistics(&mut self, cx: &mut Context<Self>) {
+        self.statistics_generation = self.statistics_generation.wrapping_add(1);
+        let generation = self.statistics_generation;
+        let Some(root) = self.state.vault_root().map(Path::to_path_buf) else {
+            self.statistics = StatisticsState::Empty;
+            self.statistics_refreshing = false;
+            cx.notify();
+            return;
+        };
+        let entries = self.state.entries.clone();
+        self.statistics_refreshing = true;
+        if !matches!(self.statistics, StatisticsState::Ready(_)) {
+            self.statistics = StatisticsState::Loading;
+        }
+        cx.notify();
+        let task = cx
+            .background_executor()
+            .spawn(async move { collect_statistics(&root, &entries) });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |this, cx| {
+                if this.statistics_generation != generation {
+                    return;
+                }
+                this.statistics_refreshing = false;
+                match result {
+                    Ok(snapshot) => {
+                        this.statistics = StatisticsState::Ready(snapshot);
+                        this.statistics_stale = false;
+                    }
+                    Err(error) => {
+                        this.statistics_stale = true;
+                        if !matches!(this.statistics, StatisticsState::Ready(_)) {
+                            this.statistics = StatisticsState::Failed(error);
+                        }
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn select_default_git_change(&mut self, cx: &mut Context<Self>) {
@@ -1756,9 +1840,8 @@ impl SynapseApp {
             cx.notify();
             return;
         }
-        if self.state.active_is_dirty()
-            && let Err(error) = self.state.save_active()
-        {
+        let saved_active = self.state.active_is_dirty();
+        if saved_active && let Err(error) = self.state.save_active() {
             push_alert_notification(
                 window,
                 cx,
@@ -1768,6 +1851,9 @@ impl SynapseApp {
                 error.to_string(),
             );
             return;
+        }
+        if saved_active {
+            self.statistics_stale = true;
         }
         let Some(root) = self.state.vault_root().map(Path::to_path_buf) else {
             return;
@@ -2220,6 +2306,11 @@ impl SynapseApp {
                         if let Some(path) = paths.into_iter().next() {
                             match this.state.open_vault(&path) {
                                 Ok(()) => {
+                                    this.statistics_generation =
+                                        this.statistics_generation.wrapping_add(1);
+                                    this.statistics = StatisticsState::Empty;
+                                    this.statistics_refreshing = false;
+                                    this.statistics_stale = true;
                                     this.vault_persistence_error =
                                         save_vault_preference(&path).err().map(|error| {
                                             format!(
@@ -2239,6 +2330,9 @@ impl SynapseApp {
                                     });
                                     this.restart_vault_watcher(cx);
                                     this.refresh_git_status(cx);
+                                    if this.workspace_view == WorkspaceView::Statistics {
+                                        this.refresh_statistics(cx);
+                                    }
                                     this.persist_session();
                                     push_alert_notification(
                                         window,
@@ -2763,6 +2857,7 @@ impl SynapseApp {
             Ok(_) => {
                 let _ = clear_recovery_preference();
                 self.persist_session();
+                self.statistics_stale = true;
             }
             Err(error) => push_alert_notification(
                 window,
