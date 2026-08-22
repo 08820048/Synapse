@@ -4735,12 +4735,14 @@ impl SynapseApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let last_layout_bottom = self
+        let (last_layout_bottom, trailing_rendered_block) = self
             .editor_line_layouts
             .borrow()
             .values()
             .last()
-            .map(|layout| layout.bounds.bottom());
+            .map_or((None, false), |layout| {
+                (Some(layout.bounds.bottom()), layout.wrapped_line.is_none())
+            });
         let clicked_below_document =
             last_layout_bottom.is_some_and(|bottom| event.position.y > bottom);
         let Some(mut cursor) = self.editor_char_for_position(event.position) else {
@@ -4749,7 +4751,9 @@ impl SynapseApp {
         if !self.large_document_active()
             && clicked_below_document
             && let Some(source) = self.state.active_document().map(|document| document.text())
-            && let Some(edit) = trailing_fenced_code_block_paragraph_edit(&source)
+            && let Some(edit) = (trailing_rendered_block && !source.ends_with('\n'))
+                .then(|| smart_enter_edit(&source, source.chars().count()))
+                .or_else(|| trailing_fenced_code_block_paragraph_edit(&source))
         {
             let previous_revision = self
                 .state

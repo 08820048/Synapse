@@ -496,6 +496,7 @@ fn render_markdown_image_block(
     preview: Option<&MarkdownImagePreview>,
     muted: Hsla,
     border: Hsla,
+    selection_border: Hsla,
 ) -> AnyElement {
     let active =
         (line.start_char..=line.start_char + line.source_len_chars).contains(&row_context.cursor);
@@ -559,7 +560,13 @@ fn render_markdown_image_block(
                         .items_center()
                         .justify_center()
                         .cursor_pointer()
-                        .child(content)
+                        .child(
+                            div()
+                                .max_w_full()
+                                .border_2()
+                                .border_color(selection_border.alpha(if active { 1.0 } else { 0.0 }))
+                                .child(content),
+                        )
                         .child(editor_block_layout_canvas(index, line, row_context, active)),
                 ),
         )
@@ -1086,6 +1093,7 @@ pub(super) fn render_editor_row(
             row_context.image_previews.get(&image.source_start_char),
             theme.muted_foreground,
             theme.border,
+            theme.ring,
         );
     }
     if line.presentation.footnote_definition.is_some() {

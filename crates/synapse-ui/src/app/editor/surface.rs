@@ -2857,10 +2857,7 @@ impl EditorLineLayout {
             }
         }
         let Some(wrapped_line) = self.wrapped_line.as_ref() else {
-            let width = f32::from(self.bounds.size.width).max(1.0);
-            let x = f32::from(position.x - self.bounds.origin.x).clamp(0.0, width);
-            let local = ((x / width) * self.source_line.source_len_chars as f32).round() as usize;
-            return self.source_line.start_char + local.min(self.source_line.source_len_chars);
+            return self.source_line.start_char;
         };
         source_char_for_shaped_line(
             &self.source_line,
@@ -3681,17 +3678,18 @@ fn utf16_offset_to_char(text: &str, offset: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use std::{hint::black_box, time::Instant};
+    use std::{hint::black_box, rc::Rc, time::Instant};
 
-    use gpui::px;
+    use gpui::{Bounds, point, px, size};
 
     use super::{
-        Buffer, CodeSyntaxCache, CodeSyntaxEdit, EDITOR_CURSOR_WIDTH, EditorSelection,
-        INLINE_STRONG_WEIGHT, LIST_BULLET_DIAMETER, MarkdownBlockKind, align_to_device_pixel,
-        char_byte_boundaries, char_to_byte, code_block_language, footnote_preview_line,
-        hidden_bullet_marker_range, inline_code_byte_ranges, shift_source_lines, source_lines,
-        source_lines_from_buffer_with_syntax_cache, source_lines_with_mode, table_cell_editor_line,
-        task_preview_line, text_run_from_markdown, visual_row_byte_ranges,
+        Buffer, CodeSyntaxCache, CodeSyntaxEdit, EDITOR_CURSOR_WIDTH, EditorLineLayout,
+        EditorSelection, INLINE_STRONG_WEIGHT, LIST_BULLET_DIAMETER, MarkdownBlockKind,
+        align_to_device_pixel, char_byte_boundaries, char_to_byte, code_block_language,
+        footnote_preview_line, hidden_bullet_marker_range, inline_code_byte_ranges,
+        shift_source_lines, source_lines, source_lines_from_buffer_with_syntax_cache,
+        source_lines_with_mode, table_cell_editor_line, task_preview_line, text_run_from_markdown,
+        visual_row_byte_ranges,
     };
 
     fn present_markdown_line(source: &str) -> super::MarkdownLinePresentation {
@@ -3915,6 +3913,28 @@ mod tests {
         let active = source_lines(active_source, 2, false);
         assert_eq!(active[0].presentation.display, "before  after");
         assert_eq!(active[0].presentation.inline_images.len(), 1);
+    }
+
+    #[test]
+    fn rendered_blocks_map_pointer_hits_to_a_safe_source_anchor() {
+        let line = Rc::new(source_lines("before\n![diagram](diagram.png)", 0, false).remove(1));
+        let source_start = line.start_char;
+        let layout = EditorLineLayout {
+            bounds: Bounds::new(point(px(100.0), px(200.0)), size(px(600.0), px(300.0))),
+            wrapped_line: None,
+            line_height: px(300.0),
+            source_line: line,
+            table_cells: None,
+        };
+
+        assert_eq!(
+            layout.source_char_for_position(point(px(110.0), px(250.0))),
+            source_start
+        );
+        assert_eq!(
+            layout.source_char_for_position(point(px(690.0), px(450.0))),
+            source_start
+        );
     }
 
     #[test]
