@@ -1895,6 +1895,7 @@ struct SynapseApp {
     editor_selection: EditorSelection,
     code_auto_pair_document: Option<PathBuf>,
     code_auto_pairs: Vec<AutoPair>,
+    inline_format_closers: Vec<InlineFormatCloser>,
     language_service: LanguageService,
     selection_menu_mode: SelectionMenuMode,
     slash_menu: Option<SlashMenuState>,
@@ -4095,6 +4096,35 @@ struct InlineFormatEdit {
     selection: Range<usize>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct InlineFormatCloser {
+    range: Range<usize>,
+    marker: &'static str,
+}
+
+fn adjust_inline_format_closers(
+    closers: &mut Vec<InlineFormatCloser>,
+    range: &Range<usize>,
+    replacement: &str,
+) {
+    let delta = replacement.chars().count() as isize - range.len() as isize;
+    closers.retain_mut(|closer| {
+        let overlaps = if range.is_empty() {
+            closer.range.start < range.start && range.start < closer.range.end
+        } else {
+            range.start < closer.range.end && closer.range.start < range.end
+        };
+        if overlaps {
+            return false;
+        }
+        if closer.range.start >= range.end {
+            closer.range.start = closer.range.start.saturating_add_signed(delta);
+            closer.range.end = closer.range.end.saturating_add_signed(delta);
+        }
+        true
+    });
+}
+
 fn inline_format_markers(format: InlineFormat) -> (&'static str, &'static str) {
     match format {
         InlineFormat::Bold => ("**", "**"),
@@ -5110,6 +5140,7 @@ pub(crate) fn run() {
                             editor_selection: EditorSelection::collapsed(0),
                             code_auto_pair_document: None,
                             code_auto_pairs: Vec::new(),
+                            inline_format_closers: Vec::new(),
                             language_service: LanguageService::default(),
                             selection_menu_mode: SelectionMenuMode::Formatting,
                             slash_menu: None,
@@ -5425,6 +5456,20 @@ mod tests {
                 selection: 2..2,
             })
         );
+    }
+
+    #[test]
+    fn inline_format_closer_tracks_typed_content_and_drops_overwritten_markers() {
+        let mut closers = vec![super::InlineFormatCloser {
+            range: 3..5,
+            marker: "**",
+        }];
+
+        super::adjust_inline_format_closers(&mut closers, &(3..3), "加粗");
+        assert_eq!(closers[0].range, 5..7);
+
+        super::adjust_inline_format_closers(&mut closers, &(5..6), "");
+        assert!(closers.is_empty());
     }
 
     #[test]

@@ -888,6 +888,7 @@ impl Render for SynapseApp {
                 .min_w(px(0.0))
                 .track_focus(&self.editor_focus)
                 .key_context("SynapseEditor")
+                .on_key_down(cx.listener(Self::editor_key_down))
                 .on_action(cx.listener(Self::save))
                 .on_action(cx.listener(Self::undo))
                 .on_action(cx.listener(Self::redo))

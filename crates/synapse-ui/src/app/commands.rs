@@ -2930,7 +2930,20 @@ impl SynapseApp {
         if self.code_auto_pair_document != active_path {
             self.code_auto_pair_document = active_path;
             self.code_auto_pairs.clear();
+            self.inline_format_closers.clear();
         }
+    }
+
+    fn take_inline_format_closer_at_cursor(&mut self, cursor: usize) -> Option<usize> {
+        self.ensure_code_auto_pairs_for_active_document();
+        let document = self.state.active_document()?;
+        let index = self.inline_format_closers.iter().position(|closer| {
+            closer.range.start == cursor
+                && document
+                    .slice(closer.range.clone())
+                    .is_ok_and(|text| text == closer.marker)
+        })?;
+        Some(self.inline_format_closers.remove(index).range.end)
     }
 
     fn active_editor_source_window(&self, range: &Range<usize>) -> Option<EditorSourceWindow> {
@@ -3098,11 +3111,8 @@ impl SynapseApp {
     }
 
     fn clear_code_auto_pairs(&mut self) {
+        self.ensure_code_auto_pairs_for_active_document();
         self.code_auto_pairs.clear();
-        self.code_auto_pair_document = self
-            .state
-            .active_document()
-            .map(|document| document.relative_path().to_path_buf());
     }
 
     pub(in crate::app) fn backspace(
@@ -3217,7 +3227,12 @@ impl SynapseApp {
     ) {
         self.editor_marked_range = None;
         if self.editor_selection.is_empty() {
-            self.state.move_right();
+            let cursor = self.state.cursor();
+            if let Some(end) = self.take_inline_format_closer_at_cursor(cursor) {
+                self.state.set_cursor(end);
+            } else {
+                self.state.move_right();
+            }
         } else {
             self.state.set_cursor(self.editor_selection.range().end);
         }
@@ -3227,6 +3242,30 @@ impl SynapseApp {
         self.restart_editor_cursor_blink(cx);
         cx.stop_propagation();
         cx.notify();
+    }
+
+    pub(in crate::app) fn editor_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if event.keystroke.key != "space"
+            || event.keystroke.modifiers.modified()
+            || self.editor_marked_range.is_some()
+            || !self.editor_selection.is_empty()
+        {
+            return;
+        }
+        let cursor = self.state.cursor();
+        let Some(end) = self.take_inline_format_closer_at_cursor(cursor) else {
+            return;
+        };
+        self.state.set_cursor(end);
+        self.editor_selection.collapse(end);
+        self.restart_editor_cursor_blink(cx);
+        cx.notify();
+        // Keep propagating so macOS handles this same space, including automatic punctuation.
     }
 
     pub(in crate::app) fn move_previous_word(
@@ -4445,11 +4484,20 @@ impl SynapseApp {
         let Some(local_range) = source_window.local_range(range) else {
             return;
         };
+        let inserts_empty_pair = local_range.is_empty()
+            && inline_format_bounds(&source_window.source, local_range.clone(), format).is_none();
         let Some(edit) = inline_format_edit(&source_window.source, local_range, format) else {
             return;
         };
         let replace_range = source_window.global_range(edit.replace_range);
         let selection = source_window.global_range(edit.selection);
+        let closer = inserts_empty_pair.then(|| {
+            let marker = inline_format_markers(format).1;
+            InlineFormatCloser {
+                range: selection.end..selection.end + marker.chars().count(),
+                marker,
+            }
+        });
         let previous_revision = self
             .state
             .active_document()
@@ -4460,6 +4508,10 @@ impl SynapseApp {
             .is_ok()
         {
             self.sync_writ_render_buffer(previous_revision, replace_range, &edit.replacement);
+            if let Some(closer) = closer {
+                self.ensure_code_auto_pairs_for_active_document();
+                self.inline_format_closers.push(closer);
+            }
             self.editor_selection.collapse(selection.start);
             self.editor_selection.select_to(selection.end);
             self.state.set_cursor(selection.end);
@@ -4904,6 +4956,7 @@ impl SynapseApp {
     ) {
         self.ensure_code_auto_pairs_for_active_document();
         adjust_auto_pairs(&mut self.code_auto_pairs, &range, replacement);
+        adjust_inline_format_closers(&mut self.inline_format_closers, &range, replacement);
         self.refresh_large_document_render_cache_after_edit(
             previous_revision,
             range.clone(),
