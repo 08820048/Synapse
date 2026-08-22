@@ -534,6 +534,7 @@ mod tests {
             &["init", "--bare", remote.to_str().unwrap()],
         );
         run_git(directory.path(), &["init", vault.to_str().unwrap()]);
+        run_git(&vault, &["config", "core.autocrlf", "false"]);
         run_git(&vault, &["config", "user.name", "Synapse Test"]);
         run_git(&vault, &["config", "user.email", "synapse@example.invalid"]);
         run_git(&vault, &["config", "commit.gpgsign", "false"]);
@@ -576,6 +577,7 @@ mod tests {
             directory.path(),
             &["clone", remote.to_str().unwrap(), peer.to_str().unwrap()],
         );
+        run_git(&peer, &["config", "core.autocrlf", "false"]);
         run_git(&peer, &["config", "user.name", "Synapse Peer"]);
         run_git(&peer, &["config", "user.email", "peer@example.invalid"]);
         run_git(&peer, &["config", "commit.gpgsign", "false"]);
